@@ -1,0 +1,10 @@
+[package]
+name = "gk3-formats"
+description = "Parsers for Gabriel Knight 3 asset formats"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+miniz_oxide.workspace = true

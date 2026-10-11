@@ -1,0 +1,17 @@
+[package]
+name = "gk3"
+description = "Gabriel Knight 3 engine and asset tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gk3-barn.workspace = true
+gk3-formats.workspace = true
+gk3-media.workspace = true
+gk3-render.workspace = true
+glam.workspace = true
+winit.workspace = true
+pollster.workspace = true
+wgpu.workspace = true

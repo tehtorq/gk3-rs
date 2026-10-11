@@ -1,0 +1,15 @@
+gk3-rs
+Copyright (C) 2026 the gk3-rs contributors
+Licensed under the GNU General Public License, version 3 or later. See LICENSE.
+
+This project is informed by two GPL-3.0 engines for the same game:
+
+  G-Engine, by Clark Kromenaker - https://github.com/kromenak/gengine
+  GK3Reborn                     - https://github.com/Devion/GK3Reborn
+
+The Barn archive layout in crates/barn follows G-Engine's BarnFile.cpp and
+GK3Reborn's docs/formats/barn.md. The LZO1X decoder follows the structure of
+the reference lzo1x_decompress_safe algorithm.
+
+Gabriel Knight 3 and its assets are the property of their owners. No game data
+is included in or distributed with this project.

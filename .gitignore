@@ -1,0 +1,7 @@
+/target
+# Game data and anything extracted from it never belongs in the repository.
+/extracted
+*.brn
+*.BRN
+*.bik
+*.BIK

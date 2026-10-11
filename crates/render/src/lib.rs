@@ -1,0 +1,660 @@
+//! GPU renderer for GK3 rooms, built on wgpu.
+//!
+//! The renderer draws into any texture view, so the same code serves a window
+//! and an offscreen image. wgpu loads the GPU driver (Vulkan, GL, Metal or
+//! D3D12) at run time; nothing graphical is linked into the executable.
+
+pub mod mesh;
+
+use gk3_formats::image::Image;
+use glam::{Mat4, Quat, Vec3};
+use wgpu::util::DeviceExt;
+
+pub use mesh::{SceneMesh, SceneSource, Sky};
+
+/// Colour format for offscreen rendering. Not sRGB: GK3 multiplied lightmaps
+/// in gamma space, and doing it in linear space would change the look.
+pub const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// A first-person camera in GK3's left-handed, Y-up world.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Camera {
+    pub position: Vec3,
+    /// Heading in radians; zero looks along +Z.
+    pub yaw: f32,
+    /// Radians; positive looks down, as in GK3's camera angles.
+    pub pitch: f32,
+    /// Vertical field of view in radians.
+    pub fov_y: f32,
+}
+
+impl Camera {
+    /// GK3's own convention, matching G-Engine: rotate about Y by the
+    /// heading, then about X by the pitch.
+    pub fn rotation(&self) -> Quat {
+        Quat::from_rotation_y(self.yaw) * Quat::from_rotation_x(self.pitch)
+    }
+
+    pub fn forward(&self) -> Vec3 {
+        self.rotation() * Vec3::Z
+    }
+
+    pub fn right(&self) -> Vec3 {
+        self.rotation() * Vec3::X
+    }
+
+    fn projection(&self, aspect: f32) -> Mat4 {
+        Mat4::perspective_lh(self.fov_y, aspect, 4.0, 40_000.0)
+    }
+
+    pub fn view_proj(&self, aspect: f32) -> Mat4 {
+        self.projection(aspect) * Mat4::look_to_lh(self.position, self.forward(), Vec3::Y)
+    }
+}
+
+/// What the scene shader shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShadeMode {
+    #[default]
+    Lit,
+    TexturesOnly,
+    LightmapsOnly,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Globals {
+    view_proj: [[f32; 4]; 4],
+    sky_inverse: [[f32; 4]; 4],
+    atlas_size: [f32; 2],
+    mode: u32,
+    _pad: u32,
+}
+
+/// Opens a GPU with no window, for offscreen rendering and tools.
+pub fn headless() -> Result<(wgpu::Device, wgpu::Queue, String), String> {
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        ..Default::default()
+    }))
+    .map_err(|e| format!("no usable GPU: {e}"))?;
+    let name = adapter.get_info().name;
+    let (device, queue) = request_device(&adapter)?;
+    Ok((device, queue, name))
+}
+
+pub fn request_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue), String> {
+    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("gk3"),
+        required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+        ..Default::default()
+    }))
+    .map_err(|e| format!("could not open the GPU: {e}"))
+}
+
+pub struct Renderer {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    scene_pipeline: wgpu::RenderPipeline,
+    sky_pipeline: wgpu::RenderPipeline,
+    globals_layout: wgpu::BindGroupLayout,
+    texture_layout: wgpu::BindGroupLayout,
+    sky_layout: wgpu::BindGroupLayout,
+    repeat_sampler: wgpu::Sampler,
+    clamp_sampler: wgpu::Sampler,
+}
+
+/// A room on the GPU.
+pub struct GpuScene {
+    vertices: wgpu::Buffer,
+    batches: Vec<mesh::Batch>,
+    textures: Vec<wgpu::BindGroup>,
+    globals: wgpu::Buffer,
+    globals_group: wgpu::BindGroup,
+    sky: Option<(wgpu::BindGroup, f32)>,
+    atlas_size: [f32; 2],
+    pub bounds: ([f32; 3], [f32; 3]),
+}
+
+impl Renderer {
+    pub fn new(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        color_format: wgpu::TextureFormat,
+    ) -> Self {
+        let tex_entry = |binding, dimension| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: dimension,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let sampler_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        };
+        let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("globals"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                tex_entry(1, wgpu::TextureViewDimension::D2),
+                sampler_entry(2),
+            ],
+        });
+        let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("diffuse"),
+            entries: &[
+                tex_entry(0, wgpu::TextureViewDimension::D2),
+                sampler_entry(1),
+            ],
+        });
+        let sky_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sky"),
+            entries: &[
+                tex_entry(0, wgpu::TextureViewDimension::Cube),
+                sampler_entry(1),
+            ],
+        });
+
+        let scene_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("scene"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("scene.wgsl").into()),
+        });
+        let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("sky"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("sky.wgsl").into()),
+        });
+
+        let scene_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("scene"),
+            bind_group_layouts: &[Some(&globals_layout), Some(&texture_layout)],
+            immediate_size: 0,
+        });
+        let sky_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sky"),
+            bind_group_layouts: &[Some(&globals_layout), Some(&sky_layout)],
+            immediate_size: 0,
+        });
+
+        let attributes = wgpu::vertex_attr_array![
+            0 => Float32x3, 1 => Float32x2, 2 => Float32x2, 3 => Float32x4, 4 => Float32
+        ];
+        let target = [Some(wgpu::ColorTargetState {
+            format: color_format,
+            blend: None,
+            write_mask: wgpu::ColorWrites::ALL,
+        })];
+
+        let scene_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("scene"),
+            layout: Some(&scene_layout),
+            vertex: wgpu::VertexState {
+                module: &scene_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<mesh::Vertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &attributes,
+                })],
+            },
+            // GK3's winding is not consistent, so nothing is culled.
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &scene_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &target,
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("sky"),
+            layout: Some(&sky_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &sky_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &sky_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &target,
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let repeat_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("repeat"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        let clamp_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("clamp"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        Self {
+            device,
+            queue,
+            scene_pipeline,
+            sky_pipeline,
+            globals_layout,
+            texture_layout,
+            sky_layout,
+            repeat_sampler,
+            clamp_sampler,
+        }
+    }
+
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    /// Uploads a room.
+    pub fn upload(&self, mesh: &SceneMesh) -> GpuScene {
+        let device = &self.device;
+        let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("scene vertices"),
+            contents: if mesh.vertices.is_empty() {
+                &[0u8; 64]
+            } else {
+                bytemuck::cast_slice(&mesh.vertices)
+            },
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let textures = mesh
+            .textures
+            .iter()
+            .map(|image| {
+                let view = self.texture(image, true);
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &self.texture_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&self.repeat_sampler),
+                        },
+                    ],
+                })
+            })
+            .collect();
+
+        let atlas = self.texture(&mesh.lightmap_atlas, false);
+        let globals = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("globals"),
+            size: std::mem::size_of::<Globals>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let globals_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("globals"),
+            layout: &self.globals_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: globals.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&atlas),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.clamp_sampler),
+                },
+            ],
+        });
+
+        let sky = mesh.sky.as_ref().map(|sky| {
+            let view = self.cube_texture(&sky.faces);
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("sky"),
+                layout: &self.sky_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.clamp_sampler),
+                    },
+                ],
+            });
+            (group, sky.azimuth)
+        });
+
+        GpuScene {
+            vertices,
+            batches: mesh.batches.clone(),
+            textures,
+            globals,
+            globals_group,
+            sky,
+            atlas_size: [
+                mesh.lightmap_atlas.width as f32,
+                mesh.lightmap_atlas.height as f32,
+            ],
+            bounds: mesh.bounds,
+        }
+    }
+
+    fn texture(&self, image: &Image, mipmaps: bool) -> wgpu::TextureView {
+        let mut levels = vec![image.clone()];
+        if mipmaps {
+            while levels.last().is_some_and(|l| l.width > 1 || l.height > 1) {
+                let next = mesh::half(levels.last().unwrap());
+                levels.push(next);
+            }
+        }
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: image.width,
+                height: image.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: levels.len() as u32,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        for (level, img) in levels.iter().enumerate() {
+            self.write_layer(&texture, img, level as u32, 0);
+        }
+        texture.create_view(&Default::default())
+    }
+
+    fn cube_texture(&self, faces: &[Image; 6]) -> wgpu::TextureView {
+        let size = faces[0].width;
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("sky"),
+            size: wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: 6,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        for (layer, face) in faces.iter().enumerate() {
+            self.write_layer(&texture, face, 0, layer as u32);
+        }
+        texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::Cube),
+            ..Default::default()
+        })
+    }
+
+    fn write_layer(&self, texture: &wgpu::Texture, image: &Image, mip: u32, layer: u32) {
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: mip,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: layer,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &image.rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(image.width * 4),
+                rows_per_image: Some(image.height),
+            },
+            wgpu::Extent3d {
+                width: image.width,
+                height: image.height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// A depth buffer for a target of this size.
+    pub fn depth_view(&self, width: u32, height: u32) -> wgpu::TextureView {
+        self.device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("depth"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: DEPTH_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            })
+            .create_view(&Default::default())
+    }
+
+    /// Draws a room into `target` and submits the work.
+    pub fn draw(
+        &self,
+        scene: &GpuScene,
+        camera: &Camera,
+        mode: ShadeMode,
+        target: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
+        size: (u32, u32),
+    ) {
+        let aspect = size.0 as f32 / size.1.max(1) as f32;
+        let rotation_only =
+            camera.projection(aspect) * Mat4::look_to_lh(Vec3::ZERO, camera.forward(), Vec3::Y);
+        // The sky texture turns with the azimuth, so a world direction is
+        // turned back the other way before the lookup.
+        let azimuth = scene.sky.as_ref().map_or(0.0, |(_, a)| *a);
+        let sky_inverse = Mat4::from_rotation_y(-azimuth.to_radians()) * rotation_only.inverse();
+        let globals = Globals {
+            view_proj: camera.view_proj(aspect).to_cols_array_2d(),
+            sky_inverse: sky_inverse.to_cols_array_2d(),
+            atlas_size: scene.atlas_size,
+            mode: match mode {
+                ShadeMode::Lit => 0,
+                ShadeMode::TexturesOnly => 1,
+                ShadeMode::LightmapsOnly => 2,
+            },
+            _pad: 0,
+        };
+        self.queue
+            .write_buffer(&scene.globals, 0, bytemuck::bytes_of(&globals));
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frame"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("scene"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.05,
+                            g: 0.05,
+                            b: 0.07,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            if let Some((sky, _)) = &scene.sky {
+                pass.set_pipeline(&self.sky_pipeline);
+                pass.set_bind_group(0, &scene.globals_group, &[]);
+                pass.set_bind_group(1, sky, &[]);
+                pass.draw(0..3, 0..1);
+            }
+
+            pass.set_pipeline(&self.scene_pipeline);
+            pass.set_bind_group(0, &scene.globals_group, &[]);
+            pass.set_vertex_buffer(0, scene.vertices.slice(..));
+            for batch in &scene.batches {
+                pass.set_bind_group(1, &scene.textures[batch.texture], &[]);
+                pass.draw(batch.first..batch.first + batch.count, 0..1);
+            }
+        }
+        self.queue.submit([encoder.finish()]);
+    }
+
+    /// Renders one frame offscreen and reads it back.
+    pub fn render_image(
+        &self,
+        scene: &GpuScene,
+        camera: &Camera,
+        mode: ShadeMode,
+        width: u32,
+        height: u32,
+    ) -> Result<Image, String> {
+        let target = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: OFFSCREEN_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&Default::default());
+        let depth = self.depth_view(width, height);
+        self.draw(scene, camera, mode, &view, &depth, (width, height));
+
+        // Rows in a copy must be a multiple of 256 bytes.
+        let stride = (width * 4).div_ceil(256) * 256;
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: stride as u64 * height as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit([encoder.finish()]);
+
+        readback.map_async(wgpu::MapMode::Read, .., |_| {});
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .map_err(|e| format!("GPU did not finish: {e}"))?;
+        let mapped = readback
+            .get_mapped_range(..)
+            .map_err(|e| format!("could not read the frame back: {e}"))?;
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for row in mapped.chunks(stride as usize).take(height as usize) {
+            rgba.extend_from_slice(&row[..(width * 4) as usize]);
+        }
+        Ok(Image {
+            width,
+            height,
+            rgba,
+        })
+    }
+}

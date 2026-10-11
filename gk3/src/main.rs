@@ -1,9 +1,11 @@
 //! `gk3`: the Gabriel Knight 3 engine and its asset tools.
 
 mod actions_cmd;
+mod camera;
 mod cast;
 mod check;
 mod export;
+mod faces;
 mod play;
 mod room;
 mod sheep_cmd;
@@ -121,6 +123,7 @@ fn main() -> ExitCode {
         "export" => open(&options).and_then(|lib| export::run(&lib, &options.args, &options.out)),
         "actions" => open(&options).and_then(|lib| actions_cmd::run(&lib, &options.args)),
         "sheep" => open(&options).and_then(|lib| sheep_cmd::run(&lib, &options.args)),
+        "face" => open(&options).and_then(|lib| faces::tool(&lib, &options.args)),
         "play" => open(&options).and_then(|lib| play::run(lib, &options.args)),
         "view" => open(&options).and_then(|lib| view::run(lib, &options.args)),
         "rooms" => open(&options).and_then(|lib| shoot::rooms(&lib)),

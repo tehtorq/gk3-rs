@@ -21,6 +21,9 @@ pub struct GameState {
     /// By character, noun and verb: what has been done to what, by whom.
     pub noun_verbs: BTreeMap<(String, String, String), i32>,
     pub topics: BTreeMap<(String, String), i32>,
+    /// Topics already discussed, by noun, verb and the case they came under:
+    /// a topic is raised once per case.
+    pub played_topics: BTreeSet<(String, String, String)>,
     pub chats: BTreeMap<String, i32>,
     /// Score events achieved; each counts once.
     pub score_events: BTreeSet<String>,
@@ -28,6 +31,8 @@ pub struct GameState {
     pub inventory: BTreeMap<String, BTreeSet<String>>,
     /// The item in each character's hand.
     pub active_item: BTreeMap<String, String>,
+    /// The inventory screen is up: the `_INV` cases hold only then.
+    pub inventory_shown: bool,
     pub actor_locations: BTreeMap<String, String>,
     /// Visits by actor, location and timeblock.
     pub location_counts: BTreeMap<(String, String, String), i32>,
@@ -71,10 +76,12 @@ impl GameState {
             variables: BTreeMap::new(),
             noun_verbs: BTreeMap::new(),
             topics: BTreeMap::new(),
+            played_topics: BTreeSet::new(),
             chats: BTreeMap::new(),
             score_events: BTreeSet::new(),
             inventory: BTreeMap::new(),
             active_item: BTreeMap::new(),
+            inventory_shown: false,
             actor_locations: BTreeMap::new(),
             location_counts: BTreeMap::new(),
             rng: 0x6B33_0001,
@@ -165,7 +172,7 @@ impl GameState {
     /// rendering, maps in key order).
     pub fn hash(&self) -> u64 {
         let text = format!(
-            "{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}",
+            "{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}",
             self.timeblock,
             self.last_timeblock,
             self.location,
@@ -175,6 +182,7 @@ impl GameState {
             self.variables,
             self.noun_verbs,
             self.topics,
+            self.played_topics,
             self.chats,
             self.score_events,
             self.inventory,

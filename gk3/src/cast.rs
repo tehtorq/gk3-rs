@@ -18,6 +18,9 @@ use gk3_game::pose::Pose;
 use gk3_render::{GpuModel, ModelLight, ModelVertex, Renderer, SubmeshDesc};
 use glam::{Mat3, Mat4, Vec3};
 
+use crate::faces::{Compositor, Expression, FaceConfig};
+use gk3_formats::anm::FaceChange;
+
 /// The vertex animations an `.ANM` starts, by the frame each begins on.
 type Clips = Vec<(u32, Arc<VertexAnimation>)>;
 
@@ -60,6 +63,41 @@ struct Figure {
     /// The last vertices sent to the GPU, for picking.
     world_vertices: Vec<Vec3>,
     triangles: Vec<[u32; 3]>,
+    face: Option<FaceState>,
+}
+
+/// A character's face: what it shows and what is due to change.
+struct FaceState {
+    config: FaceConfig,
+    submesh: usize,
+    expression: Expression,
+    events: Vec<(f64, FaceChange)>,
+    next_blink: f64,
+    dirty: bool,
+    image: Option<Image>,
+}
+
+impl FaceState {
+    fn apply(&mut self, change: &FaceChange) {
+        let code = &self.config.code;
+        match change {
+            FaceChange::Mouth(shape) => self.expression.mouth = Some(format!("{code}_{shape}")),
+            FaceChange::Paint { bitmap, part } => match part {
+                'M' => self.expression.mouth = Some(bitmap.clone()),
+                'E' => self.expression.eyelids = Some(bitmap.clone()),
+                'H' => self.expression.forehead = Some(bitmap.clone()),
+                // The eyes are part of the face bitmap and are left alone.
+                _ => return,
+            },
+            FaceChange::Clear(part) => match part {
+                'M' => self.expression.mouth = None,
+                'E' => self.expression.eyelids = None,
+                'H' => self.expression.forehead = None,
+                _ => return,
+            },
+        }
+        self.dirty = true;
+    }
 }
 
 struct ActorPlacement {
@@ -74,6 +112,8 @@ pub struct Cast {
     light: Option<Vec3>,
     pub positions: HashMap<String, (Vec3, f32)>,
     pub warnings: Vec<String>,
+    compositor: Compositor,
+    rng: u64,
 }
 
 /// Units a second for a walk with no clip to measure.
@@ -85,8 +125,11 @@ impl Cast {
         renderer: &Renderer,
         sif: &Document,
         characters: &HashMap<String, Character>,
+        faces: &HashMap<String, FaceConfig>,
     ) -> Self {
         let mut cast = Self {
+            compositor: Compositor::default(),
+            rng: 0x5DEE_CE66_D1CE_4E5B,
             figures: Vec::new(),
             clips: HashMap::new(),
             light: None,
@@ -152,6 +195,21 @@ impl Cast {
                 let gas = line.get("idle").and_then(|g| load_gas(lib, g));
                 if let Some(mut figure) = cast.figure(lib, renderer, name, Some(placement), gas) {
                     figure.noun = line.get("noun").map(|n| n.to_ascii_uppercase());
+                    if let Some(config) = faces.get(&figure.name) {
+                        let submesh = figure
+                            .model
+                            .submeshes()
+                            .position(|s| s.texture.eq_ignore_ascii_case(&config.face));
+                        figure.face = submesh.map(|submesh| FaceState {
+                            config: config.clone(),
+                            submesh,
+                            expression: Expression::default(),
+                            events: Vec::new(),
+                            next_blink: 2.0,
+                            dirty: true,
+                            image: None,
+                        });
+                    }
                     figure.visible = spot.is_some() && !hidden(line);
                     cast.figures.push(figure);
                 }
@@ -244,6 +302,7 @@ impl Cast {
             dirty: true,
             world_vertices: Vec::new(),
             triangles,
+            face: None,
         })
     }
 
@@ -419,6 +478,68 @@ impl Cast {
         true
     }
 
+    /// Schedules a change to somebody's face, by noun or model name.
+    pub fn face(&mut self, who: &str, at: f64, change: FaceChange) {
+        if let Some(i) = self.find(who)
+            && let Some(face) = &mut self.figures[i].face
+        {
+            face.events.push((at, change));
+        }
+    }
+
+    fn roll(&mut self) -> f64 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        (self.rng % 10_000) as f64 / 10_000.0
+    }
+
+    /// Plays due face changes, starts blinks, and composes changed faces.
+    fn update_faces(&mut self, lib: &Library, now: f64) {
+        for i in 0..self.figures.len() {
+            let Some(face) = &self.figures[i].face else {
+                continue;
+            };
+            let blink_due = now >= face.next_blink && self.figures[i].visible;
+            if blink_due {
+                let face = self.figures[i].face.as_ref().unwrap();
+                let total: u32 = face.config.blinks.iter().map(|(_, w)| w).sum();
+                let gap = face.config.blink_gap;
+                let blinks = face.config.blinks.clone();
+                let mut pick = (self.roll() * total.max(1) as f64) as u32;
+                let chosen = blinks.iter().find(|(_, w)| {
+                    let hit = pick < *w;
+                    pick = pick.saturating_sub(*w);
+                    hit
+                });
+                let next = now + gap.0 + (gap.1 - gap.0).max(0.0) * self.roll();
+                let events: Vec<(f64, FaceChange)> = chosen
+                    .and_then(|(name, _)| read_anm(lib, name))
+                    .map(|anm| {
+                        anm.faces
+                            .iter()
+                            .map(|f| (now + f.frame as f64 / 15.0, f.change.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let face = self.figures[i].face.as_mut().unwrap();
+                face.events.extend(events);
+                face.next_blink = next;
+            }
+            let figure = &mut self.figures[i];
+            let face = figure.face.as_mut().unwrap();
+            face.events.sort_by(|a, b| a.0.total_cmp(&b.0));
+            while face.events.first().is_some_and(|(t, _)| *t <= now) {
+                let (_, change) = face.events.remove(0);
+                face.apply(&change);
+            }
+            if face.dirty {
+                face.dirty = false;
+                face.image = self.compositor.compose(lib, &face.config, &face.expression);
+            }
+        }
+    }
+
     /// Turns an actor on the spot.
     pub fn turn(&mut self, name: &str, heading: f32) {
         let Some(i) = self.find(name) else { return };
@@ -497,8 +618,9 @@ impl Cast {
             .is_some_and(|i| self.figures[i].walk.is_some())
     }
 
-    /// Advances every walk, animation and idle script to `now` (seconds).
+    /// Advances every walk, animation, face and idle script to `now`.
     pub fn update(&mut self, lib: &Library, now: f64) {
+        self.update_faces(lib, now);
         for i in 0..self.figures.len() {
             if self.figures[i].walk.is_some() {
                 step_walk(&mut self.figures[i], now);
@@ -596,6 +718,11 @@ impl Cast {
     pub fn upload(&mut self, renderer: &Renderer) {
         for figure in &mut self.figures {
             figure.gpu.visible = figure.visible;
+            if let Some(face) = &mut figure.face
+                && let Some(image) = face.image.take()
+            {
+                renderer.replace_model_texture(&mut figure.gpu, face.submesh, &image);
+            }
             if !figure.dirty {
                 continue;
             }

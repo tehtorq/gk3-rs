@@ -12,6 +12,26 @@ pub struct Animation {
     pub actions: Vec<Action>,
     pub sounds: Vec<Sound>,
     pub captions: Vec<Caption>,
+    pub faces: Vec<FaceEvent>,
+}
+
+/// A change to somebody's face, by the noun of whose.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FaceEvent {
+    pub frame: u32,
+    pub noun: String,
+    pub change: FaceChange,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FaceChange {
+    /// A mouth shape shared by everyone (`MOUTH03`); the character's own
+    /// bitmap is `<code>_MOUTH03`.
+    Mouth(String),
+    /// A named bitmap over a part: `M` mouth, `E` eyelids, `H` forehead.
+    Paint { bitmap: String, part: char },
+    /// Back to the resting picture for a part.
+    Clear(char),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -86,6 +106,7 @@ impl Animation {
         // Captions contain commas, so everything past the fields belongs to
         // the text. SPEAKER and CAPTION come as a pair of lines.
         let mut captions = Vec::new();
+        let mut faces = Vec::new();
         let mut speaker: Option<String> = None;
         for line in doc.sections("GK3").flat_map(|s| &s.lines) {
             let mut parts = line.text.splitn(2, ',');
@@ -103,6 +124,33 @@ impl Animation {
                     speaker: speaker.clone(),
                     text: rest.trim().to_string(),
                 }),
+                "LIPSYNCH" | "FACETEX" | "UNFACETEX" => {
+                    let fields: Vec<&str> = rest.split(',').map(str::trim).collect();
+                    let part = |i: usize| {
+                        fields
+                            .get(i)
+                            .and_then(|p| p.chars().next())
+                            .map(|c| c.to_ascii_uppercase())
+                    };
+                    let change = match (kind.trim().to_ascii_uppercase().as_str(), &fields[..]) {
+                        ("LIPSYNCH", [_, shape, ..]) => {
+                            Some(FaceChange::Mouth(shape.to_ascii_uppercase()))
+                        }
+                        ("FACETEX", [_, bitmap, ..]) => part(2).map(|p| FaceChange::Paint {
+                            bitmap: bitmap.to_ascii_uppercase(),
+                            part: p,
+                        }),
+                        ("UNFACETEX", _) => part(1).map(FaceChange::Clear),
+                        _ => None,
+                    };
+                    if let (Some(change), Some(noun)) = (change, fields.first()) {
+                        faces.push(FaceEvent {
+                            frame,
+                            noun: noun.to_ascii_uppercase(),
+                            change,
+                        });
+                    }
+                }
                 "SPEAKERCAPTION" => {
                     // end frame, speaker, caption
                     let mut f = rest.splitn(3, ',');
@@ -122,6 +170,7 @@ impl Animation {
             actions,
             sounds,
             captions,
+            faces,
         }
     }
 }
@@ -143,6 +192,31 @@ mod tests {
         assert_eq!(yak.captions[0].text, "Well, that's odd.");
         assert_eq!(yak.captions[1].speaker.as_deref(), Some("MOSELY"));
         assert_eq!(yak.captions[1].text, "Starring: me, you");
+    }
+
+    #[test]
+    fn reads_face_changes() {
+        let anm = Animation::parse(
+            b"[HEADER]\r\n4\r\n[GK3]\r\n4\r\n0,FACETEX,GABRIEL,GAB_BLINK_01,E\r\n\
+              2,LIPSYNCH,GABRIEL,Mouth03\r\n3,UNFACETEX,GABRIEL,E\r\n",
+        );
+        assert_eq!(anm.faces.len(), 3);
+        assert_eq!(
+            anm.faces[0].change,
+            FaceChange::Paint {
+                bitmap: "GAB_BLINK_01".into(),
+                part: 'E'
+            }
+        );
+        assert_eq!(anm.faces[1].change, FaceChange::Mouth("MOUTH03".into()));
+        assert_eq!(
+            anm.faces[2],
+            FaceEvent {
+                frame: 3,
+                noun: "GABRIEL".into(),
+                change: FaceChange::Clear('E')
+            }
+        );
     }
 
     #[test]

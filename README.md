@@ -4,7 +4,8 @@ A Gabriel Knight 3 engine in Rust that ships as a single executable: no
 runtime to install, no bundled shared libraries. It plays the game from your
 own copy's `Data` directory. See [PLAN.md](PLAN.md) for the design and roadmap.
 
-**Status:** phase 6 of 11 done: the first room is playable. Every asset decodes, and every room can be
+**Status:** phase 6 of 11 done (the first room is playable), with parts of
+phases 4 and 9 (faces, inventory) in place. Every asset decodes, and every room can be
 flown through in a window, textured, lightmapped for its time of day and with
 its skybox. Characters and props stand where the scene puts them and run their
 idle animations (Gabriel breathes and fidgets; the lobby fans turn). The
@@ -15,9 +16,13 @@ of day.
 Gabriel's hotel room on day one is playable: click the floor to walk, click
 anything to get the original verb icons, and every action plays as the game
 wrote it, with the right camera cuts, animations, captions and recorded
-voice, and the room's ambient soundtrack. Leaving the room loads the next one.
-Not yet: lip sync, the inventory screen, SIDNEY, conversations with a topic
-menu, movies, saving.
+voice, lip-synced faces, and the room's ambient soundtrack. Conversations
+work: TALK opens a topic bar, each topic is raised once, and the "last word"
+topics come up only when the rest have been said. The inventory shows
+Gabriel's or Grace's items with the original pictures and close-ups, and an
+item can be picked up and used on things. Leaving the room loads the next
+one. Not yet: SIDNEY, movies, saving, conversation camera work, the camera
+staying inside the room's bounds.
 
 ## Playing
 
@@ -28,8 +33,16 @@ gk3 play LBY --time 207A     # anywhere, any time
 
 Left-click the floor to walk; left-click a thing to see what can be done to it
 and click a verb icon; right-click or Esc closes the menu; while someone is
-speaking, a click or Space moves on to the next line. Esc with no menu open
-quits. Sound comes from PulseAudio or PipeWire if they are there; without
+speaking, a click or Space moves on to the next line. I, Tab or the button at
+the bottom left opens the inventory; click an item for INSPECT (close-up),
+its verbs, and PICKUP, which puts it in hand so it is offered as a verb on
+whatever you click next. Esc with nothing open quits.
+
+The camera moves as in the original: W/S or Up/Down go forward and back, A/D
+or Left/Right turn, Shift makes them pitch, Ctrl makes them rise, sink and
+strafe, Alt doubles the speed, and dragging with the left button does the
+same with the mouse. Space levels the camera; 1 to 9 jump to the room's set
+camera angles. The camera only moves while nothing is playing. Sound comes from PulseAudio or PipeWire if they are there; without
 them the game is silent rather than refusing to start.
 
 For testing, the same command runs without a window:
@@ -37,6 +50,9 @@ For testing, the same command runs without a window:
 ```sh
 gk3 play R25 --list                        # everything that can be done now
 gk3 play R25 --do WINDOW:OPEN --png out.png # do it, report, take a picture
+gk3 play R25 --do HALL_DOOR:R25_ROOM_KEY    # use an item on something
+gk3 play R25 --inventory --png inv.png      # the items and their verbs
+gk3 play R25 --closeup TALISMAN --png t.png # one item's close-up
 ```
 
 ## Building

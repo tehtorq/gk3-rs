@@ -23,7 +23,11 @@ pub fn characters(
 /// The room's people and props, run forward `seconds` in fixed steps.
 pub fn cast(lib: &Library, renderer: &Renderer, room: &Room, seconds: f64) -> Option<Cast> {
     let sif = room.sif.as_ref()?;
-    let mut cast = Cast::load(lib, renderer, sif, &characters(lib));
+    let faces = lib
+        .read("FACES.TXT")
+        .map(|b| crate::faces::parse(&b))
+        .unwrap_or_default();
+    let mut cast = Cast::load(lib, renderer, sif, &characters(lib), &faces);
     let steps = (seconds * 30.0).round() as usize;
     for step in 0..=steps {
         cast.update(lib, step as f64 / 30.0);

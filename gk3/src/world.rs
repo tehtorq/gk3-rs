@@ -83,6 +83,7 @@ pub struct World<'a> {
     pub catalog: Catalog,
     scripts: HashMap<String, Rc<Script>>,
     characters: HashMap<String, Character>,
+    faces: HashMap<String, crate::faces::FaceConfig>,
     pub state: GameState,
     vm: Vm,
     pub scene: Option<Scene>,
@@ -90,8 +91,14 @@ pub struct World<'a> {
     pub clock: f64,
     tasks: Vec<Task>,
     pub captions: Vec<Caption>,
-    /// Threads running actions; while any runs the player cannot act.
-    actions: Vec<(ThreadId, Rule)>,
+    /// Threads running actions, and whether the player started them; while
+    /// any runs the player cannot act.
+    actions: Vec<(ThreadId, Rule, bool)>,
+    /// A person whose topics should be offered once the world is free.
+    pub topic_bar: Option<String>,
+    /// The conversation a script has set, if any.
+    pub conversation: Option<String>,
+    end_conversation: bool,
     approach: Option<Approach>,
     /// Something to turn to face when an approach walk ends.
     face_after: Option<String>,
@@ -112,12 +119,38 @@ pub struct World<'a> {
 impl<'a> World<'a> {
     pub fn new(lib: &'a Library, timeblock: &str, audio: Audio) -> Self {
         let (scripts, _) = crate::sheep_cmd::load_all(lib);
+        let mut state = GameState::new(timeblock, "");
+        // What each of them has on them when the story starts.
+        for item in [
+            "DAGGER",
+            "GABES_PASSPORT",
+            "NOTEPAD",
+            "PRINCE_JAMES_CARD",
+            "R25_ROOM_KEY",
+            "TALISMAN",
+            "TAPE_RECORDER",
+            "WALLET",
+        ] {
+            state.give_item("GABRIEL", item);
+        }
+        for item in [
+            "GRACE_WALLET",
+            "GRACES_PASSPORT",
+            "R25_ROOM_KEY_GRACE",
+            "SKETCHPAD",
+        ] {
+            state.give_item("GRACE", item);
+        }
         Self {
             lib,
             catalog: Catalog::new(lib),
             scripts: scripts.into_iter().collect(),
             characters: shoot::characters(lib),
-            state: GameState::new(timeblock, ""),
+            faces: lib
+                .read("FACES.TXT")
+                .map(|b| crate::faces::parse(&b))
+                .unwrap_or_default(),
+            state,
             vm: Vm::new(),
             scene: None,
             camera: Camera {
@@ -130,6 +163,9 @@ impl<'a> World<'a> {
             tasks: Vec::new(),
             captions: Vec::new(),
             actions: Vec::new(),
+            topic_bar: None,
+            conversation: None,
+            end_conversation: false,
             approach: None,
             face_after: None,
             next_location: None,
@@ -161,7 +197,7 @@ impl<'a> World<'a> {
         let room = self.catalog.load(self.lib, &scene_name)?;
         let sif = room.sif.clone().unwrap_or_default();
         let gpu = renderer.upload(&room.mesh);
-        let mut cast = Cast::load(self.lib, renderer, &sif, &self.characters);
+        let mut cast = Cast::load(self.lib, renderer, &sif, &self.characters, &self.faces);
         cast.update(self.lib, self.clock);
         cast.upload(renderer);
 
@@ -302,7 +338,7 @@ impl<'a> World<'a> {
                 .cloned()
         };
         if let Some(rule) = enter {
-            self.run(renderer, rule);
+            self.run(renderer, rule, false);
         }
         Ok(())
     }
@@ -315,15 +351,95 @@ impl<'a> World<'a> {
         let snapshot = self.state.clone();
         let mut probe = snapshot.clone();
         let mut api = GameApi::new(&mut probe, &self.scripts);
-        scene
+        let mut out: Vec<Rule> = scene
             .actions
             .available(noun, &mut api, &snapshot)
             .into_iter()
-            // Using an inventory item is a verb named after it; offer those
-            // only for items the player is carrying.
-            .filter(|r| is_plain_verb(&r.verb) || self.state.has_item(&self.state.ego, &r.verb))
+            // Topics and chat belong to the topic bar, after TALK; using an
+            // item is offered below, for the item in hand.
+            .filter(|r| {
+                !actions::is_topic(&r.verb)
+                    && !matches!(r.verb.as_str(), "Z_CHAT" | "CANCEL")
+                    && is_plain_verb(&r.verb)
+            })
             .cloned()
-            .collect()
+            .collect();
+        let ego = &self.state.ego;
+        if let Some(item) = self.state.active_item.get(ego)
+            && self.state.has_item(ego, item)
+            && !item.eq_ignore_ascii_case(noun)
+            && let Some(rule) = scene.actions.using(noun, item, &mut api, &snapshot)
+        {
+            // A wildcard rule still reads, and counts, as this noun and item.
+            out.push(Rule {
+                noun: gk3_game::state::key(noun),
+                verb: gk3_game::state::key(item),
+                ..rule.clone()
+            });
+        }
+        out
+    }
+
+    /// What can be raised with somebody: their topics, then chat and a way
+    /// out where the files give one.
+    pub fn topics(&self, noun: &str) -> Vec<Rule> {
+        let Some(scene) = &self.scene else {
+            return Vec::new();
+        };
+        let snapshot = self.state.clone();
+        let mut probe = snapshot.clone();
+        let mut api = GameApi::new(&mut probe, &self.scripts);
+        let available = scene.actions.available(noun, &mut api, &snapshot);
+        let mut out: Vec<Rule> = available
+            .iter()
+            .filter(|r| actions::is_topic(&r.verb))
+            .map(|r| (*r).clone())
+            .collect();
+        out.extend(
+            available
+                .iter()
+                .filter(|r| r.verb == "Z_CHAT")
+                .map(|r| (*r).clone()),
+        );
+        if !out.is_empty() {
+            out.extend(
+                available
+                    .iter()
+                    .filter(|r| r.verb == "CANCEL")
+                    .map(|r| (*r).clone()),
+            );
+        }
+        out
+    }
+
+    /// Ends the conversation the way the game does: `GLB_ALL:CodeCallEndConv$`.
+    pub fn end_conversation(&mut self, renderer: &Renderer) {
+        self.topic_bar = None;
+        let Some(script) = self.scripts.get("GLB_ALL").cloned() else {
+            return;
+        };
+        let (result, effects) = {
+            let mut api = GameApi::new(&mut self.state, &self.scripts);
+            let result = self
+                .vm
+                .start(&mut api, script, "GLB_ALL", "CodeCallEndConv$");
+            (result, std::mem::take(&mut api.effects))
+        };
+        if let Ok(id) = result {
+            let rule = Rule {
+                noun: "CONVERSATION".into(),
+                verb: "END".into(),
+                case: "ALL".into(),
+                approach: None,
+                target: None,
+                script: String::new(),
+                source: "GLB_ALL".into(),
+            };
+            self.actions.push((id, rule, false));
+        }
+        self.perform(renderer, effects);
+        self.conversation = None;
+        self.finish_actions();
     }
 
     /// Every noun in scope with the verbs it offers now, for tools.
@@ -337,7 +453,8 @@ impl<'a> World<'a> {
         nouns
             .into_iter()
             .map(|n| {
-                let verbs = self.verbs(&n).into_iter().map(|r| r.verb).collect();
+                let mut verbs: Vec<String> = self.verbs(&n).into_iter().map(|r| r.verb).collect();
+                verbs.extend(self.topics(&n).into_iter().map(|r| r.verb));
                 (n, verbs)
             })
             .filter(|(_, v): &(String, Vec<String>)| !v.is_empty())
@@ -380,9 +497,10 @@ impl<'a> World<'a> {
                 self.face_after = Some(target);
             }
             self.approach = Some(Approach { rule, actor: ego });
+            self.topic_bar = None;
             return;
         }
-        self.run(renderer, rule);
+        self.run(renderer, rule, true);
     }
 
     /// Where to stand to look at something: in front of it, a character's
@@ -441,7 +559,7 @@ impl<'a> World<'a> {
     }
 
     /// Runs a rule's script now.
-    fn run(&mut self, renderer: &Renderer, rule: Rule) {
+    fn run(&mut self, renderer: &Renderer, rule: Rule, user: bool) {
         let script = match compile_action(&rule.script) {
             Ok(s) => Rc::new(s),
             Err(e) => {
@@ -456,7 +574,7 @@ impl<'a> World<'a> {
             (result, std::mem::take(&mut api.effects))
         };
         match result {
-            Ok(id) => self.actions.push((id, rule)),
+            Ok(id) => self.actions.push((id, rule, user)),
             Err(e) => self.log.push(format!("  {e}")),
         }
         self.perform(renderer, effects);
@@ -510,6 +628,10 @@ impl<'a> World<'a> {
         let scene = self.scene.as_mut()?;
         let name = e.name.to_ascii_uppercase();
         match name.as_str() {
+            "SHOWINVENTORY" | "HIDEINVENTORY" => {
+                self.state.inventory_shown = name == "SHOWINVENTORY";
+                None
+            }
             "CUTTOCAMERAANGLE"
             | "FORCECUTTOCAMERAANGLE"
             | "GLIDETOCAMERAANGLE"
@@ -529,6 +651,11 @@ impl<'a> World<'a> {
                     now,
                 )?;
                 if let Some(anm) = read_anm(lib, &e.string(0)) {
+                    for f in &anm.faces {
+                        scene
+                            .cast
+                            .face(&f.noun, now + f.frame as f64 / 15.0, f.change.clone());
+                    }
                     for sound in &anm.sounds {
                         self.scheduled.push((
                             now + sound.frame as f64 / 15.0,
@@ -620,6 +747,14 @@ impl<'a> World<'a> {
                 self.next_location = Some(e.string(0));
                 None
             }
+            "SETCONVERSATION" => {
+                self.conversation = Some(e.string(0));
+                None
+            }
+            "ENDCONVERSATION" => {
+                self.conversation = None;
+                None
+            }
             // Everything else is over as soon as it starts, for now.
             _ => None,
         }
@@ -674,6 +809,11 @@ impl<'a> World<'a> {
             })
             .as_ref()?;
         let result = (anm.frames as f32 / 15.0, anm.captions.clone());
+        let faces: Vec<_> = anm
+            .faces
+            .iter()
+            .map(|f| (at + f.frame as f64 / 15.0, f.clone()))
+            .collect();
         let sounds: Vec<_> = anm
             .sounds
             .iter()
@@ -687,6 +827,11 @@ impl<'a> World<'a> {
             })
             .collect();
         self.scheduled.extend(sounds);
+        if let Some(scene) = &mut self.scene {
+            for (t, f) in faces {
+                scene.cast.face(&f.noun, t, f.change);
+            }
+        }
         Some(result)
     }
 
@@ -789,7 +934,7 @@ impl<'a> World<'a> {
             if let Some(target) = self.face_after.take() {
                 self.face(&target);
             }
-            self.run(renderer, approach.rule);
+            self.run(renderer, approach.rule, true);
         }
 
         // Release scripts whose waits are over.
@@ -812,6 +957,11 @@ impl<'a> World<'a> {
         }
         self.finish_actions();
 
+        if self.end_conversation && self.actions.is_empty() {
+            self.end_conversation = false;
+            self.end_conversation(renderer);
+        }
+
         // A change of location waits for the action that asked for it.
         if self.actions.is_empty()
             && let Some(location) = self.next_location.take()
@@ -825,29 +975,45 @@ impl<'a> World<'a> {
     fn finish_actions(&mut self) {
         let vm = &self.vm;
         let mut finished = Vec::new();
-        self.actions.retain(|(id, rule)| {
+        self.actions.retain(|(id, rule, user)| {
             let done = !matches!(
                 vm.state(*id),
                 Some(ThreadState::Running | ThreadState::Waiting)
             );
             if done {
-                finished.push(rule.clone());
+                finished.push((rule.clone(), *user));
             }
             !done
         });
-        for rule in finished {
+        for (rule, user) in finished {
             // Topics and chats count themselves; ordinary verbs count only
             // when their script says so.
-            if rule.verb.starts_with("T_") {
+            if actions::is_topic(&rule.verb) {
                 *self
                     .state
                     .topics
                     .entry((rule.noun.clone(), rule.verb.clone()))
                     .or_default() += 1;
+                self.state.played_topics.insert((
+                    rule.noun.clone(),
+                    rule.verb.clone(),
+                    rule.case.clone(),
+                ));
             } else if rule.verb == "Z_CHAT" {
                 *self.state.chats.entry(rule.noun.clone()).or_default() += 1;
             }
             self.log.push(format!("done {}:{}", rule.noun, rule.verb));
+            // After talking, the topics come up; after a chat or a cancel
+            // the conversation is over.
+            if user {
+                if rule.verb == "TALK" || actions::is_topic(&rule.verb) {
+                    self.topic_bar = Some(rule.noun.clone());
+                } else if rule.verb == "Z_CHAT" || rule.verb == "CANCEL" {
+                    self.end_conversation = true;
+                } else if self.conversation.is_some() {
+                    self.topic_bar = Some(rule.noun.clone());
+                }
+            }
         }
         self.vm.collect();
     }

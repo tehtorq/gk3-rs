@@ -624,6 +624,29 @@ impl Renderer {
         }
     }
 
+    /// Paints a different picture on one of a model's submeshes, such as a
+    /// face that has just changed expression.
+    pub fn replace_model_texture(&self, model: &mut GpuModel, submesh: usize, image: &Image) {
+        let Some(draw) = model.draws.get_mut(submesh) else {
+            return;
+        };
+        let view = self.texture(&color_key(image), true);
+        draw.0 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("repainted"),
+            layout: &self.texture_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.repeat_sampler),
+                },
+            ],
+        });
+    }
+
     /// Replaces a model's posed, placed vertices.
     pub fn update_model(&self, model: &GpuModel, vertices: &[ModelVertex]) {
         debug_assert_eq!(vertices.len(), model.vertex_count);

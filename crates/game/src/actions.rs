@@ -2,9 +2,10 @@
 //!
 //! Each rule is `NOUN, VERB, CASE, [approach=…,] [target=…,] script={…}`, and
 //! a `[LOGIC]` section defines cases as Sheep expressions. Which files apply
-//! is decided by their names, which encode the timeblocks they cover. Rules
-//! are kept in priority order, most specific file first; the first rule for
-//! a verb whose case holds is the one that runs.
+//! is decided by their names, which encode the timeblocks they cover. When
+//! several rules for a noun and verb hold, the case decides which runs, by
+//! G-Engine's ranking (see [`case_rank`]); among equals, the most specific
+//! file wins, and rules are kept most specific file first.
 
 use std::collections::HashMap;
 
@@ -33,6 +34,37 @@ pub struct Rule {
 pub struct ActionSet {
     pub rules: Vec<Rule>,
     logic: HashMap<String, String>,
+}
+
+/// The noun that stands for any noun, and the verb for any inventory item.
+pub const ANY_OBJECT: &str = "ANY_OBJECT";
+pub const ANY_INV_ITEM: &str = "ANY_INV_ITEM";
+
+/// How strongly a case claims its action, from G-Engine's `ActionManager`:
+/// the more particular the circumstance, the higher. Cases it does not rank
+/// (such as `DEFAULT`) are used only when nothing ranked holds.
+fn case_rank(case: &str, custom: bool) -> u8 {
+    match case {
+        "ALL" | "ALL_INV" => 1,
+        "GABE_ALL" | "GRACE_ALL" | "GABE_ALL_INV" | "GRACE_ALL_INV" => 2,
+        "TIME_BLOCK" => 3,
+        "OTR_TIME" => 4,
+        "DIALOGUE_TOPICS_LEFT" | "NOT_DIALOGUE_TOPICS_LEFT" => 5,
+        "TIME_BLOCK_OVERRIDE" => 6,
+        c if ["1ST_TIME", "2CD_TIME", "2ND_TIME", "3RD_TIME"]
+            .iter()
+            .any(|p| c.starts_with(p)) =>
+        {
+            8
+        }
+        _ if custom => 7,
+        _ => 0,
+    }
+}
+
+/// Whether a verb raises a topic in conversation.
+pub fn is_topic(verb: &str) -> bool {
+    verb.starts_with("T_")
 }
 
 /// A timeblock as day and hour on a 24-hour clock: `110A` is (1, 10).
@@ -136,6 +168,11 @@ impl ActionSet {
     /// Whether a rule's case holds now. Never changes the story.
     pub fn holds(&self, rule: &Rule, host: &mut dyn Host, state: &GameState) -> bool {
         let count = state.noun_verb(&state.ego, &rule.noun, &rule.verb);
+        if is_topic(&rule.verb)
+            && let Some(holds) = self.topic_holds(rule, state)
+        {
+            return holds;
+        }
         match rule.case.as_str() {
             "ALL" | "DEFAULT" | "TIME_BLOCK" | "TIME_BLOCK_OVERRIDE" => true,
             "GABE_ALL" => state.ego == "GABRIEL",
@@ -172,6 +209,47 @@ impl ActionSet {
         }
     }
 
+    /// G-Engine's rules for topics, which the case conditions do not say:
+    /// a topic is raised once per case, and one whose case is `ALL` is the
+    /// last word on it, available only when everything else has been said.
+    /// `None` means the ordinary case logic decides.
+    fn topic_holds(&self, rule: &Rule, state: &GameState) -> Option<bool> {
+        const REPEATABLE: &[&str] = &[
+            "T_HANDSHAKE_A",
+            "T_HANDSHAKE_B",
+            "T_HANDSHAKE_C",
+            "T_HANDSHAKE_D",
+            "T_HANDSHAKE_E",
+            "T_DEAD_GUYS_X",
+        ];
+        let ego_ok = match rule.case.as_str() {
+            "ALL" => true,
+            "GABE_ALL" => state.ego == "GABRIEL",
+            "GRACE_ALL" => state.ego == "GRACE",
+            _ => {
+                let played = state.played_topics.contains(&(
+                    rule.noun.clone(),
+                    rule.verb.clone(),
+                    rule.case.clone(),
+                ));
+                return (played && !REPEATABLE.contains(&rule.verb.as_str())).then_some(false);
+            }
+        };
+        if !ego_ok {
+            return Some(false);
+        }
+        let said = *state
+            .topics
+            .get(&(rule.noun.clone(), rule.verb.clone()))
+            .unwrap_or(&0);
+        let total = self
+            .rules
+            .iter()
+            .filter(|r| r.noun == rule.noun && r.verb == rule.verb)
+            .count() as i32;
+        Some(said == total - 1)
+    }
+
     fn topics_left(&self, noun: &str, host: &mut dyn Host, state: &GameState) -> bool {
         self.rules
             .iter()
@@ -181,20 +259,84 @@ impl ActionSet {
             .any(|r| self.holds(r, host, state))
     }
 
-    /// What can be done to a noun now: the first rule per verb whose case
-    /// holds, in priority order.
-    pub fn available(&self, noun: &str, host: &mut dyn Host, state: &GameState) -> Vec<&Rule> {
-        let noun = key(noun);
-        let mut out: Vec<&Rule> = Vec::new();
-        for rule in self.rules.iter().filter(|r| r.noun == noun) {
-            if out.iter().any(|r| r.verb == rule.verb) {
+    /// The rule that runs for a noun and verb now, if any: the best-ranked
+    /// case that holds.
+    pub fn best(
+        &self,
+        noun: &str,
+        verb: &str,
+        host: &mut dyn Host,
+        state: &GameState,
+    ) -> Option<&Rule> {
+        let mut best: Option<(&Rule, u8)> = None;
+        for rule in self
+            .rules
+            .iter()
+            .filter(|r| r.noun == noun && r.verb == verb)
+        {
+            let rank = case_rank(&rule.case, self.logic.contains_key(&rule.case));
+            if best.is_some_and(|(_, b)| rank <= b) || !self.holds(rule, host, state) {
                 continue;
             }
-            if self.holds(rule, host, state) {
+            best = Some((rule, rank));
+        }
+        best.map(|(r, _)| r)
+    }
+
+    /// What can be done to a noun now: one rule per verb, the noun's own
+    /// before any `ANY_OBJECT` rule for the same verb.
+    pub fn available(&self, noun: &str, host: &mut dyn Host, state: &GameState) -> Vec<&Rule> {
+        let noun = key(noun);
+        let mut verbs: Vec<(&str, &str)> = Vec::new();
+        for owner in [noun.as_str(), ANY_OBJECT] {
+            for rule in self
+                .rules
+                .iter()
+                .filter(|r| r.noun == owner && r.verb != ANY_INV_ITEM)
+            {
+                if !verbs.iter().any(|(_, v)| *v == rule.verb) {
+                    verbs.push((owner, &rule.verb));
+                }
+            }
+        }
+        let mut out: Vec<&Rule> = Vec::new();
+        let mut taken: Vec<&str> = Vec::new();
+        for (owner, verb) in verbs {
+            if taken.contains(&verb) {
+                continue;
+            }
+            if let Some(rule) = self.best(owner, verb, host, state) {
+                taken.push(verb);
+                out.push(rule);
+            } else if owner != ANY_OBJECT
+                && let Some(rule) = self.best(ANY_OBJECT, verb, host, state)
+            {
+                taken.push(verb);
                 out.push(rule);
             }
         }
         out
+    }
+
+    /// What using an inventory item on a noun does, wildcards included, in
+    /// G-Engine's order of precedence: the exact pair, then the noun with
+    /// any item, then any noun with this item, then anything with anything.
+    pub fn using(
+        &self,
+        noun: &str,
+        item: &str,
+        host: &mut dyn Host,
+        state: &GameState,
+    ) -> Option<&Rule> {
+        let (noun, item) = (key(noun), key(item));
+        [
+            (noun.as_str(), item.as_str()),
+            (&noun, ANY_INV_ITEM),
+            (ANY_OBJECT, &item),
+            (ANY_OBJECT, ANY_INV_ITEM),
+        ]
+        .into_iter()
+        .find_map(|(n, v)| self.best(n, v, host, state))
     }
 
     pub fn find(
@@ -299,6 +441,98 @@ mod tests {
         assert!(covers("HAL110A04P", "102P"));
         assert!(!covers("HAL110A04P", "106P"));
         assert!(!covers("ch312p06p", "110A"));
+    }
+
+    #[test]
+    fn cases_rank_as_g_engine_does() {
+        // A general file listed first still loses to a better-ranked case.
+        let mut set = ActionSet::default();
+        set.add_file(
+            b"LAMP, LOOK, ALL, script={A();}\nLAMP, LOOK, LIT, script={B();}\nLAMP, LOOK, 1ST_TIME, script={C();}\n\
+              LAMP, THINK, GABE_ALL, script={D();}\nLAMP, THINK, ALL, script={E();}\n\
+              [LOGIC]\nLIT={1}\n",
+            "X.NVC",
+        );
+        let scripts = HashMap::new();
+        let mut state = GameState::new("110A", "R25");
+        let snapshot = state.clone();
+        let mut api = GameApi::new(&mut state, &scripts);
+        assert_eq!(
+            set.best("LAMP", "LOOK", &mut api, &snapshot)
+                .unwrap()
+                .script,
+            "C();"
+        );
+        assert_eq!(
+            set.best("LAMP", "THINK", &mut api, &snapshot)
+                .unwrap()
+                .script,
+            "D();"
+        );
+        let mut once = snapshot.clone();
+        once.noun_verbs
+            .insert(("GABRIEL".into(), "LAMP".into(), "LOOK".into()), 1);
+        let mut api = GameApi::new(&mut state, &scripts);
+        assert_eq!(
+            set.best("LAMP", "LOOK", &mut api, &once).unwrap().script,
+            "B();"
+        );
+    }
+
+    #[test]
+    fn wildcards_and_inventory_cases() {
+        let mut set = ActionSet::default();
+        set.add_file(
+            b"ANY_OBJECT, LOOK, ALL, script={Any();}\nANY_OBJECT, ANY_INV_ITEM, ALL, script={Nope();}\n\
+              DOOR, KEY, ALL, script={Unlock();}\nDOOR, ANY_INV_ITEM, ALL, script={NotThat();}\n\
+              KEY, LOOK, ALL_INV, script={KeyLook();}\n[LOGIC]\nALL_INV={IsTopLayerInventory()}\n",
+            "X.NVC",
+        );
+        let scripts = HashMap::new();
+        let mut state = GameState::new("110A", "R25");
+        let snapshot = state.clone();
+        let mut api = GameApi::new(&mut state, &scripts);
+        let door: Vec<_> = set
+            .available("DOOR", &mut api, &snapshot)
+            .iter()
+            .map(|r| r.script.clone())
+            .collect();
+        assert_eq!(
+            door,
+            ["Unlock();", "Any();"],
+            "the noun's own verbs, then the wildcard's; never ANY_INV_ITEM"
+        );
+        assert_eq!(
+            set.using("DOOR", "KEY", &mut api, &snapshot)
+                .unwrap()
+                .script,
+            "Unlock();"
+        );
+        assert_eq!(
+            set.using("DOOR", "WALLET", &mut api, &snapshot)
+                .unwrap()
+                .script,
+            "NotThat();"
+        );
+        assert_eq!(
+            set.using("LAMP", "WALLET", &mut api, &snapshot)
+                .unwrap()
+                .script,
+            "Nope();"
+        );
+        // Inventory cases hold only while the inventory is up.
+        assert_eq!(
+            set.find("KEY", "LOOK", &mut api, &snapshot).unwrap().script,
+            "Any();"
+        );
+        let mut shown = snapshot.clone();
+        shown.inventory_shown = true;
+        let mut probe = shown.clone();
+        let mut api = GameApi::new(&mut probe, &scripts);
+        assert_eq!(
+            set.find("KEY", "LOOK", &mut api, &shown).unwrap().script,
+            "KeyLook();"
+        );
     }
 
     #[test]

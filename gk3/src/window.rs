@@ -12,9 +12,11 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+use crate::camera::{self, Controls};
 use crate::play::Options;
-use crate::ui::{Menu, Ui, inside};
+use crate::ui::{Inventory, Menu, Ui, inside};
 use crate::world::{Pick, World};
+use gk3_game::actions::Rule;
 
 pub fn run(lib: Library, options: Options) -> Result<ExitCode, String> {
     // The world borrows the library for the whole run.
@@ -51,8 +53,15 @@ struct Gfx {
     world: World<'static>,
     ui: Ui,
     menu: Option<Menu>,
+    inventory: Inventory,
     hover: Option<String>,
     pointer: (f32, f32),
+    /// Where the left button went down, and whether it has since dragged
+    /// the camera rather than clicked.
+    press: Option<(f32, f32)>,
+    dragging: bool,
+    controls: Controls,
+    last_frame: f64,
     started: Instant,
     overlay: Overlay,
 }
@@ -116,8 +125,13 @@ impl Game {
             world,
             ui,
             menu: None,
+            inventory: Inventory::default(),
             hover: None,
             pointer: (0.0, 0.0),
+            press: None,
+            dragging: false,
+            controls: Controls::default(),
+            last_frame: 0.0,
             started: Instant::now(),
             overlay: Overlay::default(),
         })
@@ -129,14 +143,106 @@ impl Gfx {
         (self.config.width, self.config.height)
     }
 
+    /// The player may move the camera only in the room itself, with nothing
+    /// playing and no menu or inventory up.
+    fn camera_free(&self) -> bool {
+        self.world.idle() && self.menu.is_none() && !self.world.state.inventory_shown
+    }
+
+    /// Jumps to one of the room's camera angles, by number from 1.
+    fn room_camera(&mut self, index: usize) {
+        let Some(scene) = &self.world.scene else {
+            return;
+        };
+        if let Some(c) = scene.room.cameras.get(index) {
+            self.world.camera = crate::shoot::from_room_camera(c);
+        }
+    }
+
+    /// Closes the menu; closing a topic bar ends the conversation.
+    fn close_menu(&mut self) {
+        if let Some(menu) = self.menu.take()
+            && menu.topics
+        {
+            self.world.end_conversation(&self.renderer);
+        }
+    }
+
+    /// The player's items, in a steady order.
+    fn items(&self) -> Vec<String> {
+        let state = &self.world.state;
+        state
+            .inventory
+            .get(&state.ego)
+            .map(|i| i.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
     fn click(&mut self) {
         let size = self.size();
+        self.inventory.open = self.world.state.inventory_shown;
+        if self.inventory.closeup.take().is_some() {
+            return;
+        }
         if let Some(menu) = self.menu.take() {
             let slots = Ui::menu_slots(&menu, size);
-            if let Some(i) = slots.iter().position(|s| inside(*s, self.pointer)) {
-                let rule = menu.rules[i].clone();
-                self.world.act(&self.renderer, rule);
+            match slots.iter().position(|s| inside(*s, self.pointer)) {
+                Some(i) => {
+                    let rule = menu.rules[i].clone();
+                    if rule.source == "UI" && rule.verb == "INSPECT" {
+                        self.inventory.closeup = Some(rule.noun);
+                    } else if rule.source == "UI" && rule.verb == "PICKUP" {
+                        let ego = self.world.state.ego.clone();
+                        self.world.state.active_item.insert(ego, rule.noun);
+                    } else {
+                        self.world.act(&self.renderer, rule);
+                    }
+                }
+                None if menu.topics => self.world.end_conversation(&self.renderer),
+                None => {}
             }
+            return;
+        }
+        if self.inventory.open {
+            let items = self.items();
+            let slots = Ui::inventory_slots(&items, size);
+            match slots.iter().position(|s| inside(*s, self.pointer)) {
+                Some(i) if self.world.idle() => {
+                    // As G-Engine's inventory screen: INSPECT first, then
+                    // the item's verbs with PICKUP (take it in hand) after LOOK.
+                    let item = items[i].clone();
+                    let screen = |verb: &str| Rule {
+                        noun: item.clone(),
+                        verb: verb.into(),
+                        case: "ALL".into(),
+                        approach: None,
+                        target: None,
+                        script: String::new(),
+                        source: "UI".into(),
+                    };
+                    let mut rules = vec![screen("INSPECT")];
+                    let verbs = self.world.verbs(&item);
+                    let after_look = verbs
+                        .iter()
+                        .position(|r| r.verb == "LOOK")
+                        .map_or(0, |i| i + 1);
+                    rules.extend(verbs);
+                    rules.insert(after_look + 1, screen("PICKUP"));
+                    self.menu = Some(Menu {
+                        noun: item,
+                        rules,
+                        topics: false,
+                        x: self.pointer.0,
+                        y: self.pointer.1,
+                    });
+                }
+                Some(_) => self.world.skip(),
+                None => self.world.state.inventory_shown = false,
+            }
+            return;
+        }
+        if inside(Ui::inventory_button(size), self.pointer) && self.world.idle() {
+            self.world.state.inventory_shown = true;
             return;
         }
         if !self.world.idle() {
@@ -157,6 +263,7 @@ impl Gfx {
                     self.menu = Some(Menu {
                         noun,
                         rules,
+                        topics: false,
                         x: self.pointer.0,
                         y: self.pointer.1,
                     });
@@ -173,9 +280,42 @@ impl Gfx {
         let now = self.started.elapsed().as_secs_f64();
         self.world.update(&self.renderer, now);
         let size = self.size();
+        let dt = (now - self.last_frame).clamp(0.0, 0.1) as f32;
+        self.last_frame = now;
+        if self.camera_free() {
+            self.controls.apply(&mut self.world.camera, dt);
+        } else {
+            self.controls.drag = (0.0, 0.0);
+        }
+        // Scripts show and hide the inventory too.
+        self.inventory.open = self.world.state.inventory_shown;
+        if !self.inventory.open {
+            self.inventory.closeup = None;
+        }
+
+        // The topics come up by themselves once the world is free.
+        if self.menu.is_none()
+            && self.world.idle()
+            && let Some(noun) = self.world.topic_bar.take()
+        {
+            let rules = self.world.topics(&noun);
+            if rules.is_empty() {
+                self.world.end_conversation(&self.renderer);
+            } else {
+                self.menu = Some(Menu {
+                    noun,
+                    rules,
+                    topics: true,
+                    x: size.0 as f32 / 2.0,
+                    y: size.1 as f32 * 0.75,
+                });
+            }
+        }
 
         self.hover = None;
         if self.menu.is_none()
+            && !self.inventory.open
+            && !self.dragging
             && self.world.idle()
             && let Pick::Noun(noun) =
                 self.world
@@ -186,6 +326,20 @@ impl Gfx {
 
         let mut overlay = std::mem::take(&mut self.overlay);
         overlay.clear();
+        if self.inventory.open {
+            self.inventory.items = self.items();
+            self.ui.inventory(
+                self.world.lib,
+                &mut self.renderer,
+                &mut overlay,
+                &self.inventory,
+                self.pointer,
+                size,
+            );
+        } else {
+            self.ui
+                .draw_inventory_button(&mut overlay, self.pointer, size);
+        }
         self.ui.captions(&mut overlay, &self.world, size);
         if let Some(noun) = &self.hover {
             self.ui
@@ -262,25 +416,88 @@ impl ApplicationHandler for Game {
                 gfx.depth = gfx.renderer.depth_view(size.width, size.height);
             }
             WindowEvent::CursorMoved { position, .. } => {
-                gfx.pointer = (position.x as f32, position.y as f32)
+                let to = (position.x as f32, position.y as f32);
+                // Holding the left button and moving drags the camera.
+                if let Some(start) = gfx.press
+                    && gfx.camera_free()
+                {
+                    let moved = (to.0 - start.0).hypot(to.1 - start.1);
+                    if gfx.dragging {
+                        gfx.controls.drag.0 += to.0 - gfx.pointer.0;
+                        gfx.controls.drag.1 += to.1 - gfx.pointer.1;
+                    } else if moved > camera::DRAG_START {
+                        gfx.dragging = true;
+                    }
+                }
+                gfx.pointer = to;
             }
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button,
-                ..
-            } => match button {
-                MouseButton::Left => gfx.click(),
-                MouseButton::Right => gfx.menu = None,
+            // A click acts on release, unless the press became a drag.
+            WindowEvent::MouseInput { state, button, .. } => match (button, state) {
+                (MouseButton::Left, ElementState::Pressed) => {
+                    gfx.press = Some(gfx.pointer);
+                    gfx.dragging = false;
+                }
+                (MouseButton::Left, ElementState::Released) => {
+                    if gfx.press.take().is_some() && !gfx.dragging {
+                        gfx.click();
+                    }
+                    gfx.dragging = false;
+                }
+                (MouseButton::Right, ElementState::Pressed) => gfx.close_menu(),
                 _ => {}
             },
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+            WindowEvent::KeyboardInput { event, .. } => {
+                let down = event.state == ElementState::Pressed;
+                let PhysicalKey::Code(code) = event.physical_key else {
+                    return;
+                };
+                let c = &mut gfx.controls;
+                match code {
+                    KeyCode::KeyW | KeyCode::ArrowUp => c.forward = down,
+                    KeyCode::KeyS | KeyCode::ArrowDown => c.back = down,
+                    KeyCode::KeyA | KeyCode::ArrowLeft => c.left = down,
+                    KeyCode::KeyD | KeyCode::ArrowRight => c.right = down,
+                    KeyCode::ShiftLeft | KeyCode::ShiftRight => c.pitch = down,
+                    KeyCode::ControlLeft | KeyCode::ControlRight => c.pan = down,
+                    KeyCode::AltLeft | KeyCode::AltRight => c.fast = down,
+                    _ => {}
+                }
+                if !down || event.repeat {
+                    return;
+                }
                 match event.physical_key {
                     PhysicalKey::Code(KeyCode::Escape) => {
-                        if gfx.menu.take().is_none() {
+                        if gfx.menu.is_some() {
+                            gfx.close_menu();
+                        } else if gfx.world.state.inventory_shown {
+                            gfx.world.state.inventory_shown = false;
+                        } else {
                             event_loop.exit();
                         }
                     }
+                    // Space moves things on; with nothing playing it levels
+                    // the camera, as in G-Engine.
+                    PhysicalKey::Code(KeyCode::Space) if gfx.camera_free() => {
+                        gfx.world.camera.pitch = 0.0;
+                    }
                     PhysicalKey::Code(KeyCode::Space | KeyCode::Period) => gfx.world.skip(),
+                    PhysicalKey::Code(
+                        k @ (KeyCode::Digit1
+                        | KeyCode::Digit2
+                        | KeyCode::Digit3
+                        | KeyCode::Digit4
+                        | KeyCode::Digit5
+                        | KeyCode::Digit6
+                        | KeyCode::Digit7
+                        | KeyCode::Digit8
+                        | KeyCode::Digit9),
+                    ) if gfx.camera_free() => {
+                        gfx.room_camera(k as usize - KeyCode::Digit1 as usize);
+                    }
+                    PhysicalKey::Code(KeyCode::KeyI | KeyCode::Tab) if gfx.menu.is_none() => {
+                        gfx.world.state.inventory_shown = !gfx.world.state.inventory_shown;
+                        gfx.inventory.closeup = None;
+                    }
                     _ => {}
                 }
             }

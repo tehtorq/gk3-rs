@@ -375,7 +375,7 @@ impl<'a> GameApi<'a> {
             "DOESMODELEXIST" => Value::Int(1),
             "ISCAMERAGLIDEENABLED" => Value::Int(1),
             "ISACTORNEAR" | "ISWALKINGACTORNEAR" => Value::Int(0),
-            "ISTOPLAYERINVENTORY" => Value::Int(0),
+            "ISTOPLAYERINVENTORY" => Value::from(st.inventory_shown),
             "DOESSIDNEYFILEEXIST" => Value::Int(0),
             _ => return None,
         })

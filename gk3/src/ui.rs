@@ -23,12 +23,27 @@ struct LoadedFont {
 pub struct Menu {
     pub noun: String,
     pub rules: Vec<Rule>,
+    /// A topic bar: closing it ends the conversation.
+    pub topics: bool,
     pub x: f32,
     pub y: f32,
 }
 
+/// The inventory screen's state.
+#[derive(Default)]
+pub struct Inventory {
+    pub open: bool,
+    /// What the player carries, in the order shown.
+    pub items: Vec<String>,
+    /// An item shown full size.
+    pub closeup: Option<String>,
+}
+
 pub struct Ui {
     fonts: HashMap<&'static str, LoadedFont>,
+    /// Item to the stem of its pictures, from INVENTORYSPRITES.TXT.
+    sprites: HashMap<String, String>,
+    pictures: HashMap<String, Option<(OverlayTexture, u32, u32)>>,
     /// Verb to its icon names (normal, hover), from VERBS.TXT.
     icon_names: HashMap<String, (String, String)>,
     icons: HashMap<String, Option<OverlayTexture>>,
@@ -63,8 +78,21 @@ impl Ui {
                 );
             }
         }
+        // NAME = stem, with ; comments; the one file of its kind.
+        let mut sprites = HashMap::new();
+        if let Ok(bytes) = lib.read("INVENTORYSPRITES.TXT") {
+            let text: String = bytes.iter().map(|&b| b as char).collect();
+            for line in text.lines() {
+                let line = line.split(';').next().unwrap_or("").trim();
+                if let Some((name, stem)) = line.split_once('=') {
+                    sprites.insert(name.trim().to_ascii_uppercase(), stem.trim().to_string());
+                }
+            }
+        }
         Self {
             fonts,
+            sprites,
+            pictures: HashMap::new(),
             icon_names,
             icons: HashMap::new(),
         }
@@ -281,6 +309,169 @@ impl Ui {
                 );
             }
         }
+    }
+}
+
+impl Ui {
+    /// An item's picture: `9` for the inventory list, `6` for a close-up,
+    /// with or without an underscore before the number.
+    fn picture(
+        &mut self,
+        lib: &Library,
+        renderer: &mut Renderer,
+        item: &str,
+        size: char,
+    ) -> Option<(OverlayTexture, u32, u32)> {
+        let stem = self.sprites.get(&item.to_ascii_uppercase())?.clone();
+        *self
+            .pictures
+            .entry(format!("{stem}{size}"))
+            .or_insert_with(|| {
+                // Close-ups are mostly `…6_ALPHA` (one is `…_6_ALPHA`).
+                let bytes = [
+                    format!("{stem}{size}.BMP"),
+                    format!("{stem}_{size}.BMP"),
+                    format!("{stem}{size}_ALPHA.BMP"),
+                    format!("{stem}_{size}_ALPHA.BMP"),
+                ]
+                .iter()
+                .find_map(|name| lib.read(name).ok())?;
+                let image = gk3_render::color_key(&image::decode(&bytes).ok()?);
+                let (w, h) = (image.width, image.height);
+                Some((renderer.add_overlay_texture(&image), w, h))
+            })
+    }
+
+    /// Where each carried item is drawn on the inventory screen.
+    pub fn inventory_slots(items: &[String], size: (u32, u32)) -> Vec<[f32; 4]> {
+        let scale = Self::scale(size.1);
+        let cell = 80.0 * scale;
+        let columns = ((size.0 as f32 * 0.8) / cell).floor().max(1.0) as usize;
+        let x0 = (size.0 as f32 - columns.min(items.len().max(1)) as f32 * cell) / 2.0;
+        let y0 = size.1 as f32 * 0.2;
+        (0..items.len())
+            .map(|i| {
+                [
+                    x0 + (i % columns) as f32 * cell,
+                    y0 + (i / columns) as f32 * cell,
+                    cell - 8.0,
+                    cell - 8.0,
+                ]
+            })
+            .collect()
+    }
+
+    pub fn inventory(
+        &mut self,
+        lib: &Library,
+        renderer: &mut Renderer,
+        overlay: &mut Overlay,
+        state: &Inventory,
+        pointer: (f32, f32),
+        size: (u32, u32),
+    ) {
+        let items = &state.items;
+        let scale = Self::scale(size.1);
+        overlay.rect([0.0, 0.0, size.0 as f32, size.1 as f32], [10, 8, 6, 200]);
+        if let Some(item) = &state.closeup {
+            if let Some((texture, w, h)) = self.picture(lib, renderer, item, '6') {
+                let fit = ((size.0 as f32 * 0.8) / w as f32).min((size.1 as f32 * 0.8) / h as f32);
+                let (dw, dh) = (w as f32 * fit, h as f32 * fit);
+                overlay.image(
+                    texture,
+                    [0.0, 0.0, w as f32, h as f32],
+                    [
+                        (size.0 as f32 - dw) / 2.0,
+                        (size.1 as f32 - dh) / 2.0,
+                        dw,
+                        dh,
+                    ],
+                    [255; 4],
+                );
+            }
+            return;
+        }
+        let title = "Inventory";
+        let (tw, _) = self.measure("F_CAPTION_EGO", title);
+        self.text(
+            overlay,
+            "F_CAPTION_EGO",
+            title,
+            ((size.0 as f32 - tw * scale) / 2.0, size.1 as f32 * 0.1),
+            scale,
+            [255; 4],
+        );
+        for (item, slot) in items.iter().zip(Self::inventory_slots(items, size)) {
+            let hovered = inside(slot, pointer);
+            if hovered {
+                overlay.rect(
+                    [slot[0] - 3.0, slot[1] - 3.0, slot[2] + 6.0, slot[3] + 6.0],
+                    [200, 170, 110, 120],
+                );
+            }
+            match self.picture(lib, renderer, item, '9') {
+                Some((texture, w, h)) => {
+                    let fit = (slot[2] / w as f32).min(slot[3] / h as f32);
+                    let (dw, dh) = (w as f32 * fit, h as f32 * fit);
+                    overlay.image(
+                        texture,
+                        [0.0, 0.0, w as f32, h as f32],
+                        [
+                            slot[0] + (slot[2] - dw) / 2.0,
+                            slot[1] + (slot[3] - dh) / 2.0,
+                            dw,
+                            dh,
+                        ],
+                        [255; 4],
+                    );
+                }
+                None => overlay.rect(slot, [80, 60, 40, 200]),
+            }
+            if hovered {
+                let name = display_name(item);
+                let (w, _) = self.measure("F_TOOLTIP", &name);
+                let at = (
+                    slot[0] + slot[2] / 2.0 - w * scale / 2.0,
+                    slot[1] + slot[3] + 2.0,
+                );
+                self.text(overlay, "F_TOOLTIP", &name, at, scale, [255; 4]);
+            }
+        }
+    }
+
+    /// A small button in the corner that opens the inventory.
+    pub fn inventory_button(size: (u32, u32)) -> [f32; 4] {
+        let scale = Self::scale(size.1);
+        [
+            8.0,
+            size.1 as f32 - 36.0 * scale,
+            90.0 * scale,
+            28.0 * scale,
+        ]
+    }
+
+    pub fn draw_inventory_button(
+        &self,
+        overlay: &mut Overlay,
+        pointer: (f32, f32),
+        size: (u32, u32),
+    ) {
+        let scale = Self::scale(size.1);
+        let r = Self::inventory_button(size);
+        let colour = if inside(r, pointer) {
+            [120, 90, 50, 220]
+        } else {
+            [60, 45, 30, 200]
+        };
+        overlay.rect(r, colour);
+        self.text(
+            overlay,
+            "F_CAPTION_EGO",
+            "Inventory",
+            (r[0] + 8.0, r[1] + 4.0 * scale),
+            scale,
+            [255; 4],
+        );
     }
 }
 

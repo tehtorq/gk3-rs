@@ -29,6 +29,9 @@ pub struct Options {
     /// Show the inventory (and with `--closeup`, one item) in the picture.
     pub inventory: bool,
     pub closeup: Option<String>,
+    /// A saved game to start from, and one to write at the end (headless).
+    pub load: Option<String>,
+    pub save: Option<String>,
 }
 
 pub fn parse(args: &[String]) -> Result<(Options, bool), String> {
@@ -43,6 +46,8 @@ pub fn parse(args: &[String]) -> Result<(Options, bool), String> {
         view: None,
         inventory: false,
         closeup: None,
+        load: None,
+        save: None,
     };
     let mut headless = false;
     let mut it = args.iter();
@@ -80,6 +85,11 @@ pub fn parse(args: &[String]) -> Result<(Options, bool), String> {
                 o.inventory = true;
                 headless = true;
             }
+            "--load" => o.load = Some(value()?),
+            "--save" => {
+                o.save = Some(value()?);
+                headless = true;
+            }
             "--list" => {
                 o.list = true;
                 headless = true;
@@ -100,6 +110,14 @@ pub fn run(lib: Library, args: &[String]) -> Result<ExitCode, String> {
     }
 }
 
+/// Enters the location asked for, or the one a saved game was in.
+pub fn start(world: &mut World, renderer: &Renderer, o: &Options) -> Result<(), String> {
+    match &o.load {
+        Some(name) => world.load(renderer, &crate::saves::read(name)?),
+        None => world.enter(renderer, &o.location),
+    }
+}
+
 /// Runs the world until the player is free (or `limit` passes).
 fn settle(world: &mut World, renderer: &Renderer, limit: f64) {
     let start = world.clock;
@@ -113,8 +131,11 @@ fn headless_run(lib: &Library, o: &Options) -> Result<ExitCode, String> {
     let (device, queue, _) = gk3_render::headless()?;
     let renderer = Renderer::new(device, queue, gk3_render::OFFSCREEN_FORMAT);
     let mut world = World::new(lib, &o.time, gk3_audio::Audio::silent("headless"));
-    world.enter(&renderer, &o.location)?;
+    start(&mut world, &renderer, o)?;
     settle(&mut world, &renderer, PATIENCE);
+    // Once settled, a loaded game puts the player back.
+    let t = world.clock;
+    world.update(&renderer, t);
 
     for (i, (noun, verb)) in o.actions.iter().enumerate() {
         // Using an item means picking it up from the inventory first.
@@ -148,6 +169,12 @@ fn headless_run(lib: &Library, o: &Options) -> Result<ExitCode, String> {
         world.update(&renderer, t);
     }
 
+    if let Some(name) = &o.save {
+        let path = world
+            .save()
+            .and_then(|text| crate::saves::write(name, &text))?;
+        println!("saved to {}", path.display());
+    }
     if o.inventory {
         world.state.inventory_shown = true;
         let ego = world.state.ego.clone();

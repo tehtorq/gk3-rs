@@ -81,7 +81,13 @@ impl Document {
             if line.is_empty() {
                 continue;
             }
-            if let Some(header) = line.strip_prefix('[').filter(|_| line.contains(']')) {
+            // LHM.SIF has a conditional header missing its closing bracket,
+            // which the original read as a header all the same.
+            let unclosed = line.contains("={") && line.ends_with('}');
+            if let Some(header) = line
+                .strip_prefix('[')
+                .filter(|_| line.contains(']') || unclosed)
+            {
                 if !current.name.is_empty() || !current.lines.is_empty() {
                     doc.sections.push(std::mem::take(&mut current));
                 }
@@ -249,7 +255,7 @@ mod tests {
     fn conditional_headers() {
         let doc = Document::parse(
             b"[MODELS={IsCurrentTime(\"202p\") && GetEgoCurrentLocationCount() < 1}]\nbed\n\
-              [MODELS]\nlamp\n[ODD={A()}]]\nx\n",
+                            [MODELS]\nlamp\n[ODD={A()}]]\nx\n[GENERAL={B() || C()}\nscene=y\n",
             Split::Commas,
         );
         let models: Vec<_> = doc.sections("MODELS").collect();
@@ -263,6 +269,9 @@ mod tests {
             doc.section("ODD").unwrap().condition.as_deref(),
             Some("A()")
         );
+        let general = doc.section("GENERAL").unwrap();
+        assert_eq!(general.condition.as_deref(), Some("B() || C()"));
+        assert_eq!(general.lines[0].get("scene"), Some("y"));
     }
 
     #[test]

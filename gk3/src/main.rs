@@ -8,6 +8,7 @@ mod export;
 mod faces;
 mod play;
 mod room;
+mod saves;
 mod sheep_cmd;
 mod shoot;
 mod soundtrack;

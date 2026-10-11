@@ -44,8 +44,20 @@ struct Walk {
     heading: Option<f32>,
 }
 
+/// What an actor does with themselves when nothing else is asked of them:
+/// stand about, talk, or listen. Each is a GAS script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fidget {
+    Idle = 0,
+    Talk = 1,
+    Listen = 2,
+}
+
 struct Figure {
     name: String,
+    /// GAS names for idling, talking and listening, by `Fidget`.
+    fidgets: [Option<String>; 3],
+    fidget: Option<Fidget>,
     noun: Option<String>,
     model: Model,
     pose: Pose,
@@ -195,6 +207,8 @@ impl Cast {
                 let gas = line.get("idle").and_then(|g| load_gas(lib, g));
                 if let Some(mut figure) = cast.figure(lib, renderer, name, Some(placement), gas) {
                     figure.noun = line.get("noun").map(|n| n.to_ascii_uppercase());
+                    figure.fidgets =
+                        ["idle", "talk", "listen"].map(|k| line.get(k).map(str::to_string));
                     if let Some(config) = faces.get(&figure.name) {
                         let submesh = figure
                             .model
@@ -286,8 +300,11 @@ impl Cast {
             Some(a) => placement::place(&pose, &a.character, a.position, a.heading),
             None => Mat4::IDENTITY,
         };
+        let fidget = gas.is_some().then_some(Fidget::Idle);
         Some(Figure {
             name: name.to_ascii_uppercase(),
+            fidgets: Default::default(),
+            fidget,
             noun: None,
             model,
             pose,
@@ -551,6 +568,19 @@ impl Cast {
         }
     }
 
+    /// Stands an actor at a spot, facing a heading in radians.
+    pub fn put(&mut self, name: &str, position: Vec3, heading: f32) {
+        let Some(i) = self.find(name) else { return };
+        let f = &mut self.figures[i];
+        if let Some(a) = &mut f.actor {
+            a.position = position;
+            a.heading = heading;
+            f.world = placement::place(&f.pose, &a.character, a.position, a.heading);
+            f.walk = None;
+            f.dirty = true;
+        }
+    }
+
     pub fn actor_position(&self, name: &str) -> Option<(Vec3, f32)> {
         let f = &self.figures[self.find(name)?];
         f.actor.as_ref().map(|a| (a.position, a.heading))
@@ -743,6 +773,74 @@ impl Cast {
     }
 
     /// The nearest visible figure with a noun under a ray: distance and noun.
+    /// Which fidget an actor is doing.
+    pub fn fidget(&self, who: &str) -> Option<Fidget> {
+        self.figures[self.find(who)?].fidget
+    }
+
+    /// Gives an actor a different script for one kind of fidget, returning
+    /// the one it replaces. If that kind is running it restarts with the new
+    /// script, or stops if there is none, as G-Engine's
+    /// `CheckUpdateActiveFidget` does.
+    pub fn set_fidget_gas(
+        &mut self,
+        lib: &Library,
+        who: &str,
+        kind: Fidget,
+        gas: Option<String>,
+    ) -> Option<Option<String>> {
+        let i = self.find(who)?;
+        let figure = &mut self.figures[i];
+        let old = std::mem::replace(&mut figure.fidgets[kind as usize], gas);
+        if figure.fidget == Some(kind) {
+            figure.fidget = None;
+            figure.gas = None;
+            self.start_fidget(lib, who, kind);
+        }
+        Some(old)
+    }
+
+    /// Starts an actor's idle, talk or listen fidget, as G-Engine does: not
+    /// if it is already the one running, and only if the actor has a script
+    /// for it.
+    pub fn start_fidget(&mut self, lib: &Library, who: &str, kind: Fidget) {
+        let Some(i) = self.find(who) else { return };
+        let figure = &mut self.figures[i];
+        if figure.fidget == Some(kind) {
+            return;
+        }
+        if let Some(gas) = figure.fidgets[kind as usize]
+            .as_deref()
+            .and_then(|g| load_gas(lib, g))
+        {
+            figure.gas = Some(gas);
+            figure.fidget = Some(kind);
+            figure.waiting_until = 0.0;
+        }
+    }
+
+    pub fn stop_fidget(&mut self, who: &str) {
+        if let Some(i) = self.find(who) {
+            self.figures[i].gas = None;
+            self.figures[i].fidget = None;
+        }
+    }
+
+    /// A figure's triangles where they stand now, found by model name.
+    pub fn world_triangles(&self, model: &str) -> Option<Vec<[Vec3; 3]>> {
+        let upper = model.to_ascii_uppercase();
+        let f = self.figures.iter().find(|f| f.name == upper)?;
+        Some(
+            f.triangles
+                .iter()
+                .filter_map(|t| {
+                    let [a, b, c] = t.map(|i| f.world_vertices.get(i as usize).copied());
+                    Some([a?, b?, c?])
+                })
+                .collect(),
+        )
+    }
+
     pub fn pick(&self, origin: Vec3, direction: Vec3) -> Option<(f32, String)> {
         let mut best: Option<(f32, String)> = None;
         for f in self.figures.iter().filter(|f| f.visible) {
@@ -948,7 +1046,11 @@ fn hidden(line: &Line) -> bool {
 }
 
 fn load_gas(lib: &Library, name: &str) -> Option<GasPlayer> {
-    let bytes = lib.read(name).ok()?;
+    let name = name.trim();
+    let bytes = lib
+        .read(name)
+        .or_else(|_| lib.read(&format!("{name}.GAS")))
+        .ok()?;
     let seed = name
         .bytes()
         .fold(0x9E37_79B9_7F4A_7C15u64, |h, b| h.rotate_left(5) ^ b as u64);

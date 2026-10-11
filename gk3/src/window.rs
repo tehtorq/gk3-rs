@@ -62,6 +62,8 @@ struct Gfx {
     dragging: bool,
     controls: Controls,
     last_frame: f64,
+    /// A message shown until a time, such as "Game saved".
+    notice: Option<(String, f64)>,
     started: Instant,
     overlay: Overlay,
 }
@@ -115,7 +117,7 @@ impl Game {
             eprintln!("no sound: {}", audio.status);
         }
         let mut world = World::new(self.lib, &self.options.time, audio);
-        world.enter(&renderer, &self.options.location)?;
+        crate::play::start(&mut world, &renderer, &self.options)?;
         Ok(Gfx {
             window,
             surface,
@@ -132,6 +134,7 @@ impl Game {
             dragging: false,
             controls: Controls::default(),
             last_frame: 0.0,
+            notice: None,
             started: Instant::now(),
             overlay: Overlay::default(),
         })
@@ -147,6 +150,35 @@ impl Gfx {
     /// playing and no menu or inventory up.
     fn camera_free(&self) -> bool {
         self.world.idle() && self.menu.is_none() && !self.world.state.inventory_shown
+    }
+
+    fn tell(&mut self, text: String) {
+        let until = self.started.elapsed().as_secs_f64() + 3.0;
+        self.notice = Some((text, until));
+    }
+
+    fn quick_save(&mut self) {
+        let result = self
+            .world
+            .save()
+            .and_then(|text| crate::saves::write(crate::saves::QUICK, &text));
+        match result {
+            Ok(_) => self.tell("Game saved".into()),
+            Err(e) => self.tell(format!("Not saved: {e}")),
+        }
+    }
+
+    fn quick_load(&mut self) {
+        let result = crate::saves::read(crate::saves::QUICK)
+            .and_then(|text| self.world.load(&self.renderer, &text));
+        match result {
+            Ok(()) => {
+                self.menu = None;
+                self.inventory.closeup = None;
+                self.tell("Game loaded".into());
+            }
+            Err(e) => self.tell(format!("Not loaded: {e}")),
+        }
     }
 
     /// Jumps to one of the room's camera angles, by number from 1.
@@ -283,7 +315,13 @@ impl Gfx {
         let dt = (now - self.last_frame).clamp(0.0, 0.1) as f32;
         self.last_frame = now;
         if self.camera_free() {
-            self.controls.apply(&mut self.world.camera, dt);
+            let none = crate::camera::Bounds::default();
+            let bounds = self
+                .world
+                .scene
+                .as_ref()
+                .map_or(&none, |s| &s.camera_bounds);
+            self.controls.apply(&mut self.world.camera, bounds, dt);
         } else {
             self.controls.drag = (0.0, 0.0);
         }
@@ -341,6 +379,13 @@ impl Gfx {
                 .draw_inventory_button(&mut overlay, self.pointer, size);
         }
         self.ui.captions(&mut overlay, &self.world, size);
+        if let Some((text, until)) = &self.notice {
+            if now < *until {
+                self.ui.notice(&mut overlay, text, size);
+            } else {
+                self.notice = None;
+            }
+        }
         if let Some(noun) = &self.hover {
             self.ui
                 .label(&mut overlay, noun, self.pointer.0, self.pointer.1, size);
@@ -481,6 +526,8 @@ impl ApplicationHandler for Game {
                         gfx.world.camera.pitch = 0.0;
                     }
                     PhysicalKey::Code(KeyCode::Space | KeyCode::Period) => gfx.world.skip(),
+                    PhysicalKey::Code(KeyCode::F5) => gfx.quick_save(),
+                    PhysicalKey::Code(KeyCode::F9) => gfx.quick_load(),
                     PhysicalKey::Code(
                         k @ (KeyCode::Digit1
                         | KeyCode::Digit2

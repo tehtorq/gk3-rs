@@ -7,6 +7,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+mod save;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GameState {
     /// Day and hour, as the game writes it: `110A` is day 1, 10am.

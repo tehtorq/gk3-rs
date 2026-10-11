@@ -25,7 +25,7 @@ use gk3_sheep::compile::{ENTRY, compile_action};
 use gk3_sheep::{Script, ThreadId, ThreadState, Vm};
 use glam::{Vec3, Vec4};
 
-use crate::cast::{Cast, ray_triangle, read_anm};
+use crate::cast::{Cast, Fidget, ray_triangle, read_anm};
 use crate::room::{Catalog, Room, RoomCamera};
 use crate::shoot;
 use crate::soundtrack::Soundtrack;
@@ -70,6 +70,30 @@ pub struct Scene {
     cameras: HashMap<String, RoomCamera>,
     /// The player character's model name.
     pub ego: String,
+    /// Where the player may take the camera.
+    pub camera_bounds: crate::camera::Bounds,
+    /// How actors behave in each conversation, from `[LISTENERS]`.
+    listeners: Vec<Listener>,
+}
+
+/// One actor's part in a conversation: fidgets to use while it lasts, and
+/// animations to step into and out of it.
+#[derive(Debug, Clone, Default)]
+struct Listener {
+    dialogue: String,
+    actor: String,
+    talk: Option<String>,
+    listen: Option<String>,
+    enter: Option<String>,
+    exit: Option<String>,
+}
+
+/// What a loaded game puts back after entering: the player's spot and
+/// heading, and the camera.
+#[derive(Default)]
+struct Restore {
+    ego_at: Option<(Vec3, f32)>,
+    camera: Option<Camera>,
 }
 
 /// An action waiting for the player to arrive before it runs.
@@ -99,7 +123,18 @@ pub struct World<'a> {
     /// The conversation a script has set, if any.
     pub conversation: Option<String>,
     end_conversation: bool,
+    /// Who is speaking, as the lines' SPEAKER marks say, and whether this
+    /// dialogue moves people between talking and listening.
+    speaker: Option<String>,
+    dialogue_fidgets: bool,
+    /// Speaker changes due, by time.
+    speaker_changes: Vec<(f64, String)>,
+    /// Fidgets a conversation replaced: actor, kind, the script to restore.
+    saved_fidgets: Vec<(String, Fidget, Option<String>)>,
     approach: Option<Approach>,
+    /// From a loaded game: where the player stood and the camera looked,
+    /// put back once the room's entry has played.
+    restore: Option<Restore>,
     /// Something to turn to face when an approach walk ends.
     face_after: Option<String>,
     next_location: Option<String>,
@@ -166,7 +201,12 @@ impl<'a> World<'a> {
             topic_bar: None,
             conversation: None,
             end_conversation: false,
+            speaker: None,
+            dialogue_fidgets: true,
+            speaker_changes: Vec::new(),
+            saved_fidgets: Vec::new(),
             approach: None,
+            restore: None,
             face_after: None,
             next_location: None,
             last_plate: None,
@@ -178,6 +218,84 @@ impl<'a> World<'a> {
             soundtracks: Vec::new(),
             soundtrack_sounds: Vec::new(),
         }
+    }
+
+    /// The game as save-file text. Only when the player is free: a running
+    /// script cannot be saved.
+    pub fn save(&self) -> Result<String, String> {
+        if !self.idle() {
+            return Err("cannot save while something is happening".into());
+        }
+        let num = |v: f32| format!("{v}");
+        let mut extra = Vec::new();
+        if let Some(scene) = &self.scene
+            && let Some((p, heading)) = scene.cast.actor_position(&scene.ego)
+        {
+            extra.push(vec![
+                "ego_at".into(),
+                num(p.x),
+                num(p.y),
+                num(p.z),
+                num(heading),
+            ]);
+        }
+        let c = &self.camera;
+        extra.push(vec![
+            "camera".into(),
+            num(c.position.x),
+            num(c.position.y),
+            num(c.position.z),
+            num(c.yaw),
+            num(c.pitch),
+            num(c.fov_y),
+        ]);
+        Ok(self.state.to_save(&extra))
+    }
+
+    /// Loads a saved game: the story as it was, then the room built from it
+    /// and entered, as G-Engine's first save versions did. The entry counts
+    /// as a visit, so first-visit scenes do not play again. Where the player
+    /// stood and looked is put back once the entry has played.
+    pub fn load(&mut self, renderer: &Renderer, text: &str) -> Result<(), String> {
+        let (state, extra) = GameState::from_save(text)?;
+        let floats = |r: &Vec<String>| -> Vec<f32> {
+            r[1..].iter().filter_map(|v| v.parse().ok()).collect()
+        };
+        let mut ego_at = None;
+        let mut camera = None;
+        for record in &extra {
+            match (record[0].as_str(), floats(record).as_slice()) {
+                ("ego_at", &[x, y, z, h]) => ego_at = Some((Vec3::new(x, y, z), h)),
+                ("camera", &[x, y, z, yaw, pitch, fov_y]) => {
+                    camera = Some(Camera {
+                        position: Vec3::new(x, y, z),
+                        yaw,
+                        pitch,
+                        fov_y,
+                    })
+                }
+                _ => {}
+            }
+        }
+        // Drop whatever was going on.
+        self.vm = Vm::new();
+        self.tasks.clear();
+        self.actions.clear();
+        self.captions.clear();
+        self.scheduled.clear();
+        self.audio.stop_all();
+        self.topic_bar = None;
+        self.end_conversation = false;
+        self.approach = None;
+        self.face_after = None;
+        self.next_location = None;
+        let last_location = state.last_location.clone();
+        self.state = state;
+        let location = self.state.location.clone();
+        self.enter(renderer, &location)?;
+        self.state.last_location = last_location;
+        self.restore = Some(Restore { ego_at, camera });
+        Ok(())
     }
 
     /// Whether the player is free to act.
@@ -220,6 +338,35 @@ impl<'a> World<'a> {
                 .find_map(|l| l.get(key).map(str::to_string))
         };
         let floor = general("floor").map(|f| f.to_ascii_uppercase());
+        // Every applicable section may add a bounds model.
+        let bounds_models: Vec<gk3_formats::model::Model> = sif
+            .sections("GENERAL")
+            .flat_map(|s| &s.lines)
+            .filter_map(|l| l.get("cameraBounds"))
+            .filter_map(|name| {
+                gk3_formats::model::Model::parse(&self.lib.read(&format!("{name}.MOD")).ok()?).ok()
+            })
+            .collect();
+        let camera_bounds = crate::camera::Bounds::from_models(&bounds_models);
+        let listeners = sif
+            .sections("LISTENERS")
+            .flat_map(|s| &s.lines)
+            .filter_map(|l| {
+                let get = |k: &str| l.get(k).map(|v| v.trim().to_string());
+                Some(Listener {
+                    dialogue: get("dialogue")?.to_ascii_uppercase(),
+                    actor: get("actor")?.to_ascii_uppercase(),
+                    talk: get("talk"),
+                    listen: get("listen"),
+                    enter: get("enter"),
+                    exit: get("exit"),
+                })
+            })
+            .collect();
+        self.speaker = None;
+        self.speaker_changes.clear();
+        self.saved_fidgets.clear();
+        self.conversation = None;
         let walk = sif
             .sections("GENERAL")
             .flat_map(|s| &s.lines)
@@ -233,17 +380,19 @@ impl<'a> World<'a> {
                 let offset = crate::room::floats::<2>(l.get("offset")?)?;
                 Some(WalkMap::new(image, size, offset))
             });
-        let ego = sif
-            .sections("ACTORS")
-            .flat_map(|s| &s.lines)
-            .find(|l| {
-                l.pairs
-                    .iter()
-                    .any(|p| p.is_flag() && p.key.eq_ignore_ascii_case("ego"))
-            })
+        let ego_line = sif.sections("ACTORS").flat_map(|s| &s.lines).find(|l| {
+            l.pairs
+                .iter()
+                .any(|p| p.is_flag() && p.key.eq_ignore_ascii_case("ego"))
+        });
+        let ego = ego_line
             .and_then(|l| l.get("model"))
             .unwrap_or("GAB")
             .to_ascii_uppercase();
+        // Whoever the room has as the player is the player, as in G-Engine.
+        if let Some(noun) = ego_line.and_then(|l| l.get("noun")) {
+            self.state.ego = gk3_game::state::character(noun);
+        }
 
         // The action files in scope: the location's, most specific first,
         // then the game's global and inventory sets.
@@ -297,6 +446,8 @@ impl<'a> World<'a> {
             floor,
             cameras,
             ego,
+            camera_bounds,
+            listeners,
         });
         self.tasks.clear();
         self.captions.clear();
@@ -628,6 +779,21 @@ impl<'a> World<'a> {
         let scene = self.scene.as_mut()?;
         let name = e.name.to_ascii_uppercase();
         match name.as_str() {
+            "CAMERABOUNDARYBLOCKMODEL" => {
+                let model = e.string(0);
+                if let Some(triangles) = scene.cast.world_triangles(&model) {
+                    scene.camera_bounds.block(&model, triangles);
+                }
+                None
+            }
+            "CAMERABOUNDARYUNBLOCKMODEL" => {
+                scene.camera_bounds.unblock(&e.string(0));
+                None
+            }
+            "ENABLECAMERABOUNDARIES" | "DISABLECAMERABOUNDARIES" => {
+                scene.camera_bounds.enabled = name == "ENABLECAMERABOUNDARIES";
+                None
+            }
             "SHOWINVENTORY" | "HIDEINVENTORY" => {
                 self.state.inventory_shown = name == "SHOWINVENTORY";
                 None
@@ -675,10 +841,12 @@ impl<'a> World<'a> {
             | "STARTDIALOGUE"
             | "STARTDIALOGUENONOFIDGETS"
             | "STARTDIALOGUENOFIDGETS" => {
+                self.dialogue_fidgets = name == "STARTDIALOGUE";
                 let seconds = self.speak(&e.string(0), e.int(1).max(1));
                 Some(Until::Time(now + seconds))
             }
             "CONTINUEDIALOGUE" | "CONTINUEDIALOGUENOFIDGETS" => {
+                self.dialogue_fidgets = name == "CONTINUEDIALOGUE";
                 let plate = self.last_plate.as_deref().map(next_plate)?;
                 let seconds = self.speak(&plate, e.int(0).max(1));
                 Some(Until::Time(now + seconds))
@@ -748,15 +916,164 @@ impl<'a> World<'a> {
                 None
             }
             "SETCONVERSATION" => {
-                self.conversation = Some(e.string(0));
-                None
+                let seconds = self.begin_conversation(&e.string(0));
+                Some(Until::Time(now + seconds))
             }
             "ENDCONVERSATION" => {
-                self.conversation = None;
+                let seconds = self.finish_conversation();
+                Some(Until::Time(now + seconds))
+            }
+            "STARTIDLEFIDGET" | "STARTTALKFIDGET" | "STARTLISTENFIDGET" => {
+                let kind = match name.as_str() {
+                    "STARTTALKFIDGET" => Fidget::Talk,
+                    "STARTLISTENFIDGET" => Fidget::Listen,
+                    _ => Fidget::Idle,
+                };
+                scene.cast.start_fidget(lib, &e.string(0), kind);
+                None
+            }
+            "SETIDLEGAS" | "SETTALKGAS" | "SETLISTENGAS" => {
+                let kind = match name.as_str() {
+                    "SETTALKGAS" => Fidget::Talk,
+                    "SETLISTENGAS" => Fidget::Listen,
+                    _ => Fidget::Idle,
+                };
+                let gas = e.string(1);
+                let gas = (!gas.trim().is_empty()).then_some(gas);
+                scene.cast.set_fidget_gas(lib, &e.string(0), kind, gas);
+                None
+            }
+            "STOPFIDGET" => {
+                scene.cast.stop_fidget(&e.string(0));
                 None
             }
             // Everything else is over as soon as it starts, for now.
             _ => None,
+        }
+    }
+
+    /// `SetConversation`: cuts to the conversation's opening camera (or its
+    /// closing one if it has none), gives its actors their talk and listen
+    /// fidgets, starts them listening and plays their way in. Returns how
+    /// long the way in takes.
+    fn begin_conversation(&mut self, name: &str) -> f64 {
+        let name = name.to_ascii_uppercase();
+        self.conversation = Some(name.clone());
+        let (lib, now) = (self.lib, self.clock);
+        let Some(scene) = &mut self.scene else {
+            return 0.0;
+        };
+        let cameras = || {
+            scene
+                .room
+                .cameras
+                .iter()
+                .filter(|c| c.dialogue.as_deref() == Some(name.as_str()))
+        };
+        if let Some(c) = cameras()
+            .find(|c| c.initial)
+            .or_else(|| cameras().find(|c| c.last))
+        {
+            self.camera = shoot::from_room_camera(c);
+            self.log.push(format!("    (camera {} for {name})", c.name));
+        }
+        let mut longest = 0.0f64;
+        for l in scene.listeners.iter().filter(|l| l.dialogue == name) {
+            if l.talk.is_none() && l.listen.is_none() {
+                continue;
+            }
+            for (kind, gas) in [(Fidget::Talk, &l.talk), (Fidget::Listen, &l.listen)] {
+                if gas.is_some()
+                    && let Some(old) = scene.cast.set_fidget_gas(lib, &l.actor, kind, gas.clone())
+                {
+                    self.saved_fidgets.push((l.actor.clone(), kind, old));
+                }
+            }
+            let kind = if l.listen.is_some() {
+                Fidget::Listen
+            } else {
+                Fidget::Talk
+            };
+            scene.cast.start_fidget(lib, &l.actor, kind);
+            self.log
+                .push(format!("    ({} {kind:?}s, for {name})", l.actor));
+            if let Some(anim) = &l.enter
+                && let Some(seconds) = scene.cast.play(lib, anim, false, false, now)
+            {
+                longest = longest.max(seconds as f64);
+            }
+        }
+        longest
+    }
+
+    /// `EndConversation`: the closing camera, the actors' way out, and their
+    /// own fidgets back.
+    fn finish_conversation(&mut self) -> f64 {
+        let Some(name) = self.conversation.take() else {
+            return 0.0;
+        };
+        let (lib, now) = (self.lib, self.clock);
+        self.speaker = None;
+        let Some(scene) = &mut self.scene else {
+            return 0.0;
+        };
+        if let Some(c) = scene
+            .room
+            .cameras
+            .iter()
+            .find(|c| c.dialogue.as_deref() == Some(name.as_str()) && c.last)
+        {
+            self.camera = shoot::from_room_camera(c);
+        }
+        let mut longest = 0.0f64;
+        for l in scene.listeners.iter().filter(|l| l.dialogue == name) {
+            if let Some(anim) = &l.exit
+                && let Some(seconds) = scene.cast.play(lib, anim, false, false, now)
+            {
+                longest = longest.max(seconds as f64);
+            }
+        }
+        for (actor, kind, gas) in self.saved_fidgets.drain(..) {
+            scene.cast.set_fidget_gas(lib, &actor, kind, gas);
+            scene.cast.start_fidget(lib, &actor, Fidget::Idle);
+        }
+        longest
+    }
+
+    /// G-Engine's `SetSpeaker`: whoever stops speaking goes from talking to
+    /// listening, whoever starts goes from listening to talking. In a
+    /// conversation, only those it gave such fidgets to.
+    fn set_speaker(&mut self, who: &str) {
+        if self.speaker.as_deref() == Some(who) {
+            return;
+        }
+        let lib = self.lib;
+        let previous = self.speaker.replace(who.to_string());
+        if !self.dialogue_fidgets {
+            return;
+        }
+        let Some(scene) = &mut self.scene else { return };
+        let in_conversation = self.conversation.is_some();
+        let saved = &self.saved_fidgets;
+        let given = |cast: &Cast, actor: &str, kind: Fidget| {
+            !in_conversation
+                || saved.iter().any(|(a, k, _)| {
+                    *k == kind && cast.find(a).is_some() && cast.find(a) == cast.find(actor)
+                })
+        };
+        if let Some(prev) = previous.filter(|p| p != "UNKNOWN")
+            && given(&scene.cast, &prev, Fidget::Listen)
+            && scene.cast.fidget(&prev) == Some(Fidget::Talk)
+        {
+            scene.cast.start_fidget(lib, &prev, Fidget::Listen);
+            self.log.push(format!("    ({prev} listens)"));
+        }
+        if who != "UNKNOWN"
+            && given(&scene.cast, who, Fidget::Talk)
+            && scene.cast.fidget(who) == Some(Fidget::Listen)
+        {
+            scene.cast.start_fidget(lib, who, Fidget::Talk);
+            self.log.push(format!("    ({who} talks)"));
         }
     }
 
@@ -774,6 +1091,12 @@ impl<'a> World<'a> {
                 .yak_at(&format!("E{plate}"), at)
                 .or_else(|| self.yak_at(&plate, at));
             if let Some((seconds, captions)) = line {
+                for c in &captions {
+                    if let Some(who) = &c.speaker {
+                        self.speaker_changes
+                            .push((at + c.frame as f64 / 15.0, who.clone()));
+                    }
+                }
                 for c in captions {
                     self.captions.push(Caption {
                         text: c.text.clone(),
@@ -891,6 +1214,26 @@ impl<'a> World<'a> {
             scene.cast.upload(renderer);
         }
         self.captions.retain(|c| c.until > now);
+        let mut changes = std::mem::take(&mut self.speaker_changes);
+        changes.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let later = changes.split_off(changes.partition_point(|c| c.0 <= now));
+        self.speaker_changes = later;
+        for (_, who) in changes {
+            self.set_speaker(&who);
+        }
+        // A loaded game's room has played its entry: put the player back.
+        if self.restore.is_some() && self.idle() {
+            let Restore { ego_at, camera } = self.restore.take().unwrap_or_default();
+            if let Some((position, heading)) = ego_at
+                && let Some(scene) = &mut self.scene
+            {
+                let ego = scene.ego.clone();
+                scene.cast.put(&ego, position, heading);
+            }
+            if let Some(camera) = camera {
+                self.camera = camera;
+            }
+        }
         let due: Vec<_> = self
             .scheduled
             .iter()

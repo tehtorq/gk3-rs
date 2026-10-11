@@ -18,11 +18,14 @@ anything to get the original verb icons, and every action plays as the game
 wrote it, with the right camera cuts, animations, captions and recorded
 voice, lip-synced faces, and the room's ambient soundtrack. Conversations
 work: TALK opens a topic bar, each topic is raised once, and the "last word"
-topics come up only when the rest have been said. The inventory shows
+topics come up only when the rest have been said; they cut to their own
+camera angles, and the people in them switch between talking and listening
+as each line's speaker changes. The inventory shows
 Gabriel's or Grace's items with the original pictures and close-ups, and an
 item can be picked up and used on things. Leaving the room loads the next
-one. Not yet: SIDNEY, movies, saving, conversation camera work, the camera
-staying inside the room's bounds.
+one, with Gabriel or Grace as the player as the story has it. The game can
+be saved and loaded. Not yet: SIDNEY, movies, the timeblock changes that move
+the story from one part of the day to the next.
 
 ## Playing
 
@@ -42,7 +45,15 @@ The camera moves as in the original: W/S or Up/Down go forward and back, A/D
 or Left/Right turn, Shift makes them pitch, Ctrl makes them rise, sink and
 strafe, Alt doubles the speed, and dragging with the left button does the
 same with the mouse. Space levels the camera; 1 to 9 jump to the room's set
-camera angles. The camera only moves while nothing is playing. Sound comes from PulseAudio or PipeWire if they are there; without
+camera angles. The camera only moves while nothing is playing, and stays
+inside the room's camera bounds, sliding along walls as the original does.
+
+F5 saves to the quick slot and F9 loads it. Saves are small text files in
+`~/.local/share/gk3-rs/saves` (or `$XDG_DATA_HOME/gk3-rs/saves`); `gk3 play
+--load quick` starts from one. A save holds the whole story state and where
+you stood; loading rebuilds the room and enters it again, as the original's
+first save format did, so the visit counts once more but first-visit scenes
+do not replay. Saving waits until nothing is playing. Sound comes from PulseAudio or PipeWire if they are there; without
 them the game is silent rather than refusing to start.
 
 For testing, the same command runs without a window:
@@ -53,6 +64,8 @@ gk3 play R25 --do WINDOW:OPEN --png out.png # do it, report, take a picture
 gk3 play R25 --do HALL_DOOR:R25_ROOM_KEY    # use an item on something
 gk3 play R25 --inventory --png inv.png      # the items and their verbs
 gk3 play R25 --closeup TALISMAN --png t.png # one item's close-up
+gk3 play R25 --do CHICKEN:PICKUP --save x.sav  # play, then save
+gk3 play --load x.sav --list                # carry on from a save
 ```
 
 ## Building

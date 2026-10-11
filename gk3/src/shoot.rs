@@ -88,7 +88,7 @@ pub fn from_room_camera(c: &RoomCamera) -> Camera {
         position: c.position.into(),
         yaw: c.yaw.to_radians(),
         pitch: c.pitch.to_radians(),
-        fov_y: 60f32.to_radians(),
+        fov_y: c.fov.to_radians(),
     }
 }
 

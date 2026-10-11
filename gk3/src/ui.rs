@@ -195,6 +195,18 @@ impl Ui {
     }
 
     /// The name of what is under the pointer.
+    /// A short message at the top of the screen, such as "Game saved".
+    pub fn notice(&self, overlay: &mut Overlay, text: &str, size: (u32, u32)) {
+        let scale = Self::scale(size.1);
+        let (w, h) = self.measure("F_TOOLTIP", text);
+        let (bx, by) = ((size.0 as f32 - w * scale) / 2.0, 12.0 * scale);
+        overlay.rect(
+            [bx - 8.0, by - 4.0, w * scale + 16.0, h * scale + 8.0],
+            [250, 240, 210, 230],
+        );
+        self.text(overlay, "F_TOOLTIP", text, (bx, by), scale, [0, 0, 0, 255]);
+    }
+
     pub fn label(&self, overlay: &mut Overlay, noun: &str, x: f32, y: f32, size: (u32, u32)) {
         let scale = Self::scale(size.1);
         let text = display_name(noun);

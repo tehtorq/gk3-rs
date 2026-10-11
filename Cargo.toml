@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/barn", "crates/formats", "crates/media", "crates/render", "gk3"]
+members = ["crates/audio", "crates/barn", "crates/formats", "crates/game", "crates/media", "crates/render", "crates/sheep", "gk3"]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,10 +9,13 @@ license = "GPL-3.0-or-later"
 rust-version = "1.88"
 
 [workspace.dependencies]
+gk3-audio = { path = "crates/audio" }
 gk3-barn = { path = "crates/barn" }
 gk3-formats = { path = "crates/formats" }
+gk3-game = { path = "crates/game" }
 gk3-media = { path = "crates/media" }
 gk3-render = { path = "crates/render" }
+gk3-sheep = { path = "crates/sheep" }
 miniz_oxide = "0.8"
 # Only the native backends; wgpu loads the GPU driver at run time.
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "vulkan", "gles", "metal", "dx12", "wgsl"] }

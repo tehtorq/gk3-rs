@@ -500,14 +500,25 @@ dependencies = [
 name = "gk3"
 version = "0.1.0"
 dependencies = [
+ "gk3-audio",
  "gk3-barn",
  "gk3-formats",
+ "gk3-game",
  "gk3-media",
  "gk3-render",
+ "gk3-sheep",
  "glam",
  "pollster",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "gk3-audio"
+version = "0.1.0"
+dependencies = [
+ "gk3-media",
+ "libloading",
 ]
 
 [[package]]
@@ -522,6 +533,15 @@ name = "gk3-formats"
 version = "0.1.0"
 dependencies = [
  "miniz_oxide",
+]
+
+[[package]]
+name = "gk3-game"
+version = "0.1.0"
+dependencies = [
+ "gk3-formats",
+ "gk3-sheep",
+ "glam",
 ]
 
 [[package]]
@@ -541,6 +561,13 @@ dependencies = [
  "glam",
  "pollster",
  "wgpu",
+]
+
+[[package]]
+name = "gk3-sheep"
+version = "0.1.0"
+dependencies = [
+ "gk3-formats",
 ]
 
 [[package]]

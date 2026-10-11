@@ -5,12 +5,16 @@
 //! D3D12) at run time; nothing graphical is linked into the executable.
 
 pub mod mesh;
+pub mod model;
+pub mod overlay;
 
 use gk3_formats::image::Image;
 use glam::{Mat4, Quat, Vec3};
 use wgpu::util::DeviceExt;
 
 pub use mesh::{SceneMesh, SceneSource, Sky};
+pub use model::{GpuModel, ModelLight, ModelVertex, SubmeshDesc};
+pub use overlay::{Overlay, OverlayTexture, Quad, WHITE};
 
 /// Colour format for offscreen rendering. Not sRGB: GK3 multiplied lightmaps
 /// in gamma space, and doing it in linear space would change the look.
@@ -51,6 +55,13 @@ impl Camera {
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
         self.projection(aspect) * Mat4::look_to_lh(self.position, self.forward(), Vec3::Y)
     }
+}
+
+/// Where a frame is drawn.
+pub struct Target<'a> {
+    pub color: &'a wgpu::TextureView,
+    pub depth: &'a wgpu::TextureView,
+    pub size: (u32, u32),
 }
 
 /// What the scene shader shows.
@@ -100,6 +111,10 @@ pub struct Renderer {
     queue: wgpu::Queue,
     scene_pipeline: wgpu::RenderPipeline,
     sky_pipeline: wgpu::RenderPipeline,
+    model_pipeline: wgpu::RenderPipeline,
+    light_layout: wgpu::BindGroupLayout,
+    overlay_pipeline: wgpu::RenderPipeline,
+    overlay_textures: Vec<(wgpu::BindGroup, (u32, u32))>,
     globals_layout: wgpu::BindGroupLayout,
     texture_layout: wgpu::BindGroupLayout,
     sky_layout: wgpu::BindGroupLayout,
@@ -263,6 +278,115 @@ impl Renderer {
             cache: None,
         });
 
+        let light_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("model light"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let model_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("model"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("model.wgsl").into()),
+        });
+        let model_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("model"),
+            bind_group_layouts: &[
+                Some(&globals_layout),
+                Some(&texture_layout),
+                Some(&light_layout),
+            ],
+            immediate_size: 0,
+        });
+        let model_attributes = wgpu::vertex_attr_array![
+            0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Unorm8x4
+        ];
+        let model_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("model"),
+            layout: Some(&model_layout),
+            vertex: wgpu::VertexState {
+                module: &model_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<ModelVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &model_attributes,
+                })],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &model_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &target,
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let overlay_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("overlay"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("overlay.wgsl").into()),
+        });
+        let overlay_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("overlay"),
+            bind_group_layouts: &[Some(&texture_layout)],
+            immediate_size: 0,
+        });
+        let overlay_attributes =
+            wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Unorm8x4];
+        let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("overlay"),
+            layout: Some(&overlay_layout),
+            vertex: wgpu::VertexState {
+                module: &overlay_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<overlay::OverlayVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &overlay_attributes,
+                })],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            // On top of everything, whatever the depth says.
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &overlay_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let repeat_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("repeat"),
             address_mode_u: wgpu::AddressMode::Repeat,
@@ -279,17 +403,27 @@ impl Renderer {
             ..Default::default()
         });
 
-        Self {
+        let mut renderer = Self {
             device,
             queue,
             scene_pipeline,
             sky_pipeline,
+            model_pipeline,
+            light_layout,
+            overlay_pipeline,
+            overlay_textures: Vec::new(),
             globals_layout,
             texture_layout,
             sky_layout,
             repeat_sampler,
             clamp_sampler,
-        }
+        };
+        renderer.add_overlay_texture(&Image {
+            width: 1,
+            height: 1,
+            rgba: vec![255; 4],
+        });
+        renderer
     }
 
     pub fn device(&self) -> &wgpu::Device {
@@ -317,7 +451,7 @@ impl Renderer {
             .textures
             .iter()
             .map(|image| {
-                let view = self.texture(image, true);
+                let view = self.texture(&color_key(image), true);
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
                     layout: &self.texture_layout,
@@ -393,6 +527,118 @@ impl Renderer {
             ],
             bounds: mesh.bounds,
         }
+    }
+
+    /// Makes an image available to the overlay.
+    pub fn add_overlay_texture(&mut self, image: &Image) -> OverlayTexture {
+        let view = self.texture(image, false);
+        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("overlay"),
+            layout: &self.texture_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.clamp_sampler),
+                },
+            ],
+        });
+        self.overlay_textures
+            .push((group, (image.width, image.height)));
+        OverlayTexture(self.overlay_textures.len() - 1)
+    }
+
+    /// Uploads a model's textures and triangles. Its vertices are supplied
+    /// with [`Renderer::update_model`], in world space, whenever it moves.
+    pub fn upload_model(&self, submeshes: &[SubmeshDesc]) -> GpuModel {
+        let device = &self.device;
+        let mut indices: Vec<u16> = Vec::new();
+        let mut draws = Vec::new();
+        let mut base_vertex = 0i32;
+        for sub in submeshes {
+            let view = self.texture(&color_key(&sub.texture), true);
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.texture_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.repeat_sampler),
+                    },
+                ],
+            });
+            let first = indices.len() as u32;
+            indices.extend(sub.triangles.iter().flatten());
+            draws.push((group, first, indices.len() as u32 - first, base_vertex));
+            base_vertex += sub.vertex_count as i32;
+        }
+        // Index buffers must be a multiple of four bytes.
+        if indices.len() % 2 == 1 {
+            indices.push(0);
+        }
+        let vertex_count = base_vertex as usize;
+        let index_bytes: &[u8] = if indices.is_empty() {
+            &[0; 4]
+        } else {
+            bytemuck::cast_slice(&indices)
+        };
+        let indices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("model indices"),
+            contents: index_bytes,
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let vertices = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("model vertices"),
+            size: (vertex_count.max(1) * std::mem::size_of::<ModelVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let light = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("model light"),
+            contents: bytemuck::bytes_of(&model::LightUniform::from(ModelLight::default())),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let light_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("model light"),
+            layout: &self.light_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: light.as_entire_binding(),
+            }],
+        });
+        GpuModel {
+            vertices,
+            indices,
+            draws,
+            light,
+            light_group,
+            vertex_count,
+            visible: true,
+        }
+    }
+
+    /// Replaces a model's posed, placed vertices.
+    pub fn update_model(&self, model: &GpuModel, vertices: &[ModelVertex]) {
+        debug_assert_eq!(vertices.len(), model.vertex_count);
+        if !vertices.is_empty() {
+            self.queue
+                .write_buffer(&model.vertices, 0, bytemuck::cast_slice(vertices));
+        }
+    }
+
+    pub fn set_model_light(&self, model: &GpuModel, light: ModelLight) {
+        self.queue.write_buffer(
+            &model.light,
+            0,
+            bytemuck::bytes_of(&model::LightUniform::from(light)),
+        );
     }
 
     fn texture(&self, image: &Image, mipmaps: bool) -> wgpu::TextureView {
@@ -494,16 +740,21 @@ impl Renderer {
             .create_view(&Default::default())
     }
 
-    /// Draws a room into `target` and submits the work.
+    /// Draws a room and its models into `target` and submits the work.
     pub fn draw(
         &self,
         scene: &GpuScene,
+        models: &[&GpuModel],
+        overlay: &Overlay,
         camera: &Camera,
         mode: ShadeMode,
-        target: &wgpu::TextureView,
-        depth: &wgpu::TextureView,
-        size: (u32, u32),
+        target: Target,
     ) {
+        let Target {
+            color: target,
+            depth,
+            size,
+        } = target;
         let aspect = size.0 as f32 / size.1.max(1) as f32;
         let rotation_only =
             camera.projection(aspect) * Mat4::look_to_lh(Vec3::ZERO, camera.forward(), Vec3::Y);
@@ -574,6 +825,46 @@ impl Renderer {
                 pass.set_bind_group(1, &scene.textures[batch.texture], &[]);
                 pass.draw(batch.first..batch.first + batch.count, 0..1);
             }
+
+            pass.set_pipeline(&self.model_pipeline);
+            for model in models.iter().filter(|m| m.visible && m.vertex_count > 0) {
+                pass.set_bind_group(2, &model.light_group, &[]);
+                pass.set_vertex_buffer(0, model.vertices.slice(..));
+                pass.set_index_buffer(model.indices.slice(..), wgpu::IndexFormat::Uint16);
+                for (group, first, count, base) in &model.draws {
+                    pass.set_bind_group(1, group, &[]);
+                    pass.draw_indexed(*first..*first + *count, *base, 0..1);
+                }
+            }
+
+            if !overlay.quads.is_empty() {
+                let sizes: Vec<(u32, u32)> =
+                    self.overlay_textures.iter().map(|(_, s)| *s).collect();
+                let vertices = overlay::vertices(overlay, &sizes, size);
+                let buffer = self
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("overlay"),
+                        contents: bytemuck::cast_slice(&vertices),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
+                pass.set_pipeline(&self.overlay_pipeline);
+                pass.set_vertex_buffer(0, buffer.slice(..));
+                // Runs of quads sharing a texture are one draw.
+                let mut start = 0;
+                while start < overlay.quads.len() {
+                    let texture = overlay.quads[start].texture;
+                    let mut end = start + 1;
+                    while end < overlay.quads.len() && overlay.quads[end].texture == texture {
+                        end += 1;
+                    }
+                    if let Some((group, _)) = self.overlay_textures.get(texture.0) {
+                        pass.set_bind_group(0, group, &[]);
+                        pass.draw((start * 6) as u32..(end * 6) as u32, 0..1);
+                    }
+                    start = end;
+                }
+            }
         }
         self.queue.submit([encoder.finish()]);
     }
@@ -582,10 +873,11 @@ impl Renderer {
     pub fn render_image(
         &self,
         scene: &GpuScene,
+        models: &[&GpuModel],
+        overlay: &Overlay,
         camera: &Camera,
         mode: ShadeMode,
-        width: u32,
-        height: u32,
+        (width, height): (u32, u32),
     ) -> Result<Image, String> {
         let target = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("offscreen"),
@@ -603,7 +895,18 @@ impl Renderer {
         });
         let view = target.create_view(&Default::default());
         let depth = self.depth_view(width, height);
-        self.draw(scene, camera, mode, &view, &depth, (width, height));
+        self.draw(
+            scene,
+            models,
+            overlay,
+            camera,
+            mode,
+            Target {
+                color: &view,
+                depth: &depth,
+                size: (width, height),
+            },
+        );
 
         // Rows in a copy must be a multiple of 256 bytes.
         let stride = (width * 4).div_ceil(256) * 256;
@@ -656,5 +959,76 @@ impl Renderer {
             height,
             rgba,
         })
+    }
+}
+
+/// GK3's transparency: magenta. G-Engine discards near-magenta texels in every
+/// texture (within 0.1 in RGB), not just those marked by a magenta corner, and
+/// leaves and chains depend on it. Keyed texels also take the colour of their
+/// opaque neighbours, so filtering at a cut-out's edge blends towards the
+/// leaf rather than towards purple.
+pub fn color_key(image: &Image) -> Image {
+    let is_key = |p: &[u8]| p[0] >= 230 && p[1] <= 25 && p[2] >= 230;
+    let mut out = image.clone();
+    let (w, h) = (image.width as i64, image.height as i64);
+    let mut any = false;
+    for (i, p) in image.rgba.chunks_exact(4).enumerate() {
+        if p[3] != 0 && !is_key(p) {
+            continue;
+        }
+        any = true;
+        let (x, y) = (i as i64 % w, i as i64 / w);
+        let mut sum = [0u32; 3];
+        let mut n = 0;
+        for (dx, dy) in [
+            (-1, 0),
+            (1, 0),
+            (0, -1),
+            (0, 1),
+            (-1, -1),
+            (1, 1),
+            (-1, 1),
+            (1, -1),
+        ] {
+            let (nx, ny) = (x + dx, y + dy);
+            if nx < 0 || ny < 0 || nx >= w || ny >= h {
+                continue;
+            }
+            let j = ((ny * w + nx) * 4) as usize;
+            let q = &image.rgba[j..j + 4];
+            if q[3] != 0 && !is_key(q) {
+                for c in 0..3 {
+                    sum[c] += q[c] as u32;
+                }
+                n += 1;
+            }
+        }
+        let o = &mut out.rgba[i * 4..i * 4 + 4];
+        if n > 0 {
+            for c in 0..3 {
+                o[c] = (sum[c] / n) as u8;
+            }
+        } else {
+            o[..3].copy_from_slice(&[0, 0, 0]);
+        }
+        o[3] = 0;
+    }
+    if any { out } else { image.clone() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn magenta_becomes_transparent_with_neighbour_colour() {
+        let image = Image {
+            width: 3,
+            height: 1,
+            rgba: vec![0, 200, 0, 255, 255, 0, 255, 255, 0, 100, 0, 255],
+        };
+        let keyed = color_key(&image);
+        assert_eq!(&keyed.rgba[4..8], &[0, 150, 0, 0]);
+        assert_eq!(&keyed.rgba[0..4], &[0, 200, 0, 255]);
     }
 }

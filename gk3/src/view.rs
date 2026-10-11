@@ -14,6 +14,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+use crate::cast::Cast;
 use crate::room::{Catalog, Room};
 use crate::shoot;
 
@@ -27,7 +28,16 @@ const SPEED: f32 = 150.0;
 const LOOK_SPEED: f32 = 0.004;
 
 pub fn run(lib: Library, args: &[String]) -> Result<ExitCode, String> {
-    let catalog = Catalog::new(&lib);
+    let mut catalog = Catalog::new(&lib);
+    let mut args = args.to_vec();
+    if let Some(i) = args.iter().position(|a| a == "--time") {
+        catalog.time = Some(
+            args.get(i + 1)
+                .ok_or("--time needs a timeblock, e.g. 110A")?
+                .to_ascii_uppercase(),
+        );
+        args.drain(i..i + 2);
+    }
     if catalog.scenes.is_empty() {
         return Err("the archives hold no rooms".into());
     }
@@ -84,6 +94,9 @@ struct Gfx {
     gpu_name: String,
     room: Room,
     scene: GpuScene,
+    cast: Option<Cast>,
+    /// When the current room was entered; the cast's clock runs from here.
+    entered: Instant,
     camera: Camera,
     camera_index: usize,
     mode: ShadeMode,
@@ -141,7 +154,7 @@ impl Viewer {
 
         let renderer = Renderer::new(device, queue, format);
         let depth = renderer.depth_view(config.width, config.height);
-        let (room, scene, camera) = self.load(&renderer, self.index)?;
+        let (room, scene, camera, cast) = self.load(&renderer, self.index)?;
         let gfx = Gfx {
             window,
             surface,
@@ -151,6 +164,8 @@ impl Viewer {
             gpu_name,
             room,
             scene,
+            cast,
+            entered: Instant::now(),
             camera,
             camera_index: 0,
             mode: ShadeMode::Lit,
@@ -159,14 +174,24 @@ impl Viewer {
         Ok(gfx)
     }
 
-    fn load(&self, renderer: &Renderer, index: usize) -> Result<(Room, GpuScene, Camera), String> {
+    fn load(
+        &self,
+        renderer: &Renderer,
+        index: usize,
+    ) -> Result<(Room, GpuScene, Camera, Option<Cast>), String> {
         let room = self.catalog.load(&self.lib, &self.catalog.scenes[index])?;
         for w in &room.warnings {
             eprintln!("{}: {w}", room.name);
         }
         let scene = renderer.upload(&room.mesh);
         let camera = shoot::start_camera(&room, None)?;
-        Ok((room, scene, camera))
+        let cast = shoot::cast(&self.lib, renderer, &room, 0.0);
+        if let Some(cast) = &cast {
+            for w in &cast.warnings {
+                eprintln!("{}: {w}", room.name);
+            }
+        }
+        Ok((room, scene, camera, cast))
     }
 
     fn switch_room(&mut self, step: isize) {
@@ -174,11 +199,13 @@ impl Viewer {
         let next = (self.index as isize + step).rem_euclid(count) as usize;
         let Some(gfx) = &self.gfx else { return };
         match self.load(&gfx.renderer, next) {
-            Ok((room, scene, camera)) => {
+            Ok((room, scene, camera, cast)) => {
                 self.index = next;
                 let gfx = self.gfx.as_mut().unwrap();
                 gfx.room = room;
                 gfx.scene = scene;
+                gfx.cast = cast;
+                gfx.entered = Instant::now();
                 gfx.camera = camera;
                 gfx.camera_index = 0;
                 gfx.update_title();
@@ -264,13 +291,18 @@ impl Gfx {
             }
         };
         let view = frame.texture.create_view(&Default::default());
+        let models = self.cast.as_ref().map(|c| c.models()).unwrap_or_default();
         self.renderer.draw(
             &self.scene,
+            &models,
+            &gk3_render::Overlay::default(),
             &self.camera,
             self.mode,
-            &view,
-            &self.depth,
-            (self.config.width, self.config.height),
+            gk3_render::Target {
+                color: &view,
+                depth: &self.depth,
+                size: (self.config.width, self.config.height),
+            },
         );
         self.window.pre_present_notify();
         self.renderer.queue().present(frame);
@@ -346,6 +378,10 @@ impl ApplicationHandler for Viewer {
                 self.last_frame = now;
                 self.fly(dt);
                 if let Some(gfx) = &mut self.gfx {
+                    if let Some(cast) = &mut gfx.cast {
+                        cast.update(&self.lib, gfx.entered.elapsed().as_secs_f64());
+                        cast.upload(&gfx.renderer);
+                    }
                     gfx.redraw();
                 }
             }

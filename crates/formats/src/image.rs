@@ -67,6 +67,22 @@ pub fn decode(bytes: &[u8]) -> Result<Image> {
     Ok(image)
 }
 
+/// Decodes a GK3 or Windows bitmap without the magenta colour key, for
+/// sheets whose colours carry meaning (font markers).
+pub fn decode_raw(bytes: &[u8]) -> Result<Image> {
+    let mut reader = Reader::new(bytes);
+    if bytes.starts_with(b"61nM") {
+        read_gk3(&mut reader)
+    } else if bytes.starts_with(b"BM") {
+        Ok(match read_bmp(bytes)? {
+            Bmp::Rgb(image) => image,
+            Bmp::Indexed(indexed) => indexed.to_rgba(),
+        })
+    } else {
+        Err(Error::Format("not a GK3 or Windows bitmap".into()))
+    }
+}
+
 /// Decodes an 8-bit Windows bitmap as indices rather than colours.
 pub fn decode_indexed(bytes: &[u8]) -> Result<IndexedImage> {
     match read_bmp(bytes)? {

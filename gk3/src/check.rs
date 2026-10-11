@@ -43,6 +43,8 @@ struct Detail {
     fact_close: usize,
     fact_off: usize,
     sections: usize,
+    keyframes: usize,
+    models: std::collections::BTreeSet<String>,
 }
 
 /// What one asset produced, for the cross-checks after the parallel pass.
@@ -100,6 +102,8 @@ pub fn run(lib: &Library, skip_audio: bool) -> Result<ExitCode, String> {
                 d.fact_close += detail.fact_close;
                 d.fact_off += detail.fact_off;
                 d.sections += detail.sections;
+                d.keyframes += detail.keyframes;
+                d.models.extend(std::mem::take(&mut detail.models));
                 let stem = stem(&entry.name);
                 match parsed {
                     Parsed::Scene { surfaces } => {
@@ -145,6 +149,46 @@ pub fn run(lib: &Library, skip_audio: bool) -> Result<ExitCode, String> {
             )),
             None => orphans.push(set),
         }
+    }
+
+    // Fonts: measure each sheet against its definition.
+    let (mut fonts, mut settled) = (0, 0);
+    let mut unsettled = Vec::new();
+    for (barn, entry) in &assets {
+        if !entry.name.to_ascii_uppercase().ends_with(".FON") {
+            continue;
+        }
+        let Ok(bytes) = barn.read(entry) else {
+            continue;
+        };
+        let def = gk3_formats::font::Definition::parse(&bytes);
+        let sheet_name = def.bitmap.clone().unwrap_or_else(|| stem(&entry.name));
+        let sheet_name = sheet_name.trim_end_matches(".bmp").trim_end_matches(".BMP");
+        let Some(sheet) = lib
+            .read(&format!("{sheet_name}.BMP"))
+            .ok()
+            .and_then(|b| image::decode_raw(&b).ok())
+        else {
+            failures.push(format!("{}: no sheet {sheet_name}.BMP", entry.name));
+            continue;
+        };
+        fonts += 1;
+        let font = gk3_formats::font::Font::new(&def, &sheet);
+        let distinct: std::collections::HashSet<char> = def.characters.iter().copied().collect();
+        if font.glyphs.len() == distinct.len() {
+            settled += 1;
+        } else {
+            unsettled.push(format!(
+                "{} ({} of {})",
+                stem(&entry.name),
+                font.glyphs.len(),
+                distinct.len()
+            ));
+        }
+    }
+    println!("Fonts: {settled} of {fonts} measure exactly as many glyphs as they declare");
+    if !unsettled.is_empty() {
+        println!("  not yet: {}", unsettled.join(", "));
     }
 
     let tallies = tallies.into_inner().unwrap();
@@ -214,6 +258,16 @@ fn parse(
             Parsed::Scene {
                 surfaces: bsp.surfaces.len(),
             }
+        }
+        Kind::ActorAnimation => {
+            let act = gk3_formats::act::VertexAnimation::parse(bytes).map_err(e)?;
+            d.keyframes = act.frame_count as usize;
+            d.models.insert(act.model.to_ascii_uppercase());
+            Parsed::Other
+        }
+        Kind::Font => {
+            // Measured in a second pass, which can look up the sheet.
+            return Ok(None);
         }
         Kind::Lightmap => {
             let maps = lightmap::parse(bytes).map_err(e)?;
@@ -287,6 +341,9 @@ fn describe(kind: Kind, d: &Detail, skip_audio: bool) -> String {
             d.fact_off
         ),
         Kind::Text => format!("{} sections", d.sections),
+        Kind::ActorAnimation => {
+            format!("{} keyframes across {} models", d.keyframes, d.models.len())
+        }
         _ => String::new(),
     }
 }

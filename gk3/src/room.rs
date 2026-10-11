@@ -13,7 +13,10 @@ use gk3_formats::bsp::Bsp;
 use gk3_formats::image::{self, Image};
 use gk3_formats::ini::{Document, Split};
 use gk3_formats::lightmap;
+use gk3_game::api::GameApi;
+use gk3_game::state::GameState;
 use gk3_render::{SceneMesh, SceneSource, Sky};
+use gk3_sheep::expr::Expr;
 
 /// A named viewpoint from a location's `[ROOM_CAMERAS]`.
 #[derive(Debug, Clone, PartialEq)]
@@ -33,8 +36,36 @@ pub struct Room {
     pub location: Option<String>,
     pub mesh: SceneMesh,
     pub cameras: Vec<RoomCamera>,
+    /// The location file, for whatever else is placed in the room.
+    pub sif: Option<Document>,
+    pub bsp: Bsp,
+    lightmaps: Vec<Image>,
+    textures: HashMap<String, Image>,
+    sky: Option<Sky>,
+    /// BSP objects not drawn, upper-cased.
+    pub hidden: HashSet<String>,
     /// Problems worth knowing about that did not stop the load.
     pub warnings: Vec<String>,
+}
+
+impl Room {
+    /// Rebuilds the drawable mesh, after objects are shown or hidden.
+    pub fn rebuild(&mut self) {
+        let texture = |name: &str| {
+            self.textures
+                .get(&name.to_ascii_uppercase())
+                .filter(|i| i.width > 0)
+                .cloned()
+        };
+        let is_hidden = |object: &str| self.hidden.contains(&object.to_ascii_uppercase());
+        self.mesh = SceneMesh::build(SceneSource {
+            bsp: &self.bsp,
+            lightmaps: &self.lightmaps,
+            texture: &texture,
+            hidden: &is_hidden,
+            sky: self.sky.clone(),
+        });
+    }
 }
 
 /// Which scene assets exist and which location each belongs to.
@@ -42,6 +73,9 @@ pub struct Catalog {
     /// Scene asset names, sorted.
     pub scenes: Vec<String>,
     location_of: HashMap<String, String>,
+    /// The story time conditions are judged at, such as `110A`. Without one,
+    /// every section of a location file applies.
+    pub time: Option<String>,
 }
 
 impl Catalog {
@@ -74,7 +108,48 @@ impl Catalog {
         Self {
             scenes,
             location_of,
+            time: None,
         }
+    }
+
+    /// A location's initialisation file as it stands at the catalog's time:
+    /// the general file (`R25.SIF`), then the timeblock's own (`R25110A.SIF`),
+    /// whose sections add to and override it.
+    pub fn location_file(&self, lib: &Library, location: &str) -> Option<Document> {
+        let location = location.to_ascii_uppercase();
+        let mut doc = Document::parse(&lib.read(&format!("{location}.SIF")).ok()?, Split::Commas);
+        if let Some(time) = &self.time
+            && let Ok(bytes) = lib.read(&format!("{location}{time}.SIF"))
+        {
+            doc.sections
+                .extend(Document::parse(&bytes, Split::Commas).sections);
+        }
+        Some(self.at_time(doc, &location))
+    }
+
+    /// The location file as it stands at the catalog's time: sections whose
+    /// condition is false are dropped, and the rest become unconditional.
+    fn at_time(&self, sif: Document, location: &str) -> Document {
+        let Some(time) = &self.time else { return sif };
+        let scripts = HashMap::new();
+        let mut state = GameState::new(time, location);
+        let mut api = GameApi::new(&mut state, &scripts);
+        let sections = sif
+            .sections
+            .into_iter()
+            .filter_map(|mut section| {
+                if let Some(condition) = section.condition.take() {
+                    let holds = Expr::parse(&condition)
+                        .map(|e| e.eval(&mut api, &|_| None).truthy())
+                        .unwrap_or(false);
+                    if !holds {
+                        return None;
+                    }
+                }
+                Some(section)
+            })
+            .collect();
+        Document { sections }
     }
 
     /// Resolves what a user typed: a scene asset (`R25_M`), a location
@@ -84,10 +159,17 @@ impl Catalog {
         if self.scenes.contains(&upper) {
             return Some(upper);
         }
-        let sif = lib.read(&format!("{upper}.SIF")).ok()?;
-        scene_lines(&Document::parse(&sif, Split::Commas))
+        let sif = self.location_file(lib, &upper)?;
+        let mut scenes = scene_lines(&sif)
             .into_iter()
-            .find(|s| self.scenes.contains(s))
+            .filter(|s| self.scenes.contains(s));
+        // At a given time a later section overrides an earlier one; without
+        // one, the first listed is as good as any.
+        if self.time.is_some() {
+            scenes.next_back()
+        } else {
+            scenes.next()
+        }
     }
 
     /// Whether any location uses this scene. A few unused scene assets point
@@ -138,12 +220,13 @@ impl Catalog {
 
         let location = self.location_of.get(&scene).cloned();
         let mut cameras = Vec::new();
+        let mut sif_doc = None;
         if let Some(location) = &location
-            && let Ok(sif) = lib.read(&format!("{location}.SIF"))
+            && let Some(sif) = self.location_file(lib, location)
         {
-            let sif = Document::parse(&sif, Split::Commas);
             cameras = room_cameras(&sif);
             hidden.extend(hidden_models(&sif));
+            sif_doc = Some(sif);
         }
 
         let sky = scn.section("SKYBOX").and_then(|section| {
@@ -171,34 +254,59 @@ impl Catalog {
             )
         });
 
-        let missing = std::cell::RefCell::new(Vec::new());
-        let texture = |name: &str| {
-            let found = load_texture(lib, name);
-            if found.is_none() {
-                missing.borrow_mut().push(name.to_string());
+        let mut textures = HashMap::new();
+        let mut missing = Vec::new();
+        for surface in &bsp.surfaces {
+            let name = surface.texture.to_ascii_uppercase();
+            if textures.contains_key(&name) {
+                continue;
             }
-            found
-        };
-        let is_hidden = |object: &str| hidden.contains(&object.to_ascii_uppercase());
-        let mesh = SceneMesh::build(SceneSource {
-            bsp: &bsp,
-            lightmaps: &lightmaps,
-            texture: &texture,
-            hidden: &is_hidden,
-            sky,
-        });
-        let missing = missing.into_inner();
+            match load_texture(lib, &name) {
+                Some(image) => {
+                    textures.insert(name, image);
+                }
+                None => {
+                    missing.push(name.clone());
+                    textures.insert(
+                        name,
+                        Image {
+                            width: 0,
+                            height: 0,
+                            rgba: Vec::new(),
+                        },
+                    );
+                }
+            }
+        }
         if !missing.is_empty() {
             warnings.push(format!("missing textures: {}", missing.join(", ")));
         }
-
-        Ok(Room {
+        let mut room = Room {
             name: scene,
             location,
-            mesh,
+            mesh: SceneMesh {
+                vertices: Vec::new(),
+                batches: Vec::new(),
+                textures: Vec::new(),
+                lightmap_atlas: Image {
+                    width: 1,
+                    height: 1,
+                    rgba: vec![255; 4],
+                },
+                sky: None,
+                bounds: ([0.0; 3], [0.0; 3]),
+            },
             cameras,
+            sif: sif_doc,
             warnings,
-        })
+            bsp,
+            lightmaps,
+            textures,
+            sky,
+            hidden,
+        };
+        room.rebuild();
+        Ok(room)
     }
 }
 
@@ -243,9 +351,21 @@ fn hidden_models(sif: &Document) -> Vec<String> {
     hidden
 }
 
-fn room_cameras(sif: &Document) -> Vec<RoomCamera> {
+/// Every named viewpoint: room cameras first (the ones the player cycles
+/// through), then the cinematic, inspection and dialogue cameras scripts cut
+/// to by name.
+pub fn room_cameras(sif: &Document) -> Vec<RoomCamera> {
     let mut cameras = Vec::new();
-    for line in sif.sections("ROOM_CAMERAS").flat_map(|s| &s.lines) {
+    let lines = [
+        "ROOM_CAMERAS",
+        "CINEMATIC_CAMERAS",
+        "INSPECT_CAMERAS",
+        "DIALOGUE_CAMERAS",
+    ]
+    .into_iter()
+    .flat_map(|name| sif.sections(name))
+    .flat_map(|s| &s.lines);
+    for line in lines {
         let Some(first) = line.pairs.first() else {
             continue;
         };
@@ -255,8 +375,14 @@ fn room_cameras(sif: &Document) -> Vec<RoomCamera> {
         ) else {
             continue;
         };
+        // Inspection cameras are named by the noun they look at.
+        let name = if first.key.eq_ignore_ascii_case("noun") {
+            first.value.clone()
+        } else {
+            first.key.clone()
+        };
         cameras.push(RoomCamera {
-            name: first.key.clone(),
+            name,
             position,
             yaw: angle[0],
             pitch: angle[1],
@@ -270,7 +396,7 @@ fn room_cameras(sif: &Document) -> Vec<RoomCamera> {
 }
 
 /// Parses `{1, 2, 3}` into numbers.
-fn floats<const N: usize>(text: &str) -> Option<[f32; N]> {
+pub(crate) fn floats<const N: usize>(text: &str) -> Option<[f32; N]> {
     let inner = text.trim().trim_start_matches('{').trim_end_matches('}');
     let values: Vec<f32> = inner
         .split(',')

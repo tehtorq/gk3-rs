@@ -8,7 +8,29 @@ use gk3_barn::Library;
 use gk3_formats::png;
 use gk3_render::{Camera, Renderer, ShadeMode};
 
+use crate::cast::Cast;
 use crate::room::{Catalog, Room, RoomCamera};
+
+/// Every character's markers and walk, from `CHARACTERS.TXT`.
+pub fn characters(
+    lib: &Library,
+) -> std::collections::HashMap<String, gk3_game::character::Character> {
+    lib.read("CHARACTERS.TXT")
+        .map(|b| gk3_game::character::parse(&b))
+        .unwrap_or_default()
+}
+
+/// The room's people and props, run forward `seconds` in fixed steps.
+pub fn cast(lib: &Library, renderer: &Renderer, room: &Room, seconds: f64) -> Option<Cast> {
+    let sif = room.sif.as_ref()?;
+    let mut cast = Cast::load(lib, renderer, sif, &characters(lib));
+    let steps = (seconds * 30.0).round() as usize;
+    for step in 0..=steps {
+        cast.update(lib, step as f64 / 30.0);
+    }
+    cast.upload(renderer);
+    Some(cast)
+}
 
 pub fn rooms(lib: &Library) -> Result<ExitCode, String> {
     let catalog = Catalog::new(lib);
@@ -86,6 +108,9 @@ pub fn render(lib: &Library, args: &[String]) -> Result<ExitCode, String> {
     let mut size = (1280u32, 720u32);
     let mut mode = ShadeMode::Lit;
     let mut out = None;
+    let mut seconds = 0.0;
+    let mut view = None;
+    let mut time = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let mut value = || it.next().cloned().ok_or(format!("{arg} needs a value"));
@@ -101,13 +126,33 @@ pub fn render(lib: &Library, args: &[String]) -> Result<ExitCode, String> {
             }
             "--mode" => mode = parse_mode(&value()?)?,
             "--png" => out = Some(value()?),
+            "--view" => {
+                let v = value()?;
+                let n: Vec<f32> = v
+                    .split(',')
+                    .map(|x| x.trim().parse())
+                    .collect::<Result<_, _>>()
+                    .map_err(|_| "--view is x,y,z,yaw,pitch")?;
+                let [x, y, z, yaw, pitch] = n[..] else {
+                    return Err("--view is x,y,z,yaw,pitch".into());
+                };
+                view = Some(Camera {
+                    position: glam::Vec3::new(x, y, z),
+                    yaw: yaw.to_radians(),
+                    pitch: pitch.to_radians(),
+                    fov_y: 60f32.to_radians(),
+                });
+            }
+            "--time" => time = Some(value()?.to_ascii_uppercase()),
+            "--seconds" => seconds = value()?.parse().map_err(|_| "--seconds takes a number")?,
             other if room_name.is_none() => room_name = Some(other.to_string()),
             other => return Err(format!("unexpected argument '{other}'")),
         }
     }
     let room_name = room_name.ok_or("render needs a room, e.g. gk3 render R25")?;
 
-    let catalog = Catalog::new(lib);
+    let mut catalog = Catalog::new(lib);
+    catalog.time = time;
     if room_name.eq_ignore_ascii_case("all") {
         return render_all(lib, &catalog, mode, size, out.as_deref().unwrap_or("rooms"));
     }
@@ -118,12 +163,30 @@ pub fn render(lib: &Library, args: &[String]) -> Result<ExitCode, String> {
     for w in &room.warnings {
         eprintln!("warning: {w}");
     }
-    let camera = start_camera(&room, camera_name.as_deref())?;
+    let camera = match view {
+        Some(v) => v,
+        None => start_camera(&room, camera_name.as_deref())?,
+    };
 
     let (device, queue, gpu) = gk3_render::headless()?;
     let renderer = Renderer::new(device, queue, gk3_render::OFFSCREEN_FORMAT);
     let gpu_scene = renderer.upload(&room.mesh);
-    let image = renderer.render_image(&gpu_scene, &camera, mode, size.0, size.1)?;
+    let cast = cast(lib, &renderer, &room, seconds);
+    if let Some(cast) = &cast {
+        for w in &cast.warnings {
+            eprintln!("warning: {w}");
+        }
+        println!("cast: {}", cast.describe());
+    }
+    let models = cast.as_ref().map(|c| c.models()).unwrap_or_default();
+    let image = renderer.render_image(
+        &gpu_scene,
+        &models,
+        &gk3_render::Overlay::default(),
+        &camera,
+        mode,
+        size,
+    )?;
 
     let out = out.unwrap_or_else(|| format!("{scene}.png"));
     std::fs::write(Path::new(&out), png::encode(&image)).map_err(|e| format!("{out}: {e}"))?;
@@ -150,6 +213,8 @@ fn render_all(
     let mut failures = Vec::new();
     let mut skipped = Vec::new();
     let mut warned = 0;
+    let mut figures = 0;
+    let mut cast_warnings: Vec<String> = Vec::new();
     for scene in &catalog.scenes {
         let result = catalog.load(lib, scene).and_then(|room| {
             if !room.warnings.is_empty() {
@@ -158,7 +223,20 @@ fn render_all(
             }
             let camera = start_camera(&room, None)?;
             let gpu_scene = renderer.upload(&room.mesh);
-            let image = renderer.render_image(&gpu_scene, &camera, mode, size.0, size.1)?;
+            let cast = cast(lib, &renderer, &room, 0.0);
+            if let Some(cast) = &cast {
+                figures += cast.models().len();
+                cast_warnings.extend(cast.warnings.iter().map(|w| format!("{scene}: {w}")));
+            }
+            let models = cast.as_ref().map(|c| c.models()).unwrap_or_default();
+            let image = renderer.render_image(
+                &gpu_scene,
+                &models,
+                &gk3_render::Overlay::default(),
+                &camera,
+                mode,
+                size,
+            )?;
             let path = Path::new(dir).join(format!("{scene}.png"));
             std::fs::write(&path, png::encode(&image)).map_err(|e| e.to_string())
         });
@@ -174,6 +252,21 @@ fn render_all(
         catalog.scenes.len(),
         start.elapsed().as_secs_f64()
     );
+    println!(
+        "{figures} people and props placed; {} could not be",
+        cast_warnings.len()
+    );
+    cast_warnings.sort();
+    cast_warnings.dedup();
+    for w in cast_warnings.iter().take(
+        if crate::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
+            usize::MAX
+        } else {
+            12
+        },
+    ) {
+        println!("  {w}");
+    }
     if !skipped.is_empty() {
         println!("Skipped, unused by any location: {}", skipped.join(", "));
     }

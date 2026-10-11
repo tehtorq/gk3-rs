@@ -39,6 +39,7 @@ pub struct Batch {
 }
 
 /// The six faces of a skybox in cube-map layer order: +X, -X, +Y, -Y, +Z, -Z.
+#[derive(Clone)]
 pub struct Sky {
     pub faces: [Image; 6],
     /// Rotation about the vertical axis, in degrees.

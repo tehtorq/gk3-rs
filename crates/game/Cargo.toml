@@ -1,0 +1,12 @@
+[package]
+name = "gk3-game"
+description = "Gabriel Knight 3 game logic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gk3-formats.workspace = true
+gk3-sheep.workspace = true
+glam.workspace = true

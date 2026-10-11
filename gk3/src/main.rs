@@ -1,10 +1,18 @@
 //! `gk3`: the Gabriel Knight 3 engine and its asset tools.
 
+mod actions_cmd;
+mod cast;
 mod check;
 mod export;
+mod play;
 mod room;
+mod sheep_cmd;
 mod shoot;
+mod soundtrack;
+mod ui;
 mod view;
+mod window;
+mod world;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -29,11 +37,25 @@ commands:
   check [--no-audio]    Parse every asset with the decoder for its kind.
   export PATTERN...     Convert matching assets: bitmaps to PNG, models and
                         rooms to OBJ, sounds to PCM WAV (see --out).
-  view [ROOM]           Fly through the rooms in a window. Starts in R25.
+  actions check         Read every action file and compile every rule's script.
+  sheep check           Decode every compiled script.
+  sheep disasm NAME     List a script's bytecode.
+  sheep apis            The game API the scripts call, by use.
+  sheep run             Run every function of every script; report and hash.
+  sheep call S F        Run function F of script S and show what it did.
+  play [LOC] [--time T] Play from a location (default R25 at 110A). With
+                        --do NOUN:VERB (repeatable), --seconds N and --png F
+                        it runs without a window and reports what happened.
+  view [ROOM] [--time T] Fly through the rooms in a window. Starts in R25.
+                        With --time (e.g. 110A, day 1 10am) rooms are set up
+                        as the story has them then.
   rooms                 List the rooms (scene assets) by name.
   render ROOM           Draw a room to a PNG without a window. Options:
                         --camera NAME, --size WxH, --png FILE,
-                        --mode lit|textures|lightmaps.
+                        --view x,y,z,yaw,pitch (any viewpoint),
+                        --mode lit|textures|lightmaps, --seconds N,
+                        --time T (set the room up as at timeblock T)
+                        (run the room's animations N seconds first).
 
 options:
   --data DIR            The game's Data directory. Defaults to $GK3_DATA.
@@ -97,6 +119,9 @@ fn main() -> ExitCode {
         "extract" => open(&options).and_then(|lib| extract(&lib, &options.args, &options.out)),
         "verify" => open(&options).and_then(|lib| verify(&lib)),
         "export" => open(&options).and_then(|lib| export::run(&lib, &options.args, &options.out)),
+        "actions" => open(&options).and_then(|lib| actions_cmd::run(&lib, &options.args)),
+        "sheep" => open(&options).and_then(|lib| sheep_cmd::run(&lib, &options.args)),
+        "play" => open(&options).and_then(|lib| play::run(lib, &options.args)),
         "view" => open(&options).and_then(|lib| view::run(lib, &options.args)),
         "rooms" => open(&options).and_then(|lib| shoot::rooms(&lib)),
         "render" => open(&options).and_then(|lib| shoot::render(&lib, &options.args)),

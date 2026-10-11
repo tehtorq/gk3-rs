@@ -1,0 +1,10 @@
+[package]
+name = "gk3-sheep"
+description = "Sheep, Gabriel Knight 3's scripting language: bytecode reader, virtual machine and expressions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gk3-formats.workspace = true

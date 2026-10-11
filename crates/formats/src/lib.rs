@@ -4,7 +4,11 @@
 //! here knows about archives, rendering or the game; see `gk3-barn` for
 //! getting the bytes.
 
+pub mod act;
+pub mod anm;
 pub mod bsp;
+pub mod font;
+pub mod gas;
 pub mod image;
 pub mod ini;
 pub mod lightmap;

@@ -1,0 +1,11 @@
+[package]
+name = "gk3-audio"
+description = "Sound output for Gabriel Knight 3, with the system's audio loaded at run time"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gk3-media.workspace = true
+libloading = "0.8"

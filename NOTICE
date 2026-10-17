@@ -11,5 +11,28 @@ The Barn archive layout in crates/barn follows G-Engine's BarnFile.cpp and
 GK3Reborn's docs/formats/barn.md. The LZO1X decoder follows the structure of
 the reference lzo1x_decompress_safe algorithm.
 
+The rules for when each timeblock ends (crates/game/src/timeblocks.rs) are
+G-Engine's reconstruction in its Assets/Timeblocks.shp, restated as Sheep
+conditions; the original game keeps them in its executable. Other behaviour
+taken from G-Engine (action case ranking, camera collision, conversations,
+title cards) is noted where it is implemented. The tables the original
+keeps in code rather than data, and that G-Engine reconstructed, are taken
+from it too: the fingerprint kit's objects, the driving map's places and
+routes, the binoculars' aim, and SIDNEY's files, search events, analyses,
+translations, fake IDs and suspects. So are the driving map's hints
+(gk3/src/map.rs), from G-Engine's HintManager; CS2's laser heads
+(gk3/src/laser_heads.rs), from its LaserHead; TE1's chessboard
+(gk3/src/chessboard.rs), from its Chessboard; TE3's pendulum
+(gk3/src/pendulum.rs), from its Pendulum; TE6's fight, from its
+DemonFight; and its scene functions' mends for faults in the original's
+files (MS3, CSE). The score each event is worth
+(crates/game/src/scores.rs) and TE5's bridge (gk3/src/bridge.rs) were read
+from the original executable.
+
+The Bink decoder (crates/bink) and the Cinepak decoder
+(crates/media/src/cinepak.rs) are ports of FFmpeg's bink.c, binkaudio.c,
+binkdsp.c and cinepak.c (LGPL-2.1-or-later, https://ffmpeg.org), used here
+under the GPL as the LGPL allows.
+
 Gabriel Knight 3 and its assets are the property of their owners. No game data
 is included in or distributed with this project.

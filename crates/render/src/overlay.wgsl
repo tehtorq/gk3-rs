@@ -7,12 +7,14 @@ struct VertexIn {
     @location(0) position: vec2<f32>,
     @location(1) uv: vec2<f32>,
     @location(2) color: vec4<f32>,
+    @location(3) bounds: vec4<f32>,
 };
 
 struct VertexOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) bounds: vec4<f32>,
 };
 
 @vertex
@@ -21,10 +23,14 @@ fn vs_main(v: VertexIn) -> VertexOut {
     out.clip = vec4<f32>(v.position, 0.0, 1.0);
     out.uv = v.uv;
     out.color = v.color;
+    out.bounds = v.bounds;
     return out;
 }
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-    return textureSample(sheet, sheet_sampler, in.uv) * in.color;
+    // Smoothed, but only from the quad's own part of the sheet: glyphs
+    // packed edge to edge would otherwise each show a sliver of the next.
+    let uv = clamp(in.uv, in.bounds.xy, in.bounds.zw);
+    return textureSample(sheet, sheet_sampler, uv) * in.color;
 }

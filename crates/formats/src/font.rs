@@ -25,6 +25,8 @@ pub struct Definition {
     pub default_char: Option<char>,
     /// `Color Replacement` fonts draw their glyphs in this colour.
     pub color: Option<[u8; 3]>,
+    /// A greyscale bitmap giving the sheet's coverage, where there is one.
+    pub alpha: Option<String>,
 }
 
 impl Definition {
@@ -40,6 +42,7 @@ impl Definition {
             line_extra: 0,
             default_char: None,
             color: None,
+            alpha: None,
         };
         let mut replacement = false;
         for line in text.split(['\r', '\n']) {
@@ -50,6 +53,7 @@ impl Definition {
             match key.trim().to_ascii_lowercase().as_str() {
                 "font" => def.characters = value.chars().collect(),
                 "bitmap name" => def.bitmap = Some(value.trim().to_string()),
+                "alpha channel" => def.alpha = Some(value.trim().to_string()),
                 "line count" => def.line_count = value.trim().parse().unwrap_or(1).max(1),
                 "char extra" => def.char_extra = value.trim().parse().unwrap_or(0),
                 "line extra" => def.line_extra = value.trim().parse().unwrap_or(0),
@@ -105,6 +109,13 @@ impl Font {
     /// Measures a sheet against its definition. `sheet` is decoded as the
     /// raw bitmap, before any colour keying.
     pub fn new(def: &Definition, sheet: &Image) -> Font {
+        Self::with_alpha(def, sheet, None)
+    }
+
+    /// As [`Font::new`], with the definition's alpha bitmap if it has one:
+    /// coverage then comes from it, and the replacement colour (the pixel
+    /// below the top left) becomes the font's colour.
+    pub fn with_alpha(def: &Definition, sheet: &Image, alpha: Option<&Image>) -> Font {
         let (w, h) = (sheet.width, sheet.height);
         let pixel = |x: u32, y: u32| {
             let mut p = sheet.pixel(x.min(w - 1), y.min(h - 1));
@@ -159,14 +170,14 @@ impl Font {
                     continue;
                 }
             }
-            glyphs.insert(
-                def.characters[i],
-                Glyph {
-                    x: start,
-                    y: y + 1,
-                    width: (x - start).max(1),
-                },
-            );
+            // A character listed twice keeps its first place: the tooltip
+            // font's list ends with a second space, past the end of its
+            // sheet, which would otherwise leave spaces a pixel wide.
+            glyphs.entry(def.characters[i]).or_insert(Glyph {
+                x: start,
+                y: y + 1,
+                width: (x - start).max(1),
+            });
             i += 1;
             if x >= w.saturating_sub(1) && line < def.line_count {
                 line += 1;
@@ -181,7 +192,10 @@ impl Font {
             char_extra: def.char_extra,
             line_extra: def.line_extra,
             default_char: def.default_char,
-            sheet: recolor(sheet, def.color),
+            sheet: match alpha.filter(|a| a.width == sheet.width && a.height == sheet.height) {
+                Some(alpha) => apply_alpha(sheet, alpha, def.color),
+                None => recolor(sheet, def.color),
+            },
         }
     }
 
@@ -230,6 +244,19 @@ impl Font {
 /// glyphs (the key gives coverage, and only the replacement colour is
 /// recoloured, so drop shadows survive), or black-backed with antialiased
 /// white glyphs (brightness gives coverage).
+fn apply_alpha(sheet: &Image, alpha: &Image, color: Option<[u8; 3]>) -> Image {
+    let replace = sheet.pixel(0, 1.min(sheet.height - 1));
+    let mut out = sheet.clone();
+    for (p, a) in out.rgba.chunks_exact_mut(4).zip(alpha.rgba.chunks_exact(4)) {
+        let texel = [p[0], p[1], p[2], 255];
+        if let Some(c) = color.filter(|_| same(texel, replace, 40)) {
+            p[..3].copy_from_slice(&c);
+        }
+        p[3] = a[0];
+    }
+    out
+}
+
 fn recolor(sheet: &Image, color: Option<[u8; 3]>) -> Image {
     let background = sheet.pixel(0, 0);
     let keyed = background[0] >= 230 && background[1] <= 25 && background[2] >= 230;
@@ -309,6 +336,15 @@ mod tests {
         assert_eq!(font.glyphs[&'C'].width, 3);
         assert_eq!(font.glyph_height, 2);
         assert_eq!(font.width("AB"), 6);
+    }
+
+    #[test]
+    fn a_character_listed_twice_keeps_its_first_place() {
+        // The second A runs off the end of the sheet.
+        let def = Definition::parse(b"Font=ABA\n");
+        let font = Font::new(&def, &sheet());
+        assert_eq!(font.glyphs[&'A'].x, 1);
+        assert_eq!(font.glyphs[&'A'].width, 3);
     }
 
     #[test]

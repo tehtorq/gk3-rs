@@ -112,91 +112,159 @@ impl Bounds {
         self.triangles.len()
     }
 
-    /// Where a camera at `from` ends up trying to move by `offset`. Moves in
-    /// steps short enough not to pass through a wall, pushing out of any wall
-    /// it is moving into the front of; what remains of the push slides it
-    /// along the wall.
+    /// Where a camera at `from` ends up trying to move by `offset`, as
+    /// G-Engine's `ResolveCollisions`: the sphere goes as far as the first
+    /// wall it would touch, and what is left of the move slides along that
+    /// wall, a few times over. It never moves into a wall, so it is never
+    /// pushed back out of one either, which jitters in corners and gaps.
     pub fn slide(&self, from: Vec3, offset: Vec3) -> Vec3 {
         if !self.enabled || self.walls().next().is_none() {
             return from + offset;
         }
-        let steps = (offset.length() / (RADIUS * 0.5)).ceil().max(1.0) as usize;
-        let step = offset / steps as f32;
         let mut p = from;
-        for _ in 0..steps {
-            let before = p;
-            p += step;
-            for _ in 0..4 {
-                let mut pushed = false;
-                for (tri, n) in self.walls() {
-                    // One-sided: only walls being approached from the front.
-                    if n.dot(p - before) >= 0.0 || n.dot(before - tri[0]) < -RADIUS * 0.5 {
-                        continue;
-                    }
-                    let q = closest_on_triangle(p, tri);
-                    let apart = p - q;
-                    let d = apart.length();
-                    if d >= RADIUS {
-                        continue;
-                    }
-                    // Off the face (an edge or corner) push straight away
-                    // from it; on it, or gone through, push out along the
-                    // normal.
-                    let out = if d > 1e-4 && n.dot(apart) > 0.0 {
-                        apart / d
-                    } else {
-                        *n
-                    };
-                    let depth = if out == *n {
-                        RADIUS - n.dot(p - tri[0])
-                    } else {
-                        RADIUS - d
-                    };
-                    p += out * depth.max(0.0);
-                    pushed = true;
-                }
-                if !pushed {
-                    break;
-                }
+        let mut rest = offset;
+        let mut first: Option<Vec3> = None;
+        for pass in 0..3 {
+            if rest.length_squared() < 1e-8 {
+                break;
             }
+            let hit = self
+                .walls()
+                .filter_map(|(tri, n)| sweep(p, rest, tri, *n))
+                .min_by(|a, b| a.0.total_cmp(&b.0));
+            let Some((t, normal)) = hit else {
+                p += rest;
+                break;
+            };
+            // Up to the wall, less a hair so the next move starts clear.
+            let length = rest.length();
+            let travel = (t * length - SKIN).max(0.0);
+            p += rest / length * travel;
+            if pass == 2 {
+                break;
+            }
+            // What is left, along the wall.
+            let left = rest * (1.0 - t);
+            rest = left - normal * left.dot(normal).min(0.0);
+            // In a corner, sliding along the second wall would go back
+            // into the first: only along the crease where they meet, or
+            // the camera swings from one to the other frame after frame.
+            if let Some(n1) = first
+                && rest.dot(n1) < 0.0
+            {
+                let crease = n1.cross(normal).normalize_or_zero();
+                rest = crease * left.dot(crease);
+            }
+            first.get_or_insert(normal);
+        }
+        // Never back the way it was pushed.
+        if (p - from).dot(offset) < 0.0 {
+            return from;
         }
         p
     }
 }
 
-/// The point of a triangle nearest `p` (Ericson, Real-Time Collision
-/// Detection, 5.1.5).
-fn closest_on_triangle(p: Vec3, [a, b, c]: &[Vec3; 3]) -> Vec3 {
-    let (a, b, c) = (*a, *b, *c);
-    let (ab, ac, ap) = (b - a, c - a, p - a);
-    let (d1, d2) = (ab.dot(ap), ac.dot(ap));
-    if d1 <= 0.0 && d2 <= 0.0 {
-        return a;
+/// How far short of a wall the camera stops.
+const SKIN: f32 = 0.01;
+
+/// When, as a fraction of `offset`, a sphere of `RADIUS` at `c` moving by
+/// `offset` first touches a wall's front, and the direction it is pushed
+/// back in there. Only a move towards the front counts (one-sided, as
+/// G-Engine's `Collide::SphereTriangle`); a sphere already touching it
+/// stops at once.
+fn sweep(c: Vec3, offset: Vec3, tri: &[Vec3; 3], n: Vec3) -> Option<(f32, Vec3)> {
+    let towards = -n.dot(offset);
+    if towards <= 0.0 {
+        return None;
     }
-    let bp = p - b;
-    let (d3, d4) = (ab.dot(bp), ac.dot(bp));
-    if d3 >= 0.0 && d4 <= d3 {
-        return b;
+    let distance = n.dot(c - tri[0]);
+    if distance < -RADIUS {
+        return None;
     }
-    let vc = d1 * d4 - d3 * d2;
-    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
-        return a + ab * (d1 / (d1 - d3));
+    let mut best: Option<(f32, Vec3)> = None;
+    // A touch counts only if it pushes back against the move.
+    let mut consider = |t: f32, normal: Vec3| {
+        if (0.0..=1.0).contains(&t)
+            && normal.dot(offset) < 0.0
+            && best.is_none_or(|(b, _)| t < b)
+        {
+            best = Some((t, normal));
+        }
+    };
+    // The face: the sphere's leading point meets the plane inside it.
+    if distance >= 0.0 {
+        let t = ((distance - RADIUS) / towards).max(0.0);
+        if t > 1.0 {
+            return None;
+        }
+        let touch = c + offset * t - n * distance.min(RADIUS);
+        if contains(tri, touch) {
+            consider(t, n);
+        }
     }
-    let cp = p - c;
-    let (d5, d6) = (ab.dot(cp), ac.dot(cp));
-    if d6 >= 0.0 && d5 <= d6 {
-        return c;
+    // The corners and edges: where the moving centre comes within a radius.
+    for k in 0..3 {
+        let (a, b) = (tri[k], tri[(k + 1) % 3]);
+        if let Some(t) = reach_point(c, offset, a) {
+            consider(t, (c + offset * t - a).normalize_or(n));
+        }
+        if let Some((t, q)) = reach_edge(c, offset, a, b) {
+            consider(t, (c + offset * t - q).normalize_or(n));
+        }
     }
-    let vb = d5 * d2 - d1 * d6;
-    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
-        return a + ac * (d2 / (d2 - d6));
+    best
+}
+
+/// Whether `p`, on a triangle's plane, is inside it (either winding).
+fn contains([a, b, c]: &[Vec3; 3], p: Vec3) -> bool {
+    let n = (*b - *a).cross(*c - *a);
+    let side = |u: Vec3, v: Vec3| (v - u).cross(p - u).dot(n) >= -1e-4;
+    side(*a, *b) && side(*b, *c) && side(*c, *a)
+}
+
+/// When a sphere at `c` moving by `offset` first comes within `RADIUS` of
+/// point `p` (at once if it already is).
+fn reach_point(c: Vec3, offset: Vec3, p: Vec3) -> Option<f32> {
+    let m = c - p;
+    let cc = m.length_squared() - RADIUS * RADIUS;
+    if cc <= 0.0 {
+        return Some(0.0);
     }
-    let va = d3 * d6 - d5 * d4;
-    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
-        return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
+    first_root(offset.length_squared(), 2.0 * m.dot(offset), cc)
+}
+
+/// The same for the segment `a`-`b`, with the point on it touched.
+fn reach_edge(c: Vec3, offset: Vec3, a: Vec3, b: Vec3) -> Option<(f32, Vec3)> {
+    let e = b - a;
+    let ee = e.length_squared();
+    if ee < 1e-8 {
+        return None;
     }
-    let denom = 1.0 / (va + vb + vc);
-    a + ab * (vb * denom) + ac * (vc * denom)
+    // Work across the edge: drop each vector's part along it.
+    let across = |v: Vec3| v - e * (v.dot(e) / ee);
+    let (m, d) = (across(c - a), across(offset));
+    let cc = m.length_squared() - RADIUS * RADIUS;
+    let t = if cc <= 0.0 {
+        0.0
+    } else {
+        first_root(d.length_squared(), 2.0 * m.dot(d), cc)?
+    };
+    let s = (c + offset * t - a).dot(e) / ee;
+    (0.0..=1.0).contains(&s).then(|| (t, a + e * s))
+}
+
+/// The smaller root of a t^2 + b t + c = 0 in [0, 1], if moving closer.
+fn first_root(a: f32, b: f32, c: f32) -> Option<f32> {
+    if a < 1e-8 || b >= 0.0 {
+        return None;
+    }
+    let disc = b * b - 4.0 * a * c;
+    if disc < 0.0 {
+        return None;
+    }
+    let t = (-b - disc.sqrt()) / (2.0 * a);
+    (0.0..=1.0).contains(&t).then_some(t)
 }
 
 #[derive(Debug, Default)]
@@ -353,6 +421,78 @@ mod tests {
         assert!(props.slide(Vec3::ZERO, Vec3::Z * 500.0).z < 100.0);
         props.unblock("box");
         assert_eq!(props.slide(Vec3::ZERO, Vec3::Z * 500.0).z, 500.0);
+    }
+
+    /// Pushed into the corners and creases of Gabriel's room (both of its
+    /// bounds models) from all over it, the camera never swings back and
+    /// forth between two walls from one frame to the next.
+    #[test]
+    fn r25_corners_hold_the_camera_steady() {
+        let Some(dir) = std::env::var_os("GK3_DATA") else {
+            return;
+        };
+        let lib = gk3_barn::Library::open_dir(dir).unwrap();
+        let models: Vec<_> = ["R25CAMERABOUNDS.MOD", "R25_SIDCM.MOD"]
+            .iter()
+            .map(|n| gk3_formats::model::Model::parse(&lib.read(n).unwrap()).unwrap())
+            .collect();
+        let bounds = Bounds::from_models(models.iter());
+        for gx in 0..6 {
+            for gz in 0..7 {
+                let start = Vec3::new(-20.0 + gx as f32 * 60.0, 62.0, 30.0 + gz as f32 * 60.0);
+                for i in 0..36 {
+                    let a = i as f32 / 12.0 * std::f32::consts::TAU;
+                    let d = Vec3::new(a.sin(), (i / 12) as f32 * 0.3 - 0.3, a.cos());
+                    let (mut p, mut prev, mut swings) = (start, Vec3::ZERO, 0);
+                    for _ in 0..180 {
+                        let q = bounds.slide(p, d * SPEED / 60.0);
+                        let m = q - p;
+                        if m.length() > 0.05 && prev.length() > 0.05 && m.dot(prev) < 0.0 {
+                            swings += 1;
+                        }
+                        (prev, p) = (m, q);
+                    }
+                    assert!(swings <= 3, "from {start} heading {i}: {swings} swings, ending {p}");
+                }
+            }
+        }
+    }
+
+    /// Held against walls, in corners and across the bathroom's narrow
+    /// spaces, the camera comes to rest or slides on: it never shakes back
+    /// and forth from frame to frame.
+    #[test]
+    fn r25_walls_hold_the_camera_steady() {
+        let Some(dir) = std::env::var_os("GK3_DATA") else {
+            return;
+        };
+        let lib = gk3_barn::Library::open_dir(dir).unwrap();
+        let model =
+            gk3_formats::model::Model::parse(&lib.read("R25CAMERABOUNDS.MOD").unwrap()).unwrap();
+        let bounds = Bounds::from_models([&model]);
+        // The START camera, and one inside the bathroom door.
+        for start in [Vec3::new(277.58, 61.70, 50.57), Vec3::new(300.0, 65.0, 130.0)] {
+            for i in 0..32 {
+                let angle = i as f32 / 32.0 * std::f32::consts::TAU;
+                let dir = Vec3::new(angle.sin(), (i % 5) as f32 * 0.1 - 0.2, angle.cos());
+                // Five seconds at 60 frames a second, full speed.
+                let mut p = start;
+                let mut trail = vec![p];
+                for _ in 0..300 {
+                    p = bounds.slide(p, dir * SPEED / 60.0);
+                    trail.push(p);
+                }
+                // The last second: the way it went is as long as how far
+                // it got, give or take.
+                let last = &trail[trail.len() - 61..];
+                let path: f32 = last.windows(2).map(|w| w[0].distance(w[1])).sum();
+                let net = last[0].distance(last[60]);
+                assert!(
+                    path <= net + 1.0,
+                    "from {start} heading {i}: moved {path:.1} to get {net:.1}"
+                );
+            }
+        }
     }
 
     /// The real bounds keep the camera in Gabriel's room, whichever way it

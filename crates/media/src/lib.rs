@@ -4,6 +4,9 @@
 //! stream (format tag 0x55), which is decoded here with symphonia's pure-Rust
 //! MP3 decoder; the rest are plain PCM.
 
+pub mod avi;
+pub mod cinepak;
+
 use std::fmt;
 use std::io::Cursor;
 

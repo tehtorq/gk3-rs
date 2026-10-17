@@ -1,0 +1,99 @@
+#!/bin/bash
+# gk3-jump: pick a time of day and a place, and play from there.
+#
+# A small launcher window for testing: it lists every timeblock and the
+# locations the story has at each (from `gk3 scenes`), then opens the game
+# at the one picked. Close the game to come back and pick another; cancel
+# a list to go back a step, or to quit from the first.
+#
+# Needs kdialog (KDE) or zenity (GNOME and others). The game is found as
+# $GK3, else next to this script in target/release, else on the PATH. The
+# game data is $GK3_DATA, as for gk3 itself; without it you are asked.
+
+set -u
+
+here=$(cd "$(dirname "$0")" && pwd)
+gk3=${GK3:-}
+if [ -z "$gk3" ]; then
+  if [ -x "$here/../target/release/gk3" ]; then
+    gk3="$here/../target/release/gk3"
+  else
+    gk3=$(command -v gk3 || true)
+  fi
+fi
+
+if command -v kdialog >/dev/null; then
+  ui=kdialog
+elif command -v zenity >/dev/null; then
+  ui=zenity
+else
+  echo "gk3-jump needs kdialog or zenity" >&2
+  exit 1
+fi
+
+error() {
+  if [ $ui = kdialog ]; then
+    kdialog --title "GK3 Jump" --error "$1"
+  else
+    zenity --title "GK3 Jump" --error --text "$1"
+  fi
+}
+
+# menu PROMPT TAG LABEL [TAG LABEL...]: prints the tag picked; fails on
+# cancel.
+menu() {
+  local prompt=$1
+  shift
+  if [ $ui = kdialog ]; then
+    kdialog --title "GK3 Jump" --geometry 560x640 --menu "$prompt" "$@"
+  else
+    zenity --title "GK3 Jump" --width 560 --height 640 --list \
+      --text "$prompt" --column tag --column "$prompt" \
+      --hide-column 1 --hide-header "$@"
+  fi
+}
+
+if [ -z "$gk3" ] || [ ! -x "$gk3" ]; then
+  error "Cannot find the gk3 program. Build it with cargo build --release, or set GK3 to it."
+  exit 1
+fi
+
+if [ -z "${GK3_DATA:-}" ]; then
+  if [ $ui = kdialog ]; then
+    GK3_DATA=$(kdialog --title "GK3 Jump: the game's Data folder" --getexistingdirectory "$HOME") || exit 0
+  else
+    GK3_DATA=$(zenity --title "GK3 Jump: the game's Data folder" --file-selection --directory) || exit 0
+  fi
+fi
+export GK3_DATA
+
+if ! scenes=$("$gk3" scenes 2>&1); then
+  error "gk3 cannot read the game data:
+$scenes"
+  exit 1
+fi
+
+while true; do
+  # The groups in order: a timeblock and its name, once each.
+  args=()
+  while IFS=$'\t' read -r tag label; do
+    args+=("$tag|$label" "$label")
+  done < <(printf '%s\n' "$scenes" | cut -f1,2 | awk '!seen[$0]++')
+  group=$(menu "Pick a time" "${args[@]}") || exit 0
+  time=${group%%|*}
+  label=${group#*|}
+
+  while true; do
+    args=()
+    while IFS=$'\t' read -r _ _ location name; do
+      args+=("$location" "$name ($location)")
+    done < <(printf '%s\n' "$scenes" | awk -F'\t' -v t="$time" -v l="$label" \
+      '$1 == t && $2 == l')
+    location=$(menu "$label: pick a place" "${args[@]}") || break
+    # The game's complaints, kept for if it fails.
+    if ! complaints=$("$gk3" play "$location" --time "$time" 2>&1 >/dev/null); then
+      error "The game stopped at $location, $label:
+$(printf '%s\n' "$complaints" | tail -n 15)"
+    fi
+  done
+done

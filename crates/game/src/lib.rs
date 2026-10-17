@@ -4,8 +4,11 @@
 pub mod actions;
 pub mod api;
 pub mod character;
+pub mod footsteps;
 pub mod gas_player;
 pub mod placement;
 pub mod pose;
+pub mod scores;
 pub mod state;
+pub mod timeblocks;
 pub mod walk;

@@ -1,0 +1,9 @@
+[package]
+name = "gk3-bink"
+description = "Bink 1 video and audio decoding for Gabriel Knight 3's movies"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]

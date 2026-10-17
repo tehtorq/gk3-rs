@@ -502,6 +502,7 @@ version = "0.1.0"
 dependencies = [
  "gk3-audio",
  "gk3-barn",
+ "gk3-bink",
  "gk3-formats",
  "gk3-game",
  "gk3-media",
@@ -527,6 +528,10 @@ version = "0.1.0"
 dependencies = [
  "miniz_oxide",
 ]
+
+[[package]]
+name = "gk3-bink"
+version = "0.1.0"
 
 [[package]]
 name = "gk3-formats"

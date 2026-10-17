@@ -55,6 +55,38 @@ impl Pose {
         }
     }
 
+    /// Turns the whole pose about the vertical through `pivot` (in the
+    /// model's space) by `angle` radians, as if the model stood turned.
+    pub fn turn_about(&mut self, angle: f32, pivot: Vec3) {
+        let turn = Mat4::from_translation(pivot)
+            * Mat4::from_rotation_y(angle)
+            * Mat4::from_translation(-pivot);
+        for mesh in &mut self.meshes {
+            let m = turn * mesh.matrix();
+            mesh.transform = [
+                m.x_axis.truncate().to_array(),
+                m.y_axis.truncate().to_array(),
+                m.z_axis.truncate().to_array(),
+                m.w_axis.truncate().to_array(),
+            ];
+        }
+    }
+
+    /// Mixes this pose back towards `from` by `weight` (0 leaves it, 1 is
+    /// `from`): for easing from one pose into another. Meshes or submeshes
+    /// that differ in shape are left as they are.
+    pub fn blend_from(&mut self, from: &Pose, weight: f32) {
+        if weight <= 0.0 {
+            return;
+        }
+        for (mesh, old) in self.meshes.iter_mut().zip(&from.meshes) {
+            mesh.transform = mix_transform(&mesh.transform, &old.transform, weight);
+            for (positions, earlier) in mesh.positions.iter_mut().zip(&old.positions) {
+                *positions = mix_positions(positions, earlier, weight);
+            }
+        }
+    }
+
     /// Applies a clip at a time measured in frames. Meshes and submeshes the
     /// clip does not record keep the shape they had.
     pub fn apply(&mut self, clip: &VertexAnimation, frame_time: f32, looping: bool) {
@@ -79,8 +111,11 @@ impl Pose {
     }
 }
 
-/// The value in force at `frame`, mixed towards the next one when that was
-/// recorded on the very next frame (or, wrapping, on frame 0).
+/// The value in force at `frame`, mixed towards the one in force on the
+/// next frame (or, wrapping, on frame 0). A track with a gap holds its value
+/// through it and moves on only in the frame before its next key: a mesh's
+/// transform may skip frames its vertices do not, and the two must move
+/// together or the part leaps out of place for a moment.
 fn sample<T: Clone>(
     track: &[Keyed<T>],
     frame: u32,
@@ -90,7 +125,7 @@ fn sample<T: Clone>(
 ) -> Option<T> {
     let i = track.partition_point(|k| k.frame <= frame).checked_sub(1)?;
     let current = &track[i];
-    if current.frame != frame || t <= 0.0 {
+    if t <= 0.0 {
         return Some(current.value.clone());
     }
     let next = if wrap {
@@ -165,10 +200,12 @@ mod tests {
     }
 
     #[test]
-    fn holds_across_a_gap() {
+    fn holds_across_a_gap_then_moves_on_into_the_next_key() {
         let mut p = pose();
         p.apply(&clip(&[0, 3]), 1.5, false);
         assert_eq!(p.meshes[0].positions[0][0], [0.0, 0.0, 0.0]);
+        p.apply(&clip(&[0, 3]), 2.5, false);
+        assert_eq!(p.meshes[0].positions[0][0], [15.0, 0.0, 0.0]);
     }
 
     #[test]

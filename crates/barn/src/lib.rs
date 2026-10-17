@@ -438,6 +438,8 @@ pub struct Library {
     index: HashMap<String, Location>,
     /// Pointer entries whose target could not be found, by asset name.
     unresolved: Vec<(String, String)>,
+    /// The directory the archives came from, where the movies lie loose.
+    dir: Option<PathBuf>,
 }
 
 impl Library {
@@ -460,7 +462,24 @@ impl Library {
         }
         paths.sort();
         let barns = paths.iter().map(Barn::open).collect::<Result<Vec<_>>>()?;
-        Ok(Self::from_barns(barns))
+        let mut library = Self::from_barns(barns);
+        library.dir = Some(dir.to_path_buf());
+        Ok(library)
+    }
+
+    /// A file lying loose beside the archives (the movies), by name, in
+    /// any case.
+    pub fn loose_file(&self, name: &str) -> Option<Vec<u8>> {
+        let dir = self.dir.as_ref()?;
+        let path = std::fs::read_dir(dir)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(name))
+            })?;
+        std::fs::read(path).ok()
     }
 
     /// Builds a library from already-open archives.
@@ -513,6 +532,7 @@ impl Library {
             barns,
             index,
             unresolved,
+            dir: None,
         }
     }
 

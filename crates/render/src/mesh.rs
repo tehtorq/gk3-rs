@@ -12,6 +12,11 @@ use gk3_formats::image::Image;
 /// `kIgnoreLightmapFlag` and `kShadowTextureFlag`).
 const NO_LIGHTMAP_FLAGS: u32 = 8 | 64;
 
+/// A surface whose texture is a shadow to darken what lies under it, which
+/// the original draws in a pass of its own after the room, multiplying it
+/// onto the picture with no lightmap (0x5938e0).
+const SHADOW_SURFACE_FLAG: u32 = 64;
+
 /// GK3's "2x lighting": lightmaps are doubled so they can brighten as well as
 /// darken.
 const LIGHTMAP_MULTIPLIER: f32 = 2.0;
@@ -36,6 +41,9 @@ pub struct Batch {
     pub texture: usize,
     pub first: u32,
     pub count: u32,
+    /// A shadow painted on a surface (flag 64): drawn after the rest, its
+    /// texture multiplied onto what lies beneath.
+    pub decal: bool,
 }
 
 /// The six faces of a skybox in cube-map layer order: +X, -X, +Y, -Y, +Z, -Z.
@@ -66,6 +74,9 @@ pub struct SceneSource<'a> {
     pub texture: &'a dyn Fn(&str) -> Option<Image>,
     /// Whether a named BSP object starts hidden.
     pub hidden: &'a dyn Fn(&str) -> bool,
+    /// A texture painted over a whole BSP object, by its name, in place of
+    /// what its surfaces say.
+    pub retexture: &'a dyn Fn(&str) -> Option<String>,
     pub sky: Option<Sky>,
 }
 
@@ -76,8 +87,14 @@ impl SceneMesh {
         // Distinct textures, in first-use order; failures get a placeholder.
         let mut names: Vec<String> = Vec::new();
         let mut texture_of_surface = Vec::with_capacity(bsp.surfaces.len());
+        let retextured: Vec<Option<String>> =
+            bsp.objects.iter().map(|o| (source.retexture)(o)).collect();
         for surface in &bsp.surfaces {
-            let key = surface.texture.to_ascii_uppercase();
+            let key = retextured
+                .get(surface.object as usize)
+                .cloned()
+                .flatten()
+                .unwrap_or_else(|| surface.texture.to_ascii_uppercase());
             let index = match names.iter().position(|n| *n == key) {
                 Some(i) => i,
                 None => {
@@ -102,7 +119,8 @@ impl SceneMesh {
                 !hidden[surface.object as usize]
             })
             .collect();
-        order.sort_by_key(|&p| texture_of_surface[bsp.polygons[p].surface as usize]);
+        let decal = |p: usize| bsp.surfaces[bsp.polygons[p].surface as usize].flags & SHADOW_SURFACE_FLAG != 0;
+        order.sort_by_key(|&p| (decal(p), texture_of_surface[bsp.polygons[p].surface as usize]));
 
         let mut vertices = Vec::new();
         let mut batches: Vec<Batch> = Vec::new();
@@ -137,12 +155,14 @@ impl SceneMesh {
                 }
             }
             let added = vertices.len() as u32 - start;
+            let is_decal = decal(p);
             match batches.last_mut() {
-                Some(b) if b.texture == texture => b.count += added,
+                Some(b) if b.texture == texture && b.decal == is_decal => b.count += added,
                 _ => batches.push(Batch {
                     texture,
                     first: start,
                     count: added,
+                    decal: is_decal,
                 }),
             }
         }
@@ -270,23 +290,33 @@ fn resize_square(image: &Image, size: u32) -> Image {
     }
 }
 
-/// Halves an image with a box filter, for mipmaps.
+/// Halves an image for the next mipmap level: Lanczos-2, in linear light,
+/// so the smaller levels keep the detail a box filter blurs away and fine
+/// patterns keep their brightness. Alpha (the colour key's cut-outs) is
+/// box-filtered, as the sharper filter's overshoot would speckle its edges.
 pub fn half(image: &Image) -> Image {
-    let w = (image.width / 2).max(1);
-    let h = (image.height / 2).max(1);
+    let (w, h) = ((image.width / 2).max(1), (image.height / 2).max(1));
+    let (sw, sh) = (image.width as usize, image.height as usize);
+    // Colour in linear light, alpha as it is.
+    let linear: Vec<[f32; 3]> = image
+        .rgba
+        .chunks_exact(4)
+        .map(|p| [0, 1, 2].map(|c| srgb_to_linear(p[c])))
+        .collect();
+    let across = resample_rows(&linear, sw, sh, w as usize);
+    let colour = resample_columns(&across, w as usize, sh, h as usize);
     let mut rgba = Vec::with_capacity((w * h * 4) as usize);
     for y in 0..h {
         for x in 0..w {
-            let mut sum = [0u32; 4];
+            let c = colour[(y * w + x) as usize];
+            rgba.extend(c.map(linear_to_srgb));
+            let mut alpha = 0u32;
             for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
                 let sx = (x * 2 + dx).min(image.width - 1);
                 let sy = (y * 2 + dy).min(image.height - 1);
-                let p = image.pixel(sx, sy);
-                for c in 0..4 {
-                    sum[c] += p[c] as u32;
-                }
+                alpha += image.pixel(sx, sy)[3] as u32;
             }
-            rgba.extend(sum.map(|s| ((s + 2) / 4) as u8));
+            rgba.push(((alpha + 2) / 4) as u8);
         }
     }
     Image {
@@ -294,6 +324,88 @@ pub fn half(image: &Image) -> Image {
         height: h,
         rgba,
     }
+}
+
+fn srgb_to_linear(v: u8) -> f32 {
+    (v as f32 / 255.0).powf(2.2)
+}
+
+fn linear_to_srgb(v: f32) -> u8 {
+    (v.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0).round() as u8
+}
+
+/// The Lanczos-2 kernel.
+fn lanczos2(x: f32) -> f32 {
+    let x = x.abs();
+    if x < 1e-6 {
+        1.0
+    } else if x >= 2.0 {
+        0.0
+    } else {
+        let px = std::f32::consts::PI * x;
+        2.0 * px.sin() * (px / 2.0).sin() / (px * px)
+    }
+}
+
+/// For each of `to` new samples across `from` old ones: which old samples
+/// it takes, and their weights (summing to one). Edges are clamped.
+fn taps(from: usize, to: usize) -> Vec<Vec<(usize, f32)>> {
+    let scale = from as f32 / to as f32;
+    let radius = 2.0 * scale;
+    (0..to)
+        .map(|i| {
+            let centre = (i as f32 + 0.5) * scale;
+            let first = (centre - radius).floor() as isize;
+            let last = (centre + radius).ceil() as isize;
+            let mut t: Vec<(usize, f32)> = (first..=last)
+                .map(|j| {
+                    let d = (j as f32 + 0.5 - centre) / scale;
+                    (j.clamp(0, from as isize - 1) as usize, lanczos2(d))
+                })
+                .filter(|(_, wt)| *wt != 0.0)
+                .collect();
+            let sum: f32 = t.iter().map(|(_, wt)| wt).sum();
+            for (_, wt) in &mut t {
+                *wt /= sum;
+            }
+            t
+        })
+        .collect()
+}
+
+fn resample_rows(src: &[[f32; 3]], w: usize, h: usize, to: usize) -> Vec<[f32; 3]> {
+    let taps = taps(w, to);
+    let mut out = Vec::with_capacity(to * h);
+    for y in 0..h {
+        let row = &src[y * w..(y + 1) * w];
+        for t in &taps {
+            let mut c = [0.0f32; 3];
+            for &(j, wt) in t {
+                for k in 0..3 {
+                    c[k] += row[j][k] * wt;
+                }
+            }
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn resample_columns(src: &[[f32; 3]], w: usize, h: usize, to: usize) -> Vec<[f32; 3]> {
+    let taps = taps(h, to);
+    let mut out = vec![[0.0f32; 3]; w * to];
+    for (i, t) in taps.iter().enumerate() {
+        for x in 0..w {
+            let mut c = [0.0f32; 3];
+            for &(j, wt) in t {
+                for k in 0..3 {
+                    c[k] += src[j * w + x][k] * wt;
+                }
+            }
+            out[i * w + x] = c;
+        }
+    }
+    out
 }
 
 /// Lightmaps packed into one image with a shelf packer. Each lightmap gets a
@@ -418,9 +530,38 @@ mod tests {
     }
 
     #[test]
-    fn halving_averages() {
-        let mut image = solid(2, 2, [0, 0, 0, 255]);
-        image.rgba[0] = 200;
-        assert_eq!(half(&image).pixel(0, 0), [50, 0, 0, 255]);
+    fn halving_keeps_flat_colour_and_brightness() {
+        // A flat colour stays that colour.
+        let flat = solid(8, 8, [120, 60, 200, 255]);
+        let small = half(&flat);
+        assert_eq!((small.width, small.height), (4, 4));
+        for y in 0..4 {
+            for x in 0..4 {
+                let p = small.pixel(x, y);
+                assert!(p.iter().zip([120, 60, 200, 255]).all(|(a, b)| a.abs_diff(b) <= 1), "{p:?}");
+            }
+        }
+        // A fine black and white check goes to an even grey of the same
+        // brightness (half the light: 186, not 128).
+        let mut check = solid(8, 8, [0, 0, 0, 255]);
+        for y in 0..8u32 {
+            for x in 0..8u32 {
+                if (x + y) % 2 == 0 {
+                    let i = ((y * 8 + x) * 4) as usize;
+                    check.rgba[i..i + 3].copy_from_slice(&[255, 255, 255]);
+                }
+            }
+        }
+        let grey = half(&check);
+        for y in 0..4 {
+            for x in 0..4 {
+                let p = grey.pixel(x, y);
+                assert!(p[0].abs_diff(186) <= 6 && p[0] == p[1] && p[1] == p[2], "{p:?}");
+            }
+        }
+        // Alpha is averaged, as a box filter would.
+        let mut cut = solid(2, 2, [10, 20, 30, 255]);
+        cut.rgba[3] = 0;
+        assert_eq!(half(&cut).pixel(0, 0)[3], 191);
     }
 }

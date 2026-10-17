@@ -12,6 +12,7 @@ gk3-barn.workspace = true
 gk3-formats.workspace = true
 gk3-game.workspace = true
 gk3-media.workspace = true
+gk3-bink.workspace = true
 gk3-render.workspace = true
 gk3-sheep.workspace = true
 glam.workspace = true

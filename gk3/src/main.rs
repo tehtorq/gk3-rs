@@ -1,16 +1,31 @@
 //! `gk3`: the Gabriel Knight 3 engine and its asset tools.
 
 mod actions_cmd;
+mod angels;
+mod binocs;
+mod bridge;
 mod camera;
 mod cast;
 mod check;
+mod chessboard;
+mod cursor;
 mod export;
 mod faces;
+mod fingerprint;
+mod html;
+mod laser_heads;
+mod map;
+mod mechanism;
+mod movie;
+mod pendulum;
 mod play;
 mod room;
 mod saves;
+mod scenes;
+mod screens;
 mod sheep_cmd;
 mod shoot;
+mod sidney;
 mod soundtrack;
 mod ui;
 mod view;
@@ -49,15 +64,27 @@ commands:
   play [LOC] [--time T] Play from a location (default R25 at 110A). With
                         --do NOUN:VERB (repeatable), --seconds N and --png F
                         it runs without a window and reports what happened.
+                        --do WALK:X,Z clicks the floor at world X,Z;
+                        --do POINT:X,Y says what is under that pixel;
+                        --do CALL:SCRIPT/FUNCTION runs a script function.
+                        --title-screen draws the title screen; --movie NAME
+                        plays a movie for --seconds and draws that frame;
+                        --show-movies plays the story's movies through;
+                        --where lists where every actor stands at the end;
+                        --during S stops the entering scene S seconds in;
+                        --size WxH draws the picture at that size.
   view [ROOM] [--time T] Fly through the rooms in a window. Starts in R25.
                         With --time (e.g. 110A, day 1 10am) rooms are set up
                         as the story has them then.
   rooms                 List the rooms (scene assets) by name.
+  scenes                Every place the story can be: each timeblock and
+                        location, with their names, tab-separated.
   render ROOM           Draw a room to a PNG without a window. Options:
                         --camera NAME, --size WxH, --png FILE,
                         --view x,y,z,yaw,pitch (any viewpoint),
                         --mode lit|textures|lightmaps, --seconds N,
-                        --time T (set the room up as at timeblock T)
+                        --time T (set the room up as at timeblock T),
+                        --msaa (smooth edges, as a window on a GPU)
                         (run the room's animations N seconds first).
 
 options:
@@ -125,9 +152,11 @@ fn main() -> ExitCode {
         "actions" => open(&options).and_then(|lib| actions_cmd::run(&lib, &options.args)),
         "sheep" => open(&options).and_then(|lib| sheep_cmd::run(&lib, &options.args)),
         "face" => open(&options).and_then(|lib| faces::tool(&lib, &options.args)),
+        "movie" => movie(&options),
         "play" => open(&options).and_then(|lib| play::run(lib, &options.args)),
         "view" => open(&options).and_then(|lib| view::run(lib, &options.args)),
         "rooms" => open(&options).and_then(|lib| shoot::rooms(&lib)),
+        "scenes" => open(&options).and_then(|lib| scenes::run(&lib)),
         "render" => open(&options).and_then(|lib| shoot::render(&lib, &options.args)),
         "check" => open(&options)
             .and_then(|lib| check::run(&lib, options.args.iter().any(|a| a == "--no-audio"))),
@@ -141,6 +170,59 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `gk3 movie NAME.avi [--frame N] [--png FILE]`: a movie from the Data
+/// directory, described, and one frame (the last by default) saved.
+fn movie(options: &Options) -> Result<ExitCode, String> {
+    let dir = options
+        .data
+        .as_deref()
+        .ok_or("no data directory: pass --data or set GK3_DATA")?;
+    let name = options.args.first().ok_or("movie needs a file name")?;
+    let path = std::fs::read_dir(dir)
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(name))
+        })
+        .ok_or_else(|| format!("no {name} in {}", dir.display()))?;
+    let avi = gk3_media::avi::Avi::parse(std::fs::read(&path).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    let value = |flag: &str| {
+        options
+            .args
+            .iter()
+            .position(|a| a == flag)
+            .and_then(|i| options.args.get(i + 1))
+    };
+    let want = value("--frame")
+        .and_then(|f| f.parse::<usize>().ok())
+        .unwrap_or(usize::MAX);
+    println!(
+        "{name}: {}x{}, {} frames, {:.2}s{}",
+        avi.width,
+        avi.height,
+        avi.frame_count(),
+        avi.seconds(),
+        avi.audio.as_ref().map_or(String::new(), |a| format!(
+            ", sound {} Hz x{}",
+            a.sample_rate, a.channels
+        ))
+    );
+    if let Some(png) = value("--png") {
+        let mut frames = avi.frames();
+        let mut n = 0;
+        while n <= want && frames.advance(&avi) {
+            n += 1;
+        }
+        std::fs::write(png, gk3_formats::png::encode(&frames.image()))
+            .map_err(|e| format!("{png}: {e}"))?;
+        println!("frame {} -> {png}", n.saturating_sub(1));
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn open(options: &Options) -> Result<Library, String> {

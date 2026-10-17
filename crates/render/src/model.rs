@@ -24,21 +24,29 @@ pub struct SubmeshDesc<'a> {
     pub vertex_count: usize,
 }
 
-/// How a model is lit this frame.
+/// How a model is lit this frame, as the original lights it (0x559550): a
+/// vertex is its tint times the light colour plus (2 cos - 1) times the
+/// range, cos the light's on the surface's front (none behind), clamped to
+/// 0 to 1; the texture is then modulated by it twice over.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelLight {
     /// Towards the light, world space.
     pub direction: [f32; 3],
-    pub color: [f32; 3],
-    pub ambient: [f32; 3],
+    /// The light colour.
+    pub colour: [f32; 3],
+    /// How far the light swings the shading either way.
+    pub range: f32,
 }
 
 impl Default for ModelLight {
+    /// The original's default light colour (half) and range (0.3), as its
+    /// hardware renderer takes them with its doubled modulation: the range
+    /// halved.
     fn default() -> Self {
         Self {
             direction: [0.3, 0.9, 0.3],
-            color: [0.45, 0.45, 0.45],
-            ambient: [0.6, 0.6, 0.6],
+            colour: [0.5; 3],
+            range: 0.15,
         }
     }
 }
@@ -47,8 +55,8 @@ impl Default for ModelLight {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub(crate) struct LightUniform {
     pub direction: [f32; 4],
-    pub color: [f32; 4],
-    pub ambient: [f32; 4],
+    /// The light colour, and the range in `w`.
+    pub colour: [f32; 4],
 }
 
 impl From<ModelLight> for LightUniform {
@@ -57,8 +65,7 @@ impl From<ModelLight> for LightUniform {
         let len = (x * x + y * y + z * z).sqrt().max(1e-6);
         Self {
             direction: [x / len, y / len, z / len, 0.0],
-            color: [l.color[0], l.color[1], l.color[2], 1.0],
-            ambient: [l.ambient[0], l.ambient[1], l.ambient[2], 1.0],
+            colour: [l.colour[0], l.colour[1], l.colour[2], l.range],
         }
     }
 }
@@ -72,4 +79,10 @@ pub struct GpuModel {
     pub(crate) light_group: wgpu::BindGroup,
     pub vertex_count: usize,
     pub visible: bool,
+    /// A blob shadow, multiplied onto the floor after everything else.
+    pub shadow: bool,
+    /// Back faces are not drawn (characters); otherwise both sides are.
+    pub one_sided: bool,
+    /// Each submesh's texture, for remaking its binding.
+    pub(crate) views: Vec<wgpu::TextureView>,
 }

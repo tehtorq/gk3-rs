@@ -23,11 +23,12 @@ pub fn characters(
 /// The room's people and props, run forward `seconds` in fixed steps.
 pub fn cast(lib: &Library, renderer: &Renderer, room: &Room, seconds: f64) -> Option<Cast> {
     let sif = room.sif.as_ref()?;
+    let characters = characters(lib);
     let faces = lib
         .read("FACES.TXT")
-        .map(|b| crate::faces::parse(&b))
+        .map(|b| crate::faces::parse(&b, &characters))
         .unwrap_or_default();
-    let mut cast = Cast::load(lib, renderer, sif, &characters(lib), &faces);
+    let mut cast = Cast::load(lib, renderer, sif, &characters, &faces);
     let steps = (seconds * 30.0).round() as usize;
     for step in 0..=steps {
         cast.update(lib, step as f64 / 30.0);
@@ -115,6 +116,8 @@ pub fn render(lib: &Library, args: &[String]) -> Result<ExitCode, String> {
     let mut seconds = 0.0;
     let mut view = None;
     let mut time = None;
+    // Samples a pixel: smoothed edges with --msaa, as a window on a GPU.
+    let mut samples = 1;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let mut value = || it.next().cloned().ok_or(format!("{arg} needs a value"));
@@ -130,6 +133,7 @@ pub fn render(lib: &Library, args: &[String]) -> Result<ExitCode, String> {
             }
             "--mode" => mode = parse_mode(&value()?)?,
             "--png" => out = Some(value()?),
+            "--msaa" => samples = gk3_render::MSAA_SAMPLES,
             "--view" => {
                 let v = value()?;
                 let n: Vec<f32> = v
@@ -158,7 +162,8 @@ pub fn render(lib: &Library, args: &[String]) -> Result<ExitCode, String> {
     let mut catalog = Catalog::new(lib);
     catalog.time = time;
     if room_name.eq_ignore_ascii_case("all") {
-        return render_all(lib, &catalog, mode, size, out.as_deref().unwrap_or("rooms"));
+        let dir = out.as_deref().unwrap_or("rooms");
+        return render_all(lib, &catalog, mode, size, samples, dir);
     }
     let scene = catalog
         .resolve(lib, &room_name)
@@ -173,7 +178,8 @@ pub fn render(lib: &Library, args: &[String]) -> Result<ExitCode, String> {
     };
 
     let (device, queue, gpu) = gk3_render::headless()?;
-    let renderer = Renderer::new(device, queue, gk3_render::OFFSCREEN_FORMAT);
+    let renderer =
+        Renderer::with_samples(device, queue, gk3_render::OFFSCREEN_FORMAT, samples);
     let gpu_scene = renderer.upload(&room.mesh);
     let cast = cast(lib, &renderer, &room, seconds);
     if let Some(cast) = &cast {
@@ -208,11 +214,13 @@ fn render_all(
     catalog: &Catalog,
     mode: ShadeMode,
     size: (u32, u32),
+    samples: u32,
     dir: &str,
 ) -> Result<ExitCode, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{dir}: {e}"))?;
     let (device, queue, gpu) = gk3_render::headless()?;
-    let renderer = Renderer::new(device, queue, gk3_render::OFFSCREEN_FORMAT);
+    let renderer =
+        Renderer::with_samples(device, queue, gk3_render::OFFSCREEN_FORMAT, samples);
     let start = std::time::Instant::now();
     let mut failures = Vec::new();
     let mut skipped = Vec::new();

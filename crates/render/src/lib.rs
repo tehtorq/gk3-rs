@@ -14,6 +14,11 @@ use wgpu::util::DeviceExt;
 
 pub use mesh::{SceneMesh, SceneSource, Sky};
 pub use model::{GpuModel, ModelLight, ModelVertex, SubmeshDesc};
+
+/// A picture uploaded once for painting on models (see
+/// `Renderer::model_texture`).
+#[derive(Clone)]
+pub struct ModelTexture(wgpu::TextureView);
 pub use overlay::{Overlay, OverlayTexture, Quad, WHITE};
 
 /// Colour format for offscreen rendering. Not sRGB: GK3 multiplied lightmaps
@@ -60,9 +65,24 @@ impl Camera {
 /// Where a frame is drawn.
 pub struct Target<'a> {
     pub color: &'a wgpu::TextureView,
-    pub depth: &'a wgpu::TextureView,
+    pub depth: &'a FrameBuffers,
     pub size: (u32, u32),
 }
+
+/// What a frame is drawn into before it reaches its target: a depth buffer
+/// and, with multisampling, the colour buffer the samples go into, which
+/// the end of the frame resolves into the target. Made for one size by
+/// `Renderer::frame_buffers`, and made again when that changes.
+pub struct FrameBuffers {
+    depth: wgpu::TextureView,
+    multisampled: Option<wgpu::TextureView>,
+}
+
+/// Anisotropic filtering's samples, at most: 16 is what GPUs offer.
+pub const MAX_ANISOTROPY: u16 = 16;
+
+/// Samples a pixel when multisampling: 4 is what every GPU offers.
+pub const MSAA_SAMPLES: u32 = 4;
 
 /// What the scene shader shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -83,6 +103,47 @@ struct Globals {
     _pad: u32,
 }
 
+/// How room and model textures are filtered: the original's advanced
+/// graphics options. Without mipmaps, far textures are sampled at full size
+/// (sharper, and shimmering); without trilinear filtering, the nearest
+/// mipmap is used rather than a mix of two. With both, sampling is also
+/// anisotropic (up to the renderer's limit), which keeps floors and walls
+/// seen at a slant sharp rather than blurred to their narrow side's level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Filtering {
+    pub mipmaps: bool,
+    pub trilinear: bool,
+}
+
+impl Default for Filtering {
+    fn default() -> Self {
+        Self {
+            mipmaps: true,
+            trilinear: true,
+        }
+    }
+}
+
+fn world_sampler(device: &wgpu::Device, filtering: Filtering, anisotropy: u16) -> wgpu::Sampler {
+    // Anisotropy needs every filter linear.
+    let linear = filtering.mipmaps && filtering.trilinear;
+    device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("repeat"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: if filtering.trilinear {
+            wgpu::MipmapFilterMode::Linear
+        } else {
+            wgpu::MipmapFilterMode::Nearest
+        },
+        lod_max_clamp: if filtering.mipmaps { 32.0 } else { 0.0 },
+        anisotropy_clamp: if linear { anisotropy.clamp(1, 16) } else { 1 },
+        ..Default::default()
+    })
+}
+
 /// Opens a GPU with no window, for offscreen rendering and tools.
 pub fn headless() -> Result<(wgpu::Device, wgpu::Queue, String), String> {
     let instance =
@@ -95,6 +156,24 @@ pub fn headless() -> Result<(wgpu::Device, wgpu::Queue, String), String> {
     let name = adapter.get_info().name;
     let (device, queue) = request_device(&adapter)?;
     Ok((device, queue, name))
+}
+
+/// How many samples a pixel a window on this adapter should draw: smoothed
+/// edges (`MSAA_SAMPLES`) on a real GPU that can, one on a software
+/// renderer, where it would cost too much.
+pub fn window_samples(adapter: &wgpu::Adapter, format: wgpu::TextureFormat) -> u32 {
+    let can = |f| {
+        adapter
+            .get_texture_format_features(f)
+            .flags
+            .sample_count_supported(MSAA_SAMPLES)
+    };
+    let software = adapter.get_info().device_type == wgpu::DeviceType::Cpu;
+    if !software && can(format) && can(DEPTH_FORMAT) {
+        MSAA_SAMPLES
+    } else {
+        1
+    }
 }
 
 pub fn request_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue), String> {
@@ -110,23 +189,41 @@ pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     scene_pipeline: wgpu::RenderPipeline,
+    decal_pipeline: wgpu::RenderPipeline,
     sky_pipeline: wgpu::RenderPipeline,
     model_pipeline: wgpu::RenderPipeline,
+    /// The same, not drawing back faces: for characters.
+    one_sided_pipeline: wgpu::RenderPipeline,
+    /// Blob shadows: multiplied onto what is already drawn.
+    shadow_pipeline: wgpu::RenderPipeline,
     light_layout: wgpu::BindGroupLayout,
     overlay_pipeline: wgpu::RenderPipeline,
     overlay_textures: Vec<(wgpu::BindGroup, (u32, u32))>,
+    /// The overlay textures themselves, for redrawing them in place.
+    overlay_images: Vec<wgpu::Texture>,
     globals_layout: wgpu::BindGroupLayout,
     texture_layout: wgpu::BindGroupLayout,
     sky_layout: wgpu::BindGroupLayout,
     repeat_sampler: wgpu::Sampler,
     clamp_sampler: wgpu::Sampler,
+    /// The colour format the pipelines draw in; offscreen pictures use it
+    /// too, or the pipelines would not fit them.
+    color_format: wgpu::TextureFormat,
+    /// Samples a pixel: 1, or `MSAA_SAMPLES` to smooth edges.
+    samples: u32,
+    /// The GPU's name, for the graphics options to show.
+    pub adapter_name: String,
+    /// The most anisotropic filtering to use: `MAX_ANISOTROPY`, or 1 on a
+    /// software renderer, where each extra sample costs.
+    pub max_anisotropy: u16,
 }
 
 /// A room on the GPU.
 pub struct GpuScene {
     vertices: wgpu::Buffer,
     batches: Vec<mesh::Batch>,
-    textures: Vec<wgpu::BindGroup>,
+    /// Each texture and its binding, which a change of filtering remakes.
+    textures: Vec<(wgpu::TextureView, wgpu::BindGroup)>,
     globals: wgpu::Buffer,
     globals_group: wgpu::BindGroup,
     sky: Option<(wgpu::BindGroup, f32)>,
@@ -135,11 +232,27 @@ pub struct GpuScene {
 }
 
 impl Renderer {
+    /// A renderer drawing one sample a pixel.
     pub fn new(
         device: wgpu::Device,
         queue: wgpu::Queue,
         color_format: wgpu::TextureFormat,
     ) -> Self {
+        Self::with_samples(device, queue, color_format, 1)
+    }
+
+    /// A renderer drawing `samples` samples a pixel (1 or `MSAA_SAMPLES`),
+    /// which smooths the edges of polygons.
+    pub fn with_samples(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        color_format: wgpu::TextureFormat,
+        samples: u32,
+    ) -> Self {
+        let multisample = wgpu::MultisampleState {
+            count: samples,
+            ..Default::default()
+        };
         let tex_entry = |binding, dimension| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::FRAGMENT,
@@ -217,8 +330,14 @@ impl Renderer {
             write_mask: wgpu::ColorWrites::ALL,
         })];
 
-        let scene_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("scene"),
+        let scene_pipeline_with = |label, blend: Option<wgpu::BlendState>, depth_write: bool, bias: wgpu::DepthBiasState| {
+            let target = [Some(wgpu::ColorTargetState {
+                format: color_format,
+                blend,
+                write_mask: wgpu::ColorWrites::ALL,
+            })];
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
             layout: Some(&scene_layout),
             vertex: wgpu::VertexState {
                 module: &scene_shader,
@@ -230,16 +349,22 @@ impl Renderer {
                     attributes: &attributes,
                 })],
             },
-            // GK3's winding is not consistent, so nothing is culled.
-            primitive: wgpu::PrimitiveState::default(),
+            // The room's polygons face one way, as G-Engine draws them:
+            // clockwise is the front and the back is not drawn. Seen from
+            // behind (a camera outside a wall), a wall is not there.
+            primitive: wgpu::PrimitiveState {
+                front_face: wgpu::FrontFace::Cw,
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
+                depth_write_enabled: Some(depth_write),
                 depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: Default::default(),
-                bias: Default::default(),
+                bias,
             }),
-            multisample: Default::default(),
+            multisample,
             fragment: Some(wgpu::FragmentState {
                 module: &scene_shader,
                 entry_point: Some("fs_main"),
@@ -248,7 +373,25 @@ impl Renderer {
             }),
             multiview_mask: None,
             cache: None,
-        });
+        })
+        };
+        let scene_pipeline = scene_pipeline_with("scene", None, true, Default::default());
+        // Shadows painted on surfaces: multiplied onto what is drawn, not
+        // written to depth, and drawn a little nearer, as the original
+        // (0x5938e0: blend zero and source colour, z bias 2).
+        let decal_pipeline = scene_pipeline_with(
+            "scene decals",
+            Some(wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Zero,
+                    dst_factor: wgpu::BlendFactor::Src,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent::REPLACE,
+            }),
+            false,
+            wgpu::DepthBiasState { constant: -2, slope_scale: -1.0, clamp: 0.0 },
+        );
 
         let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("sky"),
@@ -267,7 +410,7 @@ impl Renderer {
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
-            multisample: Default::default(),
+            multisample,
             fragment: Some(wgpu::FragmentState {
                 module: &sky_shader,
                 entry_point: Some("fs_main"),
@@ -307,8 +450,63 @@ impl Renderer {
         let model_attributes = wgpu::vertex_attr_array![
             0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Unorm8x4
         ];
-        let model_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("model"),
+        // Characters are drawn one-sided as G-Engine draws models (so a
+        // camera inside a head sees through it, not the face from behind);
+        // props are drawn two-sided, as their leaf cards face either way.
+        let model_pipeline_with = |label, cull_mode| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(&model_layout),
+            vertex: wgpu::VertexState {
+                module: &model_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<ModelVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &model_attributes,
+                })],
+            },
+            primitive: wgpu::PrimitiveState {
+                front_face: wgpu::FrontFace::Cw,
+                cull_mode,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample,
+            fragment: Some(wgpu::FragmentState {
+                module: &model_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &target,
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let model_pipeline = model_pipeline_with("model", None);
+        let one_sided_pipeline = model_pipeline_with("one-sided model", Some(wgpu::Face::Back));
+
+        // G-Engine draws an actor's blob shadow as a lightmap (times 2.1) on
+        // a white quad, multiplied onto the floor.
+        let shadow_target = [Some(wgpu::ColorTargetState {
+            format: color_format,
+            blend: Some(wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Dst,
+                    dst_factor: wgpu::BlendFactor::Zero,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent::OVER,
+            }),
+            write_mask: wgpu::ColorWrites::COLOR,
+        })];
+        let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("shadow"),
             layout: Some(&model_layout),
             vertex: wgpu::VertexState {
                 module: &model_shader,
@@ -323,17 +521,17 @@ impl Renderer {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
-            multisample: Default::default(),
+            multisample,
             fragment: Some(wgpu::FragmentState {
                 module: &model_shader,
-                entry_point: Some("fs_main"),
+                entry_point: Some("fs_shadow"),
                 compilation_options: Default::default(),
-                targets: &target,
+                targets: &shadow_target,
             }),
             multiview_mask: None,
             cache: None,
@@ -349,7 +547,7 @@ impl Renderer {
             immediate_size: 0,
         });
         let overlay_attributes =
-            wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Unorm8x4];
+            wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Unorm8x4, 3 => Float32x4];
         let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("overlay"),
             layout: Some(&overlay_layout),
@@ -372,7 +570,7 @@ impl Renderer {
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
-            multisample: Default::default(),
+            multisample,
             fragment: Some(wgpu::FragmentState {
                 module: &overlay_shader,
                 entry_point: Some("fs_main"),
@@ -387,15 +585,7 @@ impl Renderer {
             cache: None,
         });
 
-        let repeat_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("repeat"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            ..Default::default()
-        });
+        let repeat_sampler = world_sampler(&device, Filtering::default(), MAX_ANISOTROPY);
         let clamp_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("clamp"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -407,16 +597,24 @@ impl Renderer {
             device,
             queue,
             scene_pipeline,
+            decal_pipeline,
             sky_pipeline,
             model_pipeline,
+            one_sided_pipeline,
+            shadow_pipeline,
             light_layout,
             overlay_pipeline,
             overlay_textures: Vec::new(),
+            overlay_images: Vec::new(),
             globals_layout,
             texture_layout,
             sky_layout,
             repeat_sampler,
             clamp_sampler,
+            color_format,
+            samples,
+            adapter_name: String::new(),
+            max_anisotropy: MAX_ANISOTROPY,
         };
         renderer.add_overlay_texture(&Image {
             width: 1,
@@ -452,20 +650,8 @@ impl Renderer {
             .iter()
             .map(|image| {
                 let view = self.texture(&color_key(image), true);
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &self.texture_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&self.repeat_sampler),
-                        },
-                    ],
-                })
+                let group = self.world_group(&view);
+                (view, group)
             })
             .collect();
 
@@ -531,7 +717,31 @@ impl Renderer {
 
     /// Makes an image available to the overlay.
     pub fn add_overlay_texture(&mut self, image: &Image) -> OverlayTexture {
-        let view = self.texture(image, false);
+        let (texture, group) = self.overlay_group(image);
+        self.overlay_textures
+            .push((group, (image.width, image.height)));
+        self.overlay_images.push(texture);
+        OverlayTexture(self.overlay_textures.len() - 1)
+    }
+
+    /// Redraws an overlay texture with a new picture, such as the next frame
+    /// of a movie; in place when the size is the same.
+    pub fn update_overlay_texture(&mut self, texture: OverlayTexture, image: &Image) {
+        let Some(old) = self.overlay_images.get(texture.0) else {
+            return;
+        };
+        if (old.width(), old.height()) == (image.width, image.height) {
+            self.write_layer(old, image, 0, 0);
+            return;
+        }
+        let (new, group) = self.overlay_group(image);
+        self.overlay_textures[texture.0] = (group, (image.width, image.height));
+        self.overlay_images[texture.0] = new;
+    }
+
+    fn overlay_group(&self, image: &Image) -> (wgpu::Texture, wgpu::BindGroup) {
+        let texture = self.texture_object(image);
+        let view = texture.create_view(&Default::default());
         let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("overlay"),
             layout: &self.texture_layout,
@@ -546,9 +756,7 @@ impl Renderer {
                 },
             ],
         });
-        self.overlay_textures
-            .push((group, (image.width, image.height)));
-        OverlayTexture(self.overlay_textures.len() - 1)
+        (texture, group)
     }
 
     /// Uploads a model's textures and triangles. Its vertices are supplied
@@ -558,22 +766,11 @@ impl Renderer {
         let mut indices: Vec<u16> = Vec::new();
         let mut draws = Vec::new();
         let mut base_vertex = 0i32;
+        let mut views = Vec::new();
         for sub in submeshes {
             let view = self.texture(&color_key(&sub.texture), true);
-            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &self.texture_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.repeat_sampler),
-                    },
-                ],
-            });
+            let group = self.world_group(&view);
+            views.push(view);
             let first = indices.len() as u32;
             indices.extend(sub.triangles.iter().flatten());
             draws.push((group, first, indices.len() as u32 - first, base_vertex));
@@ -621,6 +818,32 @@ impl Renderer {
             light_group,
             vertex_count,
             visible: true,
+            shadow: false,
+            one_sided: false,
+            views,
+        }
+    }
+
+    /// Lets the GPU side free what has been dropped (old textures, buffers)
+    /// even when no frame is being drawn, as in headless runs.
+    pub fn tidy(&self) {
+        let _ = self.device.poll(wgpu::PollType::Poll);
+    }
+
+    /// A picture on the GPU, ready to paint on any model's submesh: made
+    /// once and painted as often as wanted, for animations that cycle a
+    /// few textures over and over.
+    pub fn model_texture(&self, image: &Image) -> ModelTexture {
+        ModelTexture(self.texture(&color_key(image), true))
+    }
+
+    /// Paints a picture made by `model_texture` on one of a model's
+    /// submeshes.
+    pub fn set_model_texture(&self, model: &mut GpuModel, submesh: usize, texture: &ModelTexture) {
+        if let Some(draw) = model.draws.get_mut(submesh) {
+            // Made before a change of filtering, it is remade with it.
+            draw.0 = self.world_group(&texture.0);
+            model.views[submesh] = texture.0.clone();
         }
     }
 
@@ -631,20 +854,47 @@ impl Renderer {
             return;
         };
         let view = self.texture(&color_key(image), true);
-        draw.0 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("repainted"),
+        draw.0 = self.world_group(&view);
+        model.views[submesh] = view;
+    }
+
+    /// A room or model texture's binding, with the filtering now chosen.
+    fn world_group(&self, view: &wgpu::TextureView) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
             layout: &self.texture_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
+                    resource: wgpu::BindingResource::TextureView(view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&self.repeat_sampler),
                 },
             ],
-        });
+        })
+    }
+
+    /// Chooses how room and model textures are filtered from now on.
+    /// What is already on the GPU takes it with `rebind_scene` and
+    /// `rebind_model`.
+    pub fn set_filtering(&mut self, filtering: Filtering) {
+        self.repeat_sampler = world_sampler(&self.device, filtering, self.max_anisotropy);
+    }
+
+    /// Remakes a room's texture bindings with the filtering now chosen.
+    pub fn rebind_scene(&self, scene: &mut GpuScene) {
+        for (view, group) in &mut scene.textures {
+            *group = self.world_group(view);
+        }
+    }
+
+    /// Remakes a model's texture bindings with the filtering now chosen.
+    pub fn rebind_model(&self, model: &mut GpuModel) {
+        for (draw, view) in model.draws.iter_mut().zip(&model.views) {
+            draw.0 = self.world_group(view);
+        }
     }
 
     /// Replaces a model's posed, placed vertices.
@@ -662,6 +912,26 @@ impl Renderer {
             0,
             bytemuck::bytes_of(&model::LightUniform::from(light)),
         );
+    }
+
+    /// A texture of one level, kept so it can be rewritten.
+    fn texture_object(&self, image: &Image) -> wgpu::Texture {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("overlay"),
+            size: wgpu::Extent3d {
+                width: image.width,
+                height: image.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.write_layer(&texture, image, 0, 0);
+        texture
     }
 
     fn texture(&self, image: &Image, mipmaps: bool) -> wgpu::TextureView {
@@ -743,24 +1013,52 @@ impl Renderer {
         );
     }
 
-    /// A depth buffer for a target of this size.
-    pub fn depth_view(&self, width: u32, height: u32) -> wgpu::TextureView {
-        self.device
-            .create_texture(&wgpu::TextureDescriptor {
-                label: Some("depth"),
-                size: wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: DEPTH_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                view_formats: &[],
-            })
-            .create_view(&Default::default())
+    /// The buffers a frame of this size is drawn into.
+    pub fn frame_buffers(&self, width: u32, height: u32) -> FrameBuffers {
+        let buffer = |label, format| {
+            self.device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width: width.max(1),
+                        height: height.max(1),
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: self.samples,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default())
+        };
+        FrameBuffers {
+            depth: buffer("depth", DEPTH_FORMAT),
+            multisampled: (self.samples > 1).then(|| buffer("multisampled", self.color_format)),
+        }
+    }
+
+    /// The colour attachment for drawing into `target`: straight in, or
+    /// into the samples, resolved into it at the end.
+    fn color_attachment<'a>(
+        target: &'a wgpu::TextureView,
+        buffers: &'a FrameBuffers,
+        clear: wgpu::Color,
+    ) -> wgpu::RenderPassColorAttachment<'a> {
+        let (view, resolve_target, store) = match &buffers.multisampled {
+            Some(samples) => (samples, Some(target), wgpu::StoreOp::Discard),
+            None => (target, None, wgpu::StoreOp::Store),
+        };
+        wgpu::RenderPassColorAttachment {
+            view,
+            depth_slice: None,
+            resolve_target,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(clear),
+                store,
+            },
+        }
     }
 
     /// Draws a room and its models into `target` and submits the work.
@@ -807,22 +1105,18 @@ impl Renderer {
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05,
-                            g: 0.05,
-                            b: 0.07,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
+                color_attachments: &[Some(Self::color_attachment(
+                    target,
+                    depth,
+                    wgpu::Color {
+                        r: 0.05,
+                        g: 0.05,
+                        b: 0.07,
+                        a: 1.0,
                     },
-                })],
+                ))],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: depth,
+                    view: &depth.depth,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Discard,
@@ -844,52 +1138,112 @@ impl Renderer {
             pass.set_pipeline(&self.scene_pipeline);
             pass.set_bind_group(0, &scene.globals_group, &[]);
             pass.set_vertex_buffer(0, scene.vertices.slice(..));
-            for batch in &scene.batches {
-                pass.set_bind_group(1, &scene.textures[batch.texture], &[]);
+            for batch in scene.batches.iter().filter(|b| !b.decal) {
+                pass.set_bind_group(1, &scene.textures[batch.texture].1, &[]);
+                pass.draw(batch.first..batch.first + batch.count, 0..1);
+            }
+            pass.set_pipeline(&self.decal_pipeline);
+            for batch in scene.batches.iter().filter(|b| b.decal) {
+                pass.set_bind_group(1, &scene.textures[batch.texture].1, &[]);
                 pass.draw(batch.first..batch.first + batch.count, 0..1);
             }
 
-            pass.set_pipeline(&self.model_pipeline);
-            for model in models.iter().filter(|m| m.visible && m.vertex_count > 0) {
-                pass.set_bind_group(2, &model.light_group, &[]);
-                pass.set_vertex_buffer(0, model.vertices.slice(..));
-                pass.set_index_buffer(model.indices.slice(..), wgpu::IndexFormat::Uint16);
-                for (group, first, count, base) in &model.draws {
-                    pass.set_bind_group(1, group, &[]);
-                    pass.draw_indexed(*first..*first + *count, *base, 0..1);
+            for shadows in [false, true] {
+                for model in models
+                    .iter()
+                    .filter(|m| m.visible && m.vertex_count > 0 && m.shadow == shadows)
+                {
+                    pass.set_pipeline(if shadows {
+                        &self.shadow_pipeline
+                    } else if model.one_sided {
+                        &self.one_sided_pipeline
+                    } else {
+                        &self.model_pipeline
+                    });
+                    pass.set_bind_group(2, &model.light_group, &[]);
+                    pass.set_vertex_buffer(0, model.vertices.slice(..));
+                    pass.set_index_buffer(model.indices.slice(..), wgpu::IndexFormat::Uint16);
+                    for (group, first, count, base) in &model.draws {
+                        pass.set_bind_group(1, group, &[]);
+                        pass.draw_indexed(*first..*first + *count, *base, 0..1);
+                    }
                 }
             }
 
-            if !overlay.quads.is_empty() {
-                let sizes: Vec<(u32, u32)> =
-                    self.overlay_textures.iter().map(|(_, s)| *s).collect();
-                let vertices = overlay::vertices(overlay, &sizes, size);
-                let buffer = self
-                    .device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("overlay"),
-                        contents: bytemuck::cast_slice(&vertices),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    });
-                pass.set_pipeline(&self.overlay_pipeline);
-                pass.set_vertex_buffer(0, buffer.slice(..));
-                // Runs of quads sharing a texture are one draw.
-                let mut start = 0;
-                while start < overlay.quads.len() {
-                    let texture = overlay.quads[start].texture;
-                    let mut end = start + 1;
-                    while end < overlay.quads.len() && overlay.quads[end].texture == texture {
-                        end += 1;
-                    }
-                    if let Some((group, _)) = self.overlay_textures.get(texture.0) {
-                        pass.set_bind_group(0, group, &[]);
-                        pass.draw((start * 6) as u32..(end * 6) as u32, 0..1);
-                    }
-                    start = end;
-                }
-            }
+            self.overlay_quads(&mut pass, overlay, size);
         }
         self.queue.submit([encoder.finish()]);
+    }
+
+    /// Draws only the overlay, over black: for screens with no room behind
+    /// them, such as the card that opens a new game.
+    pub fn draw_overlay(&self, overlay: &Overlay, target: Target) {
+        let Target {
+            color: target,
+            depth,
+            size,
+        } = target;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("overlay frame"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("overlay"),
+                color_attachments: &[Some(Self::color_attachment(
+                    target,
+                    depth,
+                    wgpu::Color::BLACK,
+                ))],
+                // The overlay pipeline is built for the scene's pass, which
+                // has depth; it does not test against it.
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth.depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.overlay_quads(&mut pass, overlay, size);
+        }
+        self.queue.submit([encoder.finish()]);
+    }
+
+    fn overlay_quads(&self, pass: &mut wgpu::RenderPass<'_>, overlay: &Overlay, size: (u32, u32)) {
+        if overlay.quads.is_empty() {
+            return;
+        }
+        let sizes: Vec<(u32, u32)> = self.overlay_textures.iter().map(|(_, s)| *s).collect();
+        let vertices = overlay::vertices(overlay, &sizes, size);
+        let buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("overlay"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        pass.set_pipeline(&self.overlay_pipeline);
+        pass.set_vertex_buffer(0, buffer.slice(..));
+        // Runs of quads sharing a texture are one draw.
+        let mut start = 0;
+        while start < overlay.quads.len() {
+            let texture = overlay.quads[start].texture;
+            let mut end = start + 1;
+            while end < overlay.quads.len() && overlay.quads[end].texture == texture {
+                end += 1;
+            }
+            if let Some((group, _)) = self.overlay_textures.get(texture.0) {
+                pass.set_bind_group(0, group, &[]);
+                pass.draw((start * 6) as u32..(end * 6) as u32, 0..1);
+            }
+            start = end;
+        }
     }
 
     /// Renders one frame offscreen and reads it back.
@@ -900,8 +1254,35 @@ impl Renderer {
         overlay: &Overlay,
         camera: &Camera,
         mode: ShadeMode,
-        (width, height): (u32, u32),
+        size: (u32, u32),
     ) -> Result<Image, String> {
+        self.offscreen(size, |target| {
+            self.draw(scene, models, overlay, camera, mode, target)
+        })
+    }
+
+    /// Renders only an overlay offscreen, over black, and reads it back.
+    pub fn render_overlay_image(
+        &self,
+        overlay: &Overlay,
+        size: (u32, u32),
+    ) -> Result<Image, String> {
+        self.offscreen(size, |target| self.draw_overlay(overlay, target))
+    }
+
+    /// Makes an offscreen target, lets `draw` fill it, and reads it back.
+    fn offscreen(
+        &self,
+        (width, height): (u32, u32),
+        draw: impl FnOnce(Target),
+    ) -> Result<Image, String> {
+        use wgpu::TextureFormat as F;
+        if !matches!(
+            self.color_format,
+            F::Rgba8Unorm | F::Rgba8UnormSrgb | F::Bgra8Unorm | F::Bgra8UnormSrgb
+        ) {
+            return Err(format!("cannot read back {:?} pictures", self.color_format));
+        }
         let target = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("offscreen"),
             size: wgpu::Extent3d {
@@ -912,24 +1293,17 @@ impl Renderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: OFFSCREEN_FORMAT,
+            format: self.color_format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let view = target.create_view(&Default::default());
-        let depth = self.depth_view(width, height);
-        self.draw(
-            scene,
-            models,
-            overlay,
-            camera,
-            mode,
-            Target {
-                color: &view,
-                depth: &depth,
-                size: (width, height),
-            },
-        );
+        let depth = self.frame_buffers(width, height);
+        draw(Target {
+            color: &view,
+            depth: &depth,
+            size: (width, height),
+        });
 
         // Rows in a copy must be a multiple of 256 bytes.
         let stride = (width * 4).div_ceil(256) * 256;
@@ -976,6 +1350,15 @@ impl Renderer {
         let mut rgba = Vec::with_capacity((width * height * 4) as usize);
         for row in mapped.chunks(stride as usize).take(height as usize) {
             rgba.extend_from_slice(&row[..(width * 4) as usize]);
+        }
+        // A window's format is often blue first.
+        if matches!(
+            self.color_format,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        ) {
+            for px in rgba.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
         }
         Ok(Image {
             width,
@@ -1042,6 +1425,27 @@ pub fn color_key(image: &Image) -> Image {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A window's renderer often draws blue-first: a picture read back from
+    /// it is still the right colours (and drawing it must not fail).
+    #[test]
+    fn pictures_read_back_from_a_window_renderer() {
+        let Ok((device, queue, _)) = headless() else {
+            eprintln!("no GPU; skipped");
+            return;
+        };
+        for format in [wgpu::TextureFormat::Bgra8Unorm, wgpu::TextureFormat::Rgba8Unorm] {
+            // Multisampled too: the samples resolve into the picture.
+            for samples in [1, MSAA_SAMPLES] {
+                let renderer =
+                    Renderer::with_samples(device.clone(), queue.clone(), format, samples);
+                let mut overlay = Overlay::default();
+                overlay.rect([0.0, 0.0, 4.0, 4.0], [255, 0, 0, 255]);
+                let image = renderer.render_overlay_image(&overlay, (4, 4)).unwrap();
+                assert_eq!(&image.rgba[..4], &[255, 0, 0, 255], "{format:?} x{samples}");
+            }
+        }
+    }
 
     #[test]
     fn magenta_becomes_transparent_with_neighbour_colour() {

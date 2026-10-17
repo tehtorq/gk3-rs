@@ -247,3 +247,49 @@ fn bad_bytecode_faults_rather_than_panicking() {
     let id = vm.start(&mut Recorder::default(), s, "T", "Main$").unwrap();
     assert!(matches!(vm.state(id), Some(ThreadState::Faulted(_))));
 }
+
+#[test]
+fn running_threads_of_a_script_share_its_variables() {
+    use Op::*;
+    // x = x + 1; wait Walk(); Report(x)
+    let s = script(
+        vec![
+            import("Walk", Type::Void, &[]),
+            import("Report", Type::Void, &[Type::Int]),
+        ],
+        &[],
+        &[
+            (LoadI, 0),
+            (PushI, 1),
+            (AddI, 0),
+            (StoreI, 0),
+            (BeginWait, 0),
+            (PushI, 0),
+            (CallSysFunctionV, 0),
+            (Pop, 0),
+            (EndWait, 0),
+            (LoadI, 0),
+            (PushI, 1),
+            (CallSysFunctionV, 1),
+            (Pop, 0),
+            (ReturnV, 0),
+        ],
+    );
+    let mut host = Recorder {
+        slow: vec!["Walk"],
+        ..Default::default()
+    };
+    let mut vm = Vm::new();
+    vm.start(&mut host, Rc::clone(&s), "T", "Main$").unwrap();
+    vm.start(&mut host, Rc::clone(&s), "t", "Main$").unwrap();
+    for waiting in std::mem::take(&mut host.pending) {
+        vm.release(&mut host, waiting);
+    }
+    assert_eq!(host.calls[2..], ["Report(2)", "Report(2)"]);
+    // With none running, a new thread starts from the initial values.
+    vm.collect();
+    vm.start(&mut host, s, "T", "Main$").unwrap();
+    let waiting = host.pending.pop().unwrap();
+    vm.release(&mut host, waiting);
+    assert_eq!(host.calls.last().unwrap(), "Report(1)");
+}

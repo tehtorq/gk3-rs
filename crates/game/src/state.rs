@@ -35,6 +35,16 @@ pub struct GameState {
     pub active_item: BTreeMap<String, String>,
     /// The inventory screen is up: the `_INV` cases hold only then.
     pub inventory_shown: bool,
+    /// SIDNEY, Grace's computer: files added (by number), and which of them
+    /// have been analysed.
+    pub sidney_files: BTreeSet<u32>,
+    pub sidney_analyzed: BTreeSet<u32>,
+    /// E-mails arrived, in order, and those read.
+    pub emails_received: Vec<String>,
+    pub emails_read: BTreeSet<String>,
+    /// SIDNEY's suspects (by number, from 0) and the files linked to each,
+    /// in the order linked.
+    pub suspect_links: BTreeMap<u32, Vec<u32>>,
     pub actor_locations: BTreeMap<String, String>,
     /// Visits by actor, location and timeblock.
     pub location_counts: BTreeMap<(String, String, String), i32>,
@@ -84,6 +94,11 @@ impl GameState {
             inventory: BTreeMap::new(),
             active_item: BTreeMap::new(),
             inventory_shown: false,
+            sidney_files: BTreeSet::new(),
+            sidney_analyzed: BTreeSet::new(),
+            emails_received: Vec::new(),
+            emails_read: BTreeSet::new(),
+            suspect_links: BTreeMap::new(),
             actor_locations: BTreeMap::new(),
             location_counts: BTreeMap::new(),
             rng: 0x6B33_0001,
@@ -127,8 +142,28 @@ impl GameState {
     }
 
     /// Moves the story to a new place, counting the visit.
+    /// Moves the story to another timeblock. Chat counts start again, as in
+    /// G-Engine's `GameProgress::SetTimeblock`.
+    pub fn set_timeblock(&mut self, timeblock: &str) {
+        self.last_timeblock = std::mem::replace(&mut self.timeblock, key(timeblock));
+        self.chats.clear();
+    }
+
     pub fn enter(&mut self, location: &str) {
+        self.move_to(location);
+        self.count_visit();
+    }
+
+    /// The ego is now somewhere else: the location they left becomes the
+    /// last one. Visits are counted separately, once the room is entered.
+    pub fn move_to(&mut self, location: &str) {
         self.last_location = std::mem::replace(&mut self.location, key(location));
+        self.actor_locations
+            .insert(self.ego.clone(), self.location.clone());
+    }
+
+    /// Counts a visit to where the ego is now.
+    pub fn count_visit(&mut self) {
         let visit = (
             self.ego.clone(),
             self.location.clone(),
@@ -174,7 +209,7 @@ impl GameState {
     /// rendering, maps in key order).
     pub fn hash(&self) -> u64 {
         let text = format!(
-            "{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}",
+            "{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}",
             self.timeblock,
             self.last_timeblock,
             self.location,
@@ -192,7 +227,12 @@ impl GameState {
             self.actor_locations,
             self.location_counts,
             self.rng,
-            self.random_draws
+            self.random_draws,
+            self.sidney_files,
+            self.sidney_analyzed,
+            self.emails_received,
+            self.emails_read,
+            self.suspect_links
         );
         text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
             (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)

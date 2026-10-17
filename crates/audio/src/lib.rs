@@ -23,6 +23,8 @@ pub enum Bus {
     Dialogue,
     Effects,
     Music,
+    /// A full-screen movie's sound.
+    Movie,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -37,26 +39,51 @@ struct Voice {
     gain: f32,
     looping: bool,
     bus: Bus,
+    /// Held still and silent, as under a menu.
+    held: bool,
 }
 
-#[derive(Default)]
 struct Mixer {
     voices: Vec<Voice>,
-    gains: [f32; 3],
+    /// Each bus's level in the mix.
+    gains: [f32; 4],
+    /// The player's volume for each bus, and for everything.
+    volumes: [f32; 4],
+    master: f32,
+    /// While set, only this bus is heard; the rest play on silently.
+    solo: Option<Bus>,
+}
+
+impl Default for Mixer {
+    fn default() -> Self {
+        Self {
+            voices: Vec::new(),
+            gains: [1.0; 4],
+            volumes: [1.0; 4],
+            master: 1.0,
+            solo: None,
+        }
+    }
 }
 
 impl Mixer {
     /// Mixes the next chunk of interleaved stereo.
     fn mix(&mut self, out: &mut [i16]) {
         let mut acc = vec![0f32; out.len()];
-        let gains = self.gains;
+        let (gains, volumes, master, solo) = (self.gains, self.volumes, self.master, self.solo);
         self.voices.retain_mut(|v| {
             let frames = v.pcm.frames();
             let channels = v.pcm.channels.max(1) as usize;
             if frames == 0 {
                 return false;
             }
-            let bus = gains[v.bus as usize] * v.gain;
+            if v.held {
+                return true;
+            }
+            let bus = match solo {
+                Some(only) if only != v.bus => 0.0,
+                _ => gains[v.bus as usize] * volumes[v.bus as usize] * master * v.gain,
+            };
             for frame in acc.chunks_exact_mut(2) {
                 if v.position >= frames as f64 {
                     if v.looping {
@@ -112,8 +139,8 @@ impl Audio {
         match Pulse::open(application) {
             Ok(pulse) => {
                 let mixer = Arc::new(Mutex::new(Mixer {
-                    voices: Vec::new(),
-                    gains: [1.0, 0.8, 0.6],
+                    gains: [1.0, 0.8, 0.6, 1.0],
+                    ..Mixer::default()
                 }));
                 let running = Arc::new(AtomicBool::new(true));
                 let (m, r) = (mixer.clone(), running.clone());
@@ -156,6 +183,7 @@ impl Audio {
                 gain,
                 looping,
                 bus,
+                held: false,
             });
         }
         SoundId(id)
@@ -186,9 +214,42 @@ impl Audio {
             .is_some_and(|m| m.lock().unwrap().voices.iter().any(|v| v.id == sound.0))
     }
 
+    /// Hears only one bus (a movie's), or every bus again with `None`, as
+    /// G-Engine's movie layer overrides the game's sound.
+    pub fn solo(&self, bus: Option<Bus>) {
+        if let Some(mixer) = &self.mixer {
+            mixer.lock().unwrap().solo = bus;
+        }
+    }
+
     pub fn set_gain(&self, bus: Bus, gain: f32) {
         if let Some(mixer) = &self.mixer {
             mixer.lock().unwrap().gains[bus as usize] = gain;
+        }
+    }
+
+    /// The player's volume for one bus, from 0 to 1.
+    pub fn set_volume(&self, bus: Bus, volume: f32) {
+        if let Some(mixer) = &self.mixer {
+            mixer.lock().unwrap().volumes[bus as usize] = volume.clamp(0.0, 1.0);
+        }
+    }
+
+    /// The player's volume for everything, from 0 to 1.
+    pub fn set_master(&self, volume: f32) {
+        if let Some(mixer) = &self.mixer {
+            mixer.lock().unwrap().master = volume.clamp(0.0, 1.0);
+        }
+    }
+
+    /// Holds everything playing still and silent (`true`), as G-Engine's
+    /// menus and popups do, or lets it go on. Sounds started while held,
+    /// such as a button's click, play as usual.
+    pub fn hold(&self, held: bool) {
+        if let Some(mixer) = &self.mixer {
+            for v in &mut mixer.lock().unwrap().voices {
+                v.held = held;
+            }
         }
     }
 }
@@ -345,10 +406,7 @@ mod tests {
 
     #[test]
     fn mixes_and_finishes() {
-        let mut m = Mixer {
-            voices: Vec::new(),
-            gains: [1.0; 3],
-        };
+        let mut m = Mixer::default();
         m.voices.push(Voice {
             id: 1,
             pcm: tone(RATE, 1, 3),
@@ -357,6 +415,7 @@ mod tests {
             gain: 1.0,
             looping: false,
             bus: Bus::Effects,
+            held: false,
         });
         let mut out = vec![0i16; 8];
         m.mix(&mut out);
@@ -367,10 +426,7 @@ mod tests {
 
     #[test]
     fn resamples_and_loops() {
-        let mut m = Mixer {
-            voices: Vec::new(),
-            gains: [1.0; 3],
-        };
+        let mut m = Mixer::default();
         m.voices.push(Voice {
             id: 1,
             pcm: tone(RATE / 2, 2, 2),
@@ -379,6 +435,7 @@ mod tests {
             gain: 0.5,
             looping: true,
             bus: Bus::Music,
+            held: false,
         });
         let mut out = vec![0i16; 20];
         m.mix(&mut out);

@@ -6,6 +6,7 @@
 //! any waitable call made inside it is still running; the host releases the
 //! thread when they finish.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::op::{Op, decode};
@@ -56,7 +57,11 @@ struct Thread {
     script: Rc<Script>,
     script_name: String,
     function: String,
-    vars: Vec<Value>,
+    /// The script's variables, shared with every other running thread of
+    /// the same script, as the original does: the temple fight's threads
+    /// pass Gabriel's and the demon's positions through them. They start
+    /// from their initial values again once no thread of it is running.
+    vars: Rc<RefCell<Vec<Value>>>,
     pc: usize,
     stack: Vec<Value>,
     in_wait: bool,
@@ -119,7 +124,16 @@ impl Vm {
         let pc = script
             .function(function)
             .ok_or_else(|| format!("{script_name} has no function {function}"))?;
-        let vars = script.variables.iter().map(|v| v.initial.clone()).collect();
+        let running = self.threads.iter().flatten().find(|t| {
+            matches!(t.state, ThreadState::Running | ThreadState::Waiting)
+                && t.script_name.eq_ignore_ascii_case(script_name)
+        });
+        let vars = match running {
+            Some(t) => Rc::clone(&t.vars),
+            None => Rc::new(RefCell::new(
+                script.variables.iter().map(|v| v.initial.clone()).collect(),
+            )),
+        };
         let thread = Thread {
             script,
             script_name: script_name.to_string(),
@@ -359,7 +373,7 @@ impl Vm {
                 }
                 Op::StoreI | Op::StoreF | Op::StoreS => {
                     let v = pop!();
-                    if let Some(slot) = t.vars.get_mut(operand as usize) {
+                    if let Some(slot) = t.vars.borrow_mut().get_mut(operand as usize) {
                         *slot = match instruction.op {
                             Op::StoreI => Value::Int(v.int()),
                             Op::StoreF => Value::Float(v.float()),
@@ -370,6 +384,7 @@ impl Vm {
                 Op::LoadI | Op::LoadF | Op::LoadS => {
                     let v = t
                         .vars
+                        .borrow()
                         .get(operand as usize)
                         .cloned()
                         .unwrap_or(Value::Int(0));

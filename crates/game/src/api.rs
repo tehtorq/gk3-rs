@@ -76,6 +76,28 @@ pub const WAITABLE: &[&str] = &[
 /// Presentation functions: performed by the engine, not by this module.
 const PRESENTATION: &[&str] = &[
     "CutToCameraAngle",
+    "StopMorphAnimation",
+    "PlayMovie",
+    "ClearRegion",
+    "InspectObject",
+    "DefaultInspect",
+    "InspectModelUsingAngle",
+    "Uninspect",
+    "LookitActorQuick",
+    "LookitModelQuick",
+    "LookitModelX",
+    "LookitModelQuickX",
+    "LookitNoun",
+    "LookitNounQuick",
+    "LookitPlayer",
+    "LookitSceneModel",
+    "LookitSceneModelQuick",
+    "LookitMouse",
+    "LookitLock",
+    "LookitUnlock",
+    "EnableEyeJitter",
+    "DisableEyeJitter",
+    "EyeJitter",
     "ForceCutToCameraAngle",
     "GlideToCameraAngle",
     "GlideToCameraAngleX",
@@ -161,6 +183,7 @@ const PRESENTATION: &[&str] = &[
     "ShowInventory",
     "HideInventory",
     "InventoryInspect",
+    "InventoryUninspect",
     "ShowSidney",
     "ShowBinocs",
     "ShowDrivingInterface",
@@ -168,6 +191,7 @@ const PRESENTATION: &[&str] = &[
     "ShowFingerprintInterface",
     "ShowDeathLayer",
     "FinishedScreen",
+    "QuitApp",
     "PreloadSheep",
     "SetScene",
     "SetSceneNoPreloadTextures",
@@ -209,6 +233,30 @@ impl Effect {
 }
 
 /// The game's API over a [`GameState`].
+/// Where things are in the scene, for the scripts' questions about it.
+#[derive(Debug, Clone, Default)]
+pub struct Whereabouts {
+    /// Each actor, by model and by noun (upper case): where it stands, and
+    /// where its walk ends (where it stands, when it is not walking).
+    pub actors: HashMap<String, ([f32; 3], [f32; 3])>,
+    /// The scene's named positions (upper case).
+    pub positions: HashMap<String, [f32; 3]>,
+}
+
+impl Whereabouts {
+    /// Whether an actor, or the end of its walk, is within `distance` of a
+    /// position, as the original measures: straight-line, in all three
+    /// dimensions. Unknown names are never near.
+    pub fn near(&self, actor: &str, position: &str, distance: f32, walk_end: bool) -> bool {
+        let (Some(&(at, goal)), Some(p)) = (self.actors.get(&key(actor)), self.positions.get(&key(position))) else {
+            return false;
+        };
+        let q = if walk_end { goal } else { at };
+        let d2: f32 = (0..3).map(|k| (q[k] - p[k]).powi(2)).sum();
+        distance >= 0.0 && d2 < distance * distance
+    }
+}
+
 pub struct GameApi<'a> {
     pub state: &'a mut GameState,
     pub scripts: &'a HashMap<String, Rc<Script>>,
@@ -222,6 +270,9 @@ pub struct GameApi<'a> {
     pub calls: u64,
     /// Actors known to the current scene; empty means "assume they exist".
     pub actors: Vec<String>,
+    /// Where the scene's actors and positions are; without it, no one is
+    /// near anywhere.
+    pub whereabouts: Option<&'a Whereabouts>,
 }
 
 impl<'a> GameApi<'a> {
@@ -235,6 +286,7 @@ impl<'a> GameApi<'a> {
             unimplemented: BTreeMap::new(),
             calls: 0,
             actors: Vec::new(),
+            whereabouts: None,
         }
     }
 
@@ -374,7 +426,14 @@ impl<'a> GameApi<'a> {
             ),
             "DOESMODELEXIST" => Value::Int(1),
             "ISCAMERAGLIDEENABLED" => Value::Int(1),
-            "ISACTORNEAR" | "ISWALKINGACTORNEAR" => Value::Int(0),
+            "ISACTORNEAR" | "ISWALKINGACTORNEAR" => {
+                let distance = a.get(2).map_or(0.0, Value::float);
+                let walk_end = key(name) == "ISWALKINGACTORNEAR";
+                Value::from(
+                    self.whereabouts
+                        .is_some_and(|w| w.near(&s(0), &s(1), distance, walk_end)),
+                )
+            }
             "ISTOPLAYERINVENTORY" => Value::from(st.inventory_shown),
             "DOESSIDNEYFILEEXIST" => Value::Int(0),
             _ => return None,
@@ -408,7 +467,8 @@ impl Host for GameApi<'_> {
             _ => {}
         }
         if key(name) == "SETLOCATION" {
-            self.state.enter(&s(0));
+            // The visit is counted when the room is entered.
+            self.state.move_to(&s(0));
         }
         if let Some(value) = self.query(name, args) {
             return Outcome::Done(value);
@@ -423,7 +483,12 @@ impl Host for GameApi<'_> {
         } else {
             *self.unimplemented.entry(name.to_string()).or_default() += 1;
         }
-        let waits = is(name, WAITABLE) && context.in_wait && context.thread != usize::MAX;
+        // Only what the engine performs can release a waiting script: an
+        // unknown call is over at once, or its script would wait for ever.
+        let waits = presentation
+            && is(name, WAITABLE)
+            && context.in_wait
+            && context.thread != usize::MAX;
         if presentation {
             self.effects.push(Effect {
                 name: name.to_string(),
@@ -496,5 +561,26 @@ mod tests {
         eval(&mut api, r#"FrobnicateWidget(1)"#);
         assert_eq!(api.trace, [r#"CutToCameraAngle("START")"#]);
         assert_eq!(api.unimplemented.get("FrobnicateWidget"), Some(&1));
+    }
+
+    /// A script waiting on a call the engine cannot perform goes on at
+    /// once: nothing would ever release it.
+    #[test]
+    fn only_performed_calls_are_waited_on() {
+        let scripts = HashMap::new();
+        let mut state = GameState::default();
+        let mut api = GameApi::new(&mut state, &scripts);
+        let waiting = CallContext {
+            thread: 1,
+            script: "TEST",
+            in_wait: true,
+        };
+        // Waitable, but not the engine's to perform here.
+        let unknown = api.call("Warp", &[], Type::Void, &waiting);
+        assert!(matches!(unknown, Outcome::Done(_)));
+        // Performed by the engine, which releases the script when it is over.
+        let walk = api.call("StartAnimation", &[Value::from("X")], Type::Void, &waiting);
+        assert!(matches!(walk, Outcome::Pending(_)));
+        assert_eq!(api.effects.last().map(|e| e.thread), Some(Some(1)));
     }
 }

@@ -63,6 +63,23 @@ impl GameState {
         for ((actor, location, time), n) in &self.location_counts {
             line(&["location_count", actor, location, time, &n.to_string()]);
         }
+        for id in &self.sidney_files {
+            line(&["sidney_file", &id.to_string()]);
+        }
+        for id in &self.sidney_analyzed {
+            line(&["sidney_analyzed", &id.to_string()]);
+        }
+        for email in &self.emails_received {
+            line(&["email", email]);
+        }
+        for email in &self.emails_read {
+            line(&["email_read", email]);
+        }
+        for (suspect, files) in &self.suspect_links {
+            for file in files {
+                line(&["suspect_link", &suspect.to_string(), &file.to_string()]);
+            }
+        }
         for record in extra {
             let fields: Vec<&str> = record.iter().map(String::as_str).collect();
             line(&fields);
@@ -134,6 +151,24 @@ impl GameState {
                 "location_count" => {
                     state.location_counts.insert((s(1)?, s(2)?, s(3)?), int(4)?);
                 }
+                "sidney_file" => {
+                    state.sidney_files.insert(int(1)? as u32);
+                }
+                "sidney_analyzed" => {
+                    state.sidney_analyzed.insert(int(1)? as u32);
+                }
+                "email" => state.emails_received.push(s(1)?),
+                "suspect_link" => {
+                    let suspect = int(1)? as u32;
+                    state
+                        .suspect_links
+                        .entry(suspect)
+                        .or_default()
+                        .push(int(2)? as u32);
+                }
+                "email_read" => {
+                    state.emails_read.insert(s(1)?);
+                }
                 _ => extra.push(f.iter().map(|s| s.to_string()).collect()),
             }
         }
@@ -172,6 +207,13 @@ mod tests {
             .location_counts
             .insert(("GRACE".into(), "LBY".into(), "207A".into()), 1);
         state.random(1, 10);
+        state.sidney_files.extend([19, 3]);
+        state.sidney_analyzed.insert(19);
+        state
+            .emails_received
+            .extend(["Email1".to_string(), "Email2".to_string()]);
+        state.emails_read.insert("Email1".into());
+        state.suspect_links.insert(1, vec![32, 1]);
 
         let extra = vec![vec!["ego_at".to_string(), "1.5".into(), "0".into()]];
         let text = state.to_save(&extra);

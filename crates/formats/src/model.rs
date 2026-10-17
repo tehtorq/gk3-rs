@@ -29,6 +29,9 @@ pub struct Submesh {
     pub texture: String,
     /// Tint as RGB. The file's alpha byte is always zero and is ignored.
     pub color: [u8; 3],
+    /// How many vertices at the end are points of their own rather than
+    /// part of the shape (left out of its bounds): 4 or 0.
+    pub trailing_points: usize,
     pub positions: Vec<[f32; 3]>,
     /// As stored: in model space rather than mesh space.
     pub normals: Vec<[f32; 3]>,
@@ -103,7 +106,9 @@ fn read_submesh(r: &mut Reader) -> Result<Submesh> {
     let vertex_count = r.u32()? as usize;
     let face_count = r.u32()? as usize;
     let lod_count = r.u32()? as usize;
-    r.skip(4)?; // unknown, usually 0
+    // Non-zero: the last four vertices are points of their own, which the
+    // original leaves out of the submesh's bounds (0x57b140, 0x57ce20).
+    let trailing_points = if r.u32()? != 0 { 4 } else { 0 };
 
     // Positions, normals and UVs: 32 bytes per vertex; 8 bytes per face.
     r.expect_room(vertex_count, 32)?;
@@ -144,6 +149,7 @@ fn read_submesh(r: &mut Reader) -> Result<Submesh> {
     Ok(Submesh {
         texture,
         color: [red, green, blue],
+        trailing_points,
         positions,
         normals,
         uvs,

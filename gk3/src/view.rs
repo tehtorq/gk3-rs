@@ -90,7 +90,7 @@ struct Gfx {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     renderer: Renderer,
-    depth: wgpu::TextureView,
+    depth: gk3_render::FrameBuffers,
     gpu_name: String,
     room: Room,
     scene: GpuScene,
@@ -151,9 +151,14 @@ impl Viewer {
         config.format = format;
         config.present_mode = wgpu::PresentMode::AutoVsync;
         surface.configure(&device, &config);
+        let samples = gk3_render::window_samples(&adapter, format);
 
-        let renderer = Renderer::new(device, queue, format);
-        let depth = renderer.depth_view(config.width, config.height);
+        let mut renderer = Renderer::with_samples(device, queue, format, samples);
+        if adapter.get_info().device_type == wgpu::DeviceType::Cpu {
+            renderer.max_anisotropy = 1;
+            renderer.set_filtering(gk3_render::Filtering::default());
+        }
+        let depth = renderer.frame_buffers(config.width, config.height);
         let (room, scene, camera, cast) = self.load(&renderer, self.index)?;
         let gfx = Gfx {
             window,
@@ -272,7 +277,7 @@ impl Gfx {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(self.renderer.device(), &self.config);
-        self.depth = self.renderer.depth_view(width, height);
+        self.depth = self.renderer.frame_buffers(width, height);
     }
 
     fn redraw(&mut self) {

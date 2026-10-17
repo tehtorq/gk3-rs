@@ -61,6 +61,10 @@ pub(crate) struct OverlayVertex {
     pub position: [f32; 2],
     pub uv: [f32; 2],
     pub color: [u8; 4],
+    /// The source rectangle less half a texel all round, as u, v from and
+    /// to: the shader keeps its samples inside, so a smoothed glyph or
+    /// sprite never picks up its neighbour on the sheet.
+    pub bounds: [f32; 4],
 }
 
 /// Six vertices per quad, in clip space.
@@ -81,10 +85,18 @@ pub(crate) fn vertices(
         let [sx, sy, swid, shei] = q.source;
         let (u0, u1) = (sx / tw, (sx + swid) / tw);
         let (v0, v1) = (sy / th, (sy + shei) / th);
+        let (hu, hv) = (0.5 / tw, 0.5 / th);
+        let inset = |a: f32, b: f32, half: f32| {
+            let (lo, hi) = (a.min(b) + half, a.max(b) - half);
+            if lo <= hi { (lo, hi) } else { let m = (a + b) / 2.0; (m, m) }
+        };
+        let (bu0, bu1) = inset(u0, u1, hu);
+        let (bv0, bv1) = inset(v0, v1, hv);
         let v = |position, uv| OverlayVertex {
             position,
             uv,
             color: q.color,
+            bounds: [bu0, bv0, bu1, bv1],
         };
         out.extend([
             v([x0, y0], [u0, v0]),
@@ -110,5 +122,17 @@ mod tests {
         assert_eq!(v[0].position, [-1.0, 1.0]);
         assert_eq!(v[5].position, [0.0, 0.0]);
         assert_eq!(v[5].uv, [1.0, 1.0]);
+    }
+
+    #[test]
+    fn samples_stay_half_a_texel_inside_the_source() {
+        let mut o = Overlay::default();
+        // A glyph 4 texels wide at x 10 on a sheet 100 wide, 10 high.
+        o.image(OverlayTexture(1), [10.0, 0.0, 4.0, 10.0], [0.0, 0.0, 9.0, 22.0], [255; 4]);
+        let v = vertices(&o, &[(1, 1), (100, 10)], (100, 50));
+        let want = [0.105, 0.05, 0.135, 0.95];
+        for (got, want) in v[0].bounds.iter().zip(want) {
+            assert!((got - want).abs() < 1e-6, "{:?}", v[0].bounds);
+        }
     }
 }

@@ -31,7 +31,12 @@ struct Step {
 }
 
 pub struct Soundtrack {
+    /// Upper-cased, without `.STK`, for stopping it by name.
+    pub name: String,
     pub music: bool,
+    /// Runs through its list once rather than round and round, as an
+    /// animation's `PLAYSOUNDTRACKTBS` asks.
+    pub once: bool,
     steps: Vec<Step>,
     at: usize,
     busy_until: f64,
@@ -100,7 +105,9 @@ impl Soundtrack {
             .bytes()
             .fold(0x2545_F491_4F6C_DD1Du64, |h, b| h.rotate_left(7) ^ b as u64);
         Self {
+            name: name.to_ascii_uppercase(),
             music,
+            once: false,
             steps,
             at: 0,
             busy_until: 0.0,
@@ -126,6 +133,10 @@ impl Soundtrack {
                 break;
             }
             if self.at >= self.steps.len() {
+                if self.once {
+                    self.stopped = true;
+                    break;
+                }
                 self.at = 0;
                 if self.steps.iter().all(|s| s.repeat == Some(0)) {
                     self.stopped = true;

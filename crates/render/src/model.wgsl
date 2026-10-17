@@ -1,5 +1,8 @@
 // Models: characters and props. Positions arrive already posed and placed in
-// the world each frame; lighting is an ambient term plus one light.
+// the world each frame; lighting is the original's (0x559550): a vertex is
+// its tint times the light colour plus (2 cos - 1) times the range, cos the
+// light on the surface's front, clamped to 0 to 1; its hardware renderer then
+// modulates the texture by that twice over (MODULATE2X).
 
 struct Globals {
     view_proj: mat4x4<f32>,
@@ -12,8 +15,8 @@ struct Globals {
 struct ModelLight {
     // Direction towards the light, in world space.
     direction: vec4<f32>,
-    color: vec4<f32>,
-    ambient: vec4<f32>,
+    // The light colour; w is the range.
+    colour: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -47,16 +50,28 @@ fn vs_main(v: VertexIn) -> VertexOut {
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-    let texel = textureSample(diffuse, diffuse_sampler, in.uv) * vec4<f32>(in.tint.rgb, 1.0);
+    let texel = textureSample(diffuse, diffuse_sampler, in.uv);
     if texel.a < 0.5 {
         discard;
     }
-    let n = normalize(in.normal);
-    // Normals in the data are not consistently outward, so light both sides.
-    let lambert = abs(dot(n, light.direction.xyz));
-    let lit = light.ambient.rgb + light.color.rgb * lambert;
     if g.mode == 1u {
-        return vec4<f32>(texel.rgb, 1.0);
+        return vec4<f32>(texel.rgb * in.tint.rgb, 1.0);
     }
-    return vec4<f32>(texel.rgb * lit, 1.0);
+    let n = normalize(in.normal);
+    let lambert = max(dot(n, light.direction.xyz), 0.0);
+    let lit = clamp(
+        in.tint.rgb * (light.colour.rgb + (2.0 * lambert - 1.0) * light.colour.w),
+        vec3<f32>(0.0),
+        vec3<f32>(1.0),
+    );
+    return vec4<f32>(min(2.0 * texel.rgb * lit, vec3<f32>(1.0)), 1.0);
+}
+
+// A blob shadow, as the original draws it on a card that can modulate twice
+// over (0x599f20, 0x59ae00): its picture doubled, then multiplied onto what
+// lies under it.
+@fragment
+fn fs_shadow(in: VertexOut) -> @location(0) vec4<f32> {
+    let texel = textureSample(diffuse, diffuse_sampler, in.uv);
+    return vec4<f32>(min(texel.rgb * 2.0, vec3<f32>(1.0)), 1.0);
 }

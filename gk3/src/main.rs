@@ -65,6 +65,8 @@ commands:
                         --do NOUN:VERB (repeatable), --seconds N and --png F
                         it runs without a window and reports what happened.
                         --do WALK:X,Z clicks the floor at world X,Z;
+                        --do CLICK:X,Z (or CLICK:HERE) clicks it without
+                        waiting for the walk;
                         --do POINT:X,Y says what is under that pixel;
                         --do CALL:SCRIPT/FUNCTION runs a script function.
                         --title-screen draws the title screen; --movie NAME

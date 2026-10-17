@@ -1747,6 +1747,23 @@ impl Cast {
         started
     }
 
+    /// A click too near to walk to, made while walking, as the original's
+    /// (0x41d34a → 0x41dadd): the walk becomes the click's, which asks for
+    /// no heading, and stops. Setting off or striding, the walker goes into
+    /// the stop where they are (0x4187fa); already stopping, the turn to
+    /// the old heading is dropped (0x4188e4). False if not walking.
+    pub fn stop_walk(&mut self, name: &str) -> bool {
+        let Some(walk) = self.find(name).and_then(|i| self.figures[i].walk.as_mut()) else {
+            return false;
+        };
+        walk.path.clear();
+        walk.goal = None;
+        walk.heading = None;
+        walk.face_within = None;
+        walk.tolerance.face = None;
+        true
+    }
+
     /// Turns someone on the spot to face a heading, as the original's walks
     /// that do not move (`TurnToModel`, a walk to see something already in
     /// reach): a walk already at its end, turning to the heading at the

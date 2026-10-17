@@ -386,6 +386,28 @@ fn headless_run(lib: &Library, o: &Options) -> Result<ExitCode, String> {
             }
             continue;
         }
+        // `CLICK:X,Z` is a click on the floor there, not waited out (so a
+        // walk under way can be clicked into); `CLICK:HERE` at the ego's
+        // own feet.
+        if noun == "CLICK" {
+            let here = world.ego_position().map(|(at, _)| (at.x, at.z));
+            let goal = if verb == "HERE" {
+                here
+            } else {
+                verb.split_once(',')
+                    .and_then(|(x, z)| Some((x.trim().parse().ok()?, z.trim().parse().ok()?)))
+            };
+            let Some((x, z)) = goal else {
+                world.log.push(format!("cannot CLICK:{verb}; it is CLICK:X,Z or CLICK:HERE"));
+                continue;
+            };
+            let walks = world.walk_ego(glam::Vec3::new(x, 0.0, z), None, crate::world::EgoWalk::Click);
+            world.log.push(format!(
+                "click at {x:.0},{z:.0}{}",
+                if walks { "" } else { " (no walk)" }
+            ));
+            continue;
+        }
         // `WALK:X,Z` is a click on the floor there.
         if noun == "WALK" {
             let goal = verb

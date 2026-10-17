@@ -155,6 +155,13 @@ seeing the model, 2 on entering the region), not how it ends visually.
 spot and heading at once (0x41826b moves the models straight there); a
 click does nothing.
 
+**A click that near while walking** (measured from where the walker now
+stands) still replaces the walk under way with the click's, which asks for
+no heading (0x417d4a copies it over), and stops it: setting off or striding
+(states 0 to 2), the walker goes into the stop where they are, with no
+final turn (0x4187fa); already stopping or paused (3 and up), the walk is
+done at once (0x4188e4). Anything the old walk was to face is dropped.
+
 ## An action's approach (0x406d5a)
 
 A rule's `approach=` picks the walk made before its script runs, from the
@@ -326,9 +333,36 @@ around scripted scenes.
 
 ### Not yet applied
 
+## Triggers
+
+A scene file's `[TRIGGERS]` (a noun and a floor rectangle; parsed at
+0x512110, the rectangle read with `strtok` and normalised) become
+`Trigger` objects (`mNoun`, `mRects`, `mEnable`; saved at 0x5259d3).
+
+**When they trip.** At the end of each frame's update (0x41838e), walking
+or standing, the ego's walker looks for a trigger where it stands
+(0x4194d7 → 0x525c61): the first, in order, that is enabled, holds the
+point in one of its rectangles, and whose noun has a `WALK` action now
+(0x525a1b). If there is one and it is not the one found last time
+(+0x374), it is sent a message to trip; either way what was found (or
+nothing) is kept as the last. So a trigger trips on coming into it, and
+again only after leaving it, or after its `WALK` action has been
+unavailable for a frame.
+
+**What tripping does** (0x525a57): runs `noun:WALK`, if the action
+manager will take it (0x4077b4): with no action, or one whose state
+(`mCurrentState`) is 0 or 2, walking to where it is done. In states 1, 3
+and 4 (its script playing) the trip does nothing, and the trigger, already
+kept as the last, does not trip again until left. Only the ego's walker
+looks (+0xb4 against the ego).
+
+**Skipping a walk** (`SkipEgoWalk`, 0x41d4f9 → 0x418564 → 0x4e0e8f) and a
+walk skipped into view jump along the route a step at a time, stopping at
+the first point in a trigger not yet tripped (which then trips) or at the
+end.
+
 ## Still to trace
 
 - The interface mode that switches walkers' collisions off (0x4403ac).
 - Characters without a heading model still have each clip placed by the
   hip, and do not steer during a turning start (none of them has one).
-- What a click does to a walk under way when it lands within 24.

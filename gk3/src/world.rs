@@ -269,6 +269,10 @@ pub struct World<'a> {
     /// Something to turn to face when an approach walk ends, and within
     /// what of it (radians).
     face_after: Option<(String, f32)>,
+    /// The trigger the player was last found in (its noun), as the
+    /// original's walker keeps it (+0x374): a trigger trips on coming into
+    /// it, not again until it has been left.
+    last_trigger: Option<String>,
     next_location: Option<String>,
     /// A door's sound on going through it to another room (not in the
     /// original). The action under way is on a door; its change of room
@@ -450,6 +454,7 @@ impl<'a> World<'a> {
             approach: None,
             restore: None,
             face_after: None,
+            last_trigger: None,
             next_location: None,
             door_sounds: true,
             door_action: false,
@@ -926,6 +931,7 @@ impl<'a> World<'a> {
         self.pendulum = None;
         self.bridge = None;
         self.demon_fight = false;
+        self.last_trigger = None;
         self.timed_shows.clear();
         self.scene_function(renderer, "init");
         self.state.count_visit();
@@ -1883,43 +1889,72 @@ impl<'a> World<'a> {
         scene.cast.actor_position(&scene.ego)
     }
 
-    /// As G-Engine's scene update: while the player stands in a trigger's
-    /// area and nothing is playing, the trigger's noun is acted on with
-    /// WALK, if the story has a rule for it now.
+    /// The player's triggers, as the original's walker checks them each
+    /// frame, walking or not (0x41838e → 0x4194d7): the first trigger the
+    /// player stands in whose noun the story has a WALK rule for now
+    /// (0x525c61), if not the one found last time, is tripped; and is kept
+    /// as the last, as is being in none. So a trigger trips on coming into
+    /// it, and again only once it has been left. Tripped while an action
+    /// plays its script, it does nothing (0x525a57, 0x4077b4); while the
+    /// player is only walking to one, it takes that action's place.
     fn trip_triggers(&mut self, renderer: &Renderer) {
-        if !self.idle() {
+        let Some((at, _)) = self.ego_position() else { return };
+        let found = self.trigger_at(at);
+        let noun = found.as_ref().map(|r| r.noun.to_ascii_uppercase());
+        if noun == self.last_trigger {
             return;
         }
-        let Some((at, _)) = self.ego_position() else { return };
-        let Some(scene) = &self.scene else { return };
-        let inside: Vec<String> = scene
+        self.last_trigger = noun;
+        let Some(rule) = found else { return };
+        let playing = !self.actions.is_empty()
+            || self.next_location.is_some()
+            || self.timeblock_change.is_some()
+            || self.binocs.as_ref().is_some_and(|b| !b.queue.is_empty());
+        if playing {
+            self.log.push(format!("trigger {} (while busy: nothing)", rule.noun));
+            return;
+        }
+        self.log.push(format!("trigger {}", rule.noun));
+        self.approach = None;
+        self.face_after = None;
+        self.act(renderer, rule);
+    }
+
+    /// The trigger the player would be found in at a point (0x525c61): the
+    /// first holding it whose noun has a WALK rule now, and that rule.
+    fn trigger_at(&self, at: Vec3) -> Option<Rule> {
+        let scene = self.scene.as_ref()?;
+        let inside: Vec<&str> = scene
             .triggers
             .iter()
             .filter(|t| (t.min.0..=t.max.0).contains(&at.x) && (t.min.1..=t.max.1).contains(&at.z))
-            .map(|t| t.noun.clone())
+            .map(|t| t.noun.as_str())
             .collect();
-        for noun in inside {
+        if inside.is_empty() {
+            return None;
+        }
+        let snapshot = self.state.clone();
+        let whereabouts = self.whereabouts();
+        inside.into_iter().find_map(|noun| {
             // WALK is not a verb the player is offered, so not among
             // `verbs`: the rules are asked for directly.
-            let rule = {
-                let snapshot = self.state.clone();
-                let mut probe = snapshot.clone();
-                let whereabouts = self.whereabouts();
-                let mut api = GameApi::new(&mut probe, &self.scripts);
-                api.whereabouts = Some(&whereabouts);
-                scene
-                    .actions
-                    .available(&noun, &mut api, &snapshot)
-                    .into_iter()
-                    .find(|r| r.verb == "WALK")
-                    .cloned()
-            };
-            if let Some(rule) = rule {
-                self.log.push(format!("trigger {noun}"));
-                self.act(renderer, rule);
-                return;
-            }
-        }
+            let mut probe = snapshot.clone();
+            let mut api = GameApi::new(&mut probe, &self.scripts);
+            api.whereabouts = Some(&whereabouts);
+            scene
+                .actions
+                .available(noun, &mut api, &snapshot)
+                .into_iter()
+                .find(|r| r.verb == "WALK")
+                .cloned()
+        })
+    }
+
+    /// Whether a point is in a trigger the player has not just tripped
+    /// (0x419473).
+    fn new_trigger_at(&self, at: Vec3) -> bool {
+        self.trigger_at(at)
+            .is_some_and(|r| Some(r.noun.to_ascii_uppercase()) != self.last_trigger)
     }
 
     /// Whether the player is on their way somewhere.
@@ -1943,9 +1978,13 @@ impl<'a> World<'a> {
         // a turn to the heading, if it is much off. Routing from where one
         // stands can go out and back, when that spot is closed off (such as
         // in front of an open wardrobe). A click this near is no walk at
-        // all, as the original's (0x41d34a).
+        // all, as the original's (0x41d34a), and stops one under way.
         let near = if kind == EgoWalk::Click { CLICK_NEAR } else { AT_SPOT };
         if Vec3::new(goal.x - from.x, 0.0, goal.z - from.z).length() <= near {
+            if kind == EgoWalk::Click {
+                scene.cast.stop_walk(&ego);
+                return false;
+            }
             let off = heading.map_or(0.0, |h| {
                 let d = (h - facing).rem_euclid(std::f32::consts::TAU);
                 d.min(std::f32::consts::TAU - d)
@@ -2006,6 +2045,34 @@ impl<'a> World<'a> {
             at = to;
         }
         let first_seen = points.iter().position(|(p, _)| seen(*p));
+        // As the original's skip (0x4e0e8f), the player's stops short at
+        // a trigger not yet tripped, which then trips where they are put.
+        let is_ego = self.scene.as_ref().is_some_and(|s| s.ego.eq_ignore_ascii_case(who));
+        let first_trigger = if is_ego {
+            points
+                .iter()
+                .take(first_seen.unwrap_or(points.len()))
+                .position(|(p, _)| self.new_trigger_at(*p))
+        } else {
+            None
+        };
+        if let Some(k) = first_trigger {
+            let (put, leg) = points[k];
+            let before = if k == 0 { from } else { points[k - 1].0 };
+            let d = put - before;
+            self.log.push(format!(
+                "  ({who} skips into a trigger at {:.0},{:.0})",
+                put.x, put.z
+            ));
+            if let Some(scene) = &mut self.scene {
+                scene.cast.put(who, put, d.x.atan2(d.z));
+            }
+            let mut rest = path[leg..].to_vec();
+            if rest.is_empty() {
+                rest.push([put.x, put.z]);
+            }
+            return rest;
+        }
         let (put, facing, rest) = match first_seen {
             // Never in view: straight to the end, facing the way asked.
             None => {

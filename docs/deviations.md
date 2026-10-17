@@ -138,10 +138,10 @@ Behaviour that is not yet the original's, with what is known.
 | What | The original | Ours | Status |
 |---|---|---|---|
 | Walkers' collisions switched off | During an interface mode, for every actor *(traced: 0x4403ac; the mode not identified)* | Always on | To identify the mode |
-| A click within 24 units while walking | Seems to stop the walk under way *(traced, unconfirmed)* | Ignored; the walk carries on | To confirm |
 | Actors the scene gives no usable spot (`pos=` missing, or naming a position no scene file defines: 15 such names in the data) | Creating the actor, looks the name up and places the actor only if found *(traced: 0x502c9d)*; how the first animation then places them is not traced | Stand where their first animation puts the model, and are synced to it. A relative animation is played where its data has it, since some are authored where they play (Buthane at dinner at 306P, whose seat matches her absolute animation's at 207A). G-Engine instead substitutes another animation for Buthane | To trace the first animation's placement (the loader's deferred animation queue after 0x502e1e) |
 | A room's `custom=` mode (`Chess`, `Bridge`, `Laser` and others, 11 rooms) | Selects the room's puzzle code *(inferred: the names)* | Not read; each puzzle is chosen by its room | To trace |
 | Clicks on TE3's floor | Picking tests only visible room geometry, with hit-test areas made visible for it and `noClick` models hidden for it, then the nearer of that and any model *(traced: 0x52a0e2, 0x52b9ca, 0x564440, 0x565520)*. TE3's visible floor is `noClick`, its walk floor hidden, so a click meets the floor's unnamed rings | The same; a click on unnamed geometry that is not the walk floor does nothing | What the original does with such a click is not traced (the click handler is reached through virtual calls) |
+| Skipping the player's walk (`SkipEgoWalk`) | Jumps along the route to the first trigger not yet tripped, which trips, or to the end *(traced: 0x41d4f9 → 0x418564 → 0x4e0e8f)* | No walk is skipped | To do |
 | The order TE5's stones glint in | Shuffled each round with the C library's `rand()` *(traced)*; how it was seeded is not | Shuffled each round from a sequence of our own | — |
 
 ### Small differences in what is traced
@@ -167,11 +167,6 @@ but have not been traced in the executable yet:
 - Characters' normals are stored as their meshes rest, in model space;
   they are taken back into each mesh's space and turned with the mesh as
   animated, so the light on a character follows its animation.
-- Triggers (`[TRIGGERS]`: a noun and a floor rectangle): while the player
-  stands in one and nothing is playing, its noun is acted on with WALK,
-  checked every frame. *(traced: the section's parser, 0x512110, and that
-  the rectangle is read with `strtok` and normalised; when it is checked
-  is G-Engine's)*
 - `IsActorNear` measures in three dimensions, from the actor's floor point
   raised by its shoes.
 - Skip into view: a walk starting off camera begins just before the route

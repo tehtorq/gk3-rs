@@ -2308,9 +2308,21 @@ impl<'a> World<'a> {
                 scene.cast.place(&e.string(0), &e.string(1));
                 None
             }
+            // As the original's (0x4a8b08): the player stands on the
+            // position, and if it names a camera, the view cuts to it
+            // whatever the forced cuts say (0x4ab6b1).
             "INITEGOPOSITION" => {
                 let ego = scene.ego.clone();
-                scene.cast.init_position(lib, &ego, &e.string(0));
+                let position = e.string(0).to_ascii_uppercase();
+                scene.cast.init_position(lib, &ego, &position);
+                if let Some(c) = scene
+                    .cast
+                    .position_cameras
+                    .get(&position)
+                    .and_then(|camera| scene.cameras.get(camera))
+                {
+                    self.camera = shoot::from_room_camera(c);
+                }
                 None
             }
             "SHOWMODEL" | "HIDEMODEL" | "SHOWSCENEMODEL" | "HIDESCENEMODEL" => {

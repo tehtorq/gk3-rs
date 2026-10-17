@@ -367,6 +367,9 @@ pub struct Cast {
     clips: HashMap<String, Option<Arc<VertexAnimation>>>,
     light: Option<Vec3>,
     pub positions: HashMap<String, (Vec3, f32)>,
+    /// The camera a position names (`camera=`), which `InitEgoPosition`
+    /// cuts to.
+    pub position_cameras: HashMap<String, String>,
     pub warnings: Vec<String>,
     /// What fidgets' animations show, hide and repaint, by time, for the
     /// world to carry out (some are parts of the room).
@@ -411,6 +414,7 @@ impl Cast {
             clips: HashMap::new(),
             light: None,
             positions: positions(sif),
+            position_cameras: position_cameras(sif),
             warnings: Vec::new(),
             cues: Vec::new(),
             paints: HashMap::new(),
@@ -3504,6 +3508,18 @@ pub fn read_anm(lib: &Library, name: &str) -> Option<Animation> {
         .or_else(|_| lib.read(&format!("{name}.YAK")))
         .ok()
         .map(|b| Animation::parse(&b))
+}
+
+fn position_cameras(sif: &Document) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for line in sif.sections("POSITIONS").flat_map(|s| &s.lines) {
+        let (Some(first), Some(camera)) = (line.pairs.first(), line.get("camera")) else {
+            continue;
+        };
+        out.entry(first.key.to_ascii_uppercase())
+            .or_insert_with(|| camera.trim().to_ascii_uppercase());
+    }
+    out
 }
 
 fn positions(sif: &Document) -> HashMap<String, (Vec3, f32)> {

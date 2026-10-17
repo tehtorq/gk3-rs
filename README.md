@@ -104,7 +104,8 @@ gk3 play --load x.sav --do HAND_MIRROR:FINGERPRINT_KIT --lift   # dust and keep
 gk3 play --load x.sav --sid open --sid "search=holy grail" --png s.png  # SIDNEY
 gk3 play TE6 --time 309P --do FLOOR:TE6_FLOOR --do WAIT:3.5 \
   --do FLOOR:TE6_FLOOR --do WAIT:3.5 --do SARCOPHAGUS:CLIMB --do WAIT:4 \
-  --do ASMODEUS:TALISMAN --do WAIT:1 --do ASMODEUS:DAGGER --do WAIT:240  # the end
+  --do ASMODEUS:TALISMAN --do WAIT:9 --do ASMODEUS:TALISMAN --do WAIT:1 \
+  --do ASMODEUS:DAGGER --do WAIT:240           # the end
 gk3 play TE6 --time 309P --do WAIT:2 --where   # where everyone stands
 gk3 movie Parch1Geo.avi --png last.png       # an AVI from the Data folder
 ```

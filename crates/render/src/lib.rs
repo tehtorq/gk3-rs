@@ -825,8 +825,11 @@ impl Renderer {
     }
 
     /// Lets the GPU side free what has been dropped (old textures, buffers)
-    /// even when no frame is being drawn, as in headless runs.
+    /// even when no frame is being drawn, as in headless runs. Uploads wait
+    /// in the queue (holding their staging copies and textures) until a
+    /// submit, which polling alone does not make, so an empty one is sent.
     pub fn tidy(&self) {
+        self.queue.submit([]);
         let _ = self.device.poll(wgpu::PollType::Poll);
     }
 

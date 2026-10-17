@@ -90,6 +90,8 @@ struct Gfx {
     map_buttons: Vec<(&'static str, [f32; 4])>,
     /// The binoculars' buttons as last drawn.
     binocs_buttons: Vec<(BinocsButton, [f32; 4])>,
+    /// The GPS's panel and power button, while it is up.
+    gps_rects: Option<([f32; 4], [f32; 4])>,
     /// The fingerprint kit's parts as last drawn, and the pointer then.
     kit_layout: KitLayout,
     kit_pointer: (f32, f32),
@@ -237,6 +239,7 @@ impl Game {
             card_until: None,
             map_buttons: Vec::new(),
             binocs_buttons: Vec::new(),
+            gps_rects: None,
             kit_layout: KitLayout::default(),
             kit_pointer: (0.0, 0.0),
             started: Instant::now(),
@@ -1076,6 +1079,15 @@ impl Gfx {
             self.world.skip();
             return;
         }
+        // The GPS takes clicks on its panel; its power button turns it off.
+        if let Some((panel, power)) = self.gps_rects
+            && inside(panel, self.pointer)
+        {
+            if inside(power, self.pointer) {
+                self.world.gps_power();
+            }
+            return;
+        }
         let (pick, object) = self
             .world
             .pick_object(self.pointer.0, self.pointer.1, size.0, size.1);
@@ -1365,6 +1377,16 @@ impl Gfx {
                 self.ui.captions(&mut overlay, &self.world, size);
             }
         } else {
+            self.gps_rects = self.world.gps.as_ref().and_then(|gps| {
+                self.ui.gps(
+                    self.world.lib,
+                    &mut self.renderer,
+                    &mut overlay,
+                    gps,
+                    (self.pointer, self.press.is_some()),
+                    size,
+                )
+            });
             if self.inventory.open {
                 self.inventory.items = self.items();
                 self.ui.inventory(
@@ -1497,6 +1519,7 @@ impl Gfx {
             || under.is_some_and(|b| b != Button::Panel)
             || (self.world.map.is_some() && self.map_buttons.iter().any(|b| inside(b.1, at)))
             || (self.world.binocs.is_some() && self.binocs_buttons.iter().any(|b| inside(b.1, at)))
+            || self.gps_rects.is_some_and(|(_, power)| inside(power, at))
             || (self.front == Some(Front::Title)
                 && self.title_buttons.iter().any(|(_, r)| inside(*r, self.pointer)));
         let story_busy = !self.world.idle()

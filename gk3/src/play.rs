@@ -336,6 +336,17 @@ fn headless_run(lib: &Library, o: &Options) -> Result<ExitCode, String> {
         }
         // `SKIPLINES:0.5` clicks through every line half a second in, from
         // here on.
+        // `GIVE:ITEM` puts an item in the ego's inventory.
+        if noun == "GIVE" {
+            let ego = world.state.ego.clone();
+            world.state.give_item(&ego, verb);
+            continue;
+        }
+        // `GPS:POWER` presses the GPS's power button.
+        if noun == "GPS" {
+            world.gps_power();
+            continue;
+        }
         if noun == "SKIPLINES" {
             world.skip_lines_after = verb.parse::<f64>().ok();
             continue;
@@ -864,6 +875,9 @@ fn headless_run(lib: &Library, o: &Options) -> Result<ExitCode, String> {
                 (-1.0, -1.0),
                 size,
             );
+        }
+        if let Some(gps) = &world.gps {
+            ui.gps(lib, &mut ui_renderer, &mut overlay, gps, ((-1.0, -1.0), false), size);
         }
         ui.captions(&mut overlay, &world, size);
         if o.title_screen {

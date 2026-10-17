@@ -1,10 +1,11 @@
 #!/bin/bash
 # gk3-jump: pick a time of day and a place, and play from there.
 #
-# A small launcher window for testing: it lists every timeblock and the
-# locations the story has at each (from `gk3 scenes`), then opens the game
-# at the one picked. Close the game to come back and pick another; cancel
-# a list to go back a step, or to quit from the first.
+# A small launcher window for testing: pick by time of day (every
+# timeblock, then the locations the story has at it) or by place (every
+# location, then the times it is there), from `gk3 scenes`, and the game
+# opens at the one picked. Close the game to come back and pick another;
+# cancel a list to go back a step, or to quit from the first.
 #
 # Needs kdialog (KDE) or zenity (GNOME and others). The game is found as
 # $GK3, else next to this script in target/release, else on the PATH. The
@@ -73,27 +74,71 @@ $scenes"
   exit 1
 fi
 
-while true; do
-  # The groups in order: a timeblock and its name, once each.
-  args=()
-  while IFS=$'\t' read -r tag label; do
-    args+=("$tag|$label" "$label")
-  done < <(printf '%s\n' "$scenes" | cut -f1,2 | awk '!seen[$0]++')
-  group=$(menu "Pick a time" "${args[@]}") || exit 0
-  time=${group%%|*}
-  label=${group#*|}
+# play LOCATION TIME LABEL: runs the game there until it is closed.
+play() {
+  # The game's complaints, kept for if it fails.
+  local complaints
+  if ! complaints=$("$gk3" play "$1" --time "$2" 2>&1 >/dev/null); then
+    error "The game stopped at $1, $3:
+$(printf '%s\n' "$complaints" | tail -n 15)"
+  fi
+}
 
+# By time: a timeblock, then a place at it.
+by_time() {
+  local args group time label location
+  while true; do
+    # The groups in order: a timeblock and its name, once each.
+    args=()
+    while IFS=$'\t' read -r tag label; do
+      args+=("$tag|$label" "$label")
+    done < <(printf '%s\n' "$scenes" | cut -f1,2 | awk '!seen[$0]++')
+    group=$(menu "Pick a time" "${args[@]}") || return
+    time=${group%%|*}
+    label=${group#*|}
+
+    while true; do
+      args=()
+      while IFS=$'\t' read -r _ _ location name; do
+        args+=("$location" "$name ($location)")
+      done < <(printf '%s\n' "$scenes" | awk -F'\t' -v t="$time" -v l="$label" \
+        '$1 == t && $2 == l')
+      location=$(menu "$label: pick a place" "${args[@]}") || break
+      play "$location" "$time" "$label"
+    done
+  done
+}
+
+# By place: a location, by its name, then a time it is there.
+by_place() {
+  local args group time label location name
   while true; do
     args=()
-    while IFS=$'\t' read -r _ _ location name; do
-      args+=("$location" "$name ($location)")
-    done < <(printf '%s\n' "$scenes" | awk -F'\t' -v t="$time" -v l="$label" \
-      '$1 == t && $2 == l')
-    location=$(menu "$label: pick a place" "${args[@]}") || break
-    # The game's complaints, kept for if it fails.
-    if ! complaints=$("$gk3" play "$location" --time "$time" 2>&1 >/dev/null); then
-      error "The game stopped at $location, $label:
-$(printf '%s\n' "$complaints" | tail -n 15)"
-    fi
+    while IFS=$'\t' read -r location name; do
+      args+=("$location|$name" "$name ($location)")
+    done < <(printf '%s\n' "$scenes" | awk -F'\t' '!seen[$3]++ { print $3 "\t" $4 }' |
+      sort -t$'\t' -k2,2 -f)
+    group=$(menu "Pick a place" "${args[@]}") || return
+    location=${group%%|*}
+    name=${group#*|}
+
+    while true; do
+      args=()
+      while IFS=$'\t' read -r time label; do
+        args+=("$time|$label" "$label")
+      done < <(printf '%s\n' "$scenes" | awk -F'\t' -v p="$location" '$3 == p { print $1 "\t" $2 }')
+      group=$(menu "$name: pick a time" "${args[@]}") || break
+      time=${group%%|*}
+      label=${group#*|}
+      play "$location" "$time" "$label"
+    done
   done
+}
+
+while true; do
+  how=$(menu "Jump by" time "By time of day" place "By place") || exit 0
+  case $how in
+    time) by_time ;;
+    place) by_place ;;
+  esac
 done

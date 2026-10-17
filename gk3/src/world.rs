@@ -87,6 +87,9 @@ pub struct Scene {
     /// Pieces of the room that are only there to be clicked (`type=hittest`).
     hit_tests: std::collections::HashSet<String>,
     floor: Option<String>,
+    /// The scene file's `custom=`, upper case: the kind of room the
+    /// original makes (0x51df4c), as `LANGOLIER` or `COORDINATEDEVICE`.
+    custom: Option<String>,
     cameras: HashMap<String, RoomCamera>,
     /// The player character's model name.
     pub ego: String,
@@ -322,6 +325,8 @@ pub struct World<'a> {
     map_follow: crate::map::Follow,
     map_leave: Option<(f64, String)>,
     pub binocs: Option<Binocs>,
+    /// Grace's GPS, in a `CoordinateDevice` room.
+    pub gps: Option<crate::gps::Gps>,
     /// Grace's computer, while it is up.
     pub sidney: Option<crate::sidney::Sidney>,
     /// A sound SIDNEY keeps playing (the anagram parser's scramble).
@@ -479,6 +484,7 @@ impl<'a> World<'a> {
             map_follow: crate::map::Follow::None,
             map_leave: None,
             binocs: None,
+            gps: None,
             sidney: None,
             sidney_loop: None,
             normal_verbs: lib
@@ -635,7 +641,13 @@ impl<'a> World<'a> {
             self.open_map(crate::map::Follow::None);
             return Ok(());
         }
+        let gps_on = self.state.flags.contains(&gk3_game::state::key("GPSOn"));
         self.enter(renderer, &location)?;
+        // A game saved with the GPS on has it up and on again (0x4701d2).
+        if gps_on && let Some(gps) = &mut self.gps {
+            gps.restore();
+            self.state.flags.insert(gk3_game::state::key("GPSOn"));
+        }
         if let Some(name) = swapped {
             self.set_scene(renderer, &name);
         }
@@ -693,6 +705,10 @@ impl<'a> World<'a> {
     /// visit, and runs its `SCENE ENTER` action.
     pub fn enter(&mut self, renderer: &Renderer, location: &str) -> Result<(), String> {
         let location = location.to_ascii_uppercase();
+        // The GPS is put away on leaving its room (0x46f391).
+        if self.gps.take().is_some_and(|mut g| g.leave()) {
+            self.state.flags.remove(&gk3_game::state::key("GPSOn"));
+        }
         // A script's SetLocation has already moved the ego; anything else
         // (the map, a new game) moves them now. Either way the room's file
         // is read as the story stands on arrival, as G-Engine reads it.
@@ -759,6 +775,14 @@ impl<'a> World<'a> {
                 .find_map(|l| l.get(key).map(str::to_string))
         };
         let floor = general("floor").map(|f| f.to_ascii_uppercase());
+        // Each section read sets it again, so the last one given holds
+        // (0x50fcbc).
+        let custom = sif
+            .sections("GENERAL")
+            .flat_map(|s| &s.lines)
+            .filter_map(|l| l.get("custom"))
+            .last()
+            .map(|c| c.trim().to_ascii_uppercase());
         // Every applicable section may add a bounds model.
         let bounds_models: Vec<gk3_formats::model::Model> = sif
             .sections("GENERAL")
@@ -885,6 +909,7 @@ impl<'a> World<'a> {
             object_verbs,
             hit_tests,
             floor,
+            custom,
             cameras,
             ego,
             camera_bounds,
@@ -932,6 +957,15 @@ impl<'a> World<'a> {
         self.bridge = None;
         self.demon_fight = false;
         self.last_trigger = None;
+        // A `CoordinateDevice` room has the GPS, off (0x46f37a).
+        if self.scene.as_ref().and_then(|s| s.custom.as_deref()) == Some("COORDINATEDEVICE") {
+            self.gps = self
+                .lib
+                .read("GPS.TXT")
+                .ok()
+                .and_then(|txt| crate::gps::Gps::new(&txt, &location));
+            self.state.flags.remove(&gk3_game::state::key("GPSOn"));
+        }
         self.timed_shows.clear();
         self.scene_function(renderer, "init");
         self.state.count_visit();
@@ -953,6 +987,36 @@ impl<'a> World<'a> {
         Ok(())
     }
 
+    /// Does what the GPS asks of the game.
+    fn gps_effects(&mut self, effects: Vec<crate::gps::Effect>) {
+        for effect in effects {
+            match effect {
+                crate::gps::Effect::Flag(flag, on) => {
+                    let flag = gk3_game::state::key(flag);
+                    if on {
+                        self.state.flags.insert(flag);
+                    } else {
+                        self.state.flags.remove(&flag);
+                    }
+                }
+                crate::gps::Effect::Script(text) => self.deferred.push(text),
+            }
+        }
+    }
+
+    /// The GPS's power button pressed (0x470167): it turns off, and Grace's
+    /// use of the device counts once, so the scripts take it as put away.
+    pub fn gps_power(&mut self) {
+        let no_turn_off = self.state.flags.contains(&gk3_game::state::key("NoGPSTurnOff"));
+        let now = self.clock;
+        if self.gps.as_mut().is_some_and(|g| g.press_power(now, no_turn_off)) {
+            self.log.push("  (the GPS's power is pressed)".into());
+            let ego = self.state.ego.clone();
+            self.state
+                .set_noun_verb(&ego, "GRACE", "COORDINATE_FIXING_DEVICE", 1);
+        }
+    }
+
     /// What can be done to a noun now.
     /// One of the engine's own functions for the room, by G-Engine's
     /// `SceneFunctions`: the church's angels, CS2's laser heads, and two of
@@ -961,6 +1025,23 @@ impl<'a> World<'a> {
     fn scene_function(&mut self, renderer: &Renderer, function: &str) -> Option<Option<Until>> {
         let location = self.state.location.to_ascii_uppercase();
         let f = function.to_ascii_lowercase();
+        // The GPS's room takes `On` and `Off` for the device (0x46f3c5),
+        // as any name starting so.
+        if let Some(gps) = &mut self.gps {
+            let now = self.clock;
+            let wait = if f.starts_with("on") {
+                let (wait, effects) = gps.turn_on(now);
+                self.gps_effects(effects);
+                Some(wait)
+            } else if f.starts_with("off") {
+                Some(gps.turn_off(now))
+            } else {
+                None
+            };
+            if let Some(wait) = wait {
+                return Some(wait.map(|w| Until::Time(now + w)));
+            }
+        }
         match (location.as_str(), f.as_str()) {
             ("CHU", _) => {
                 let ego = self.state.ego.clone();
@@ -1979,6 +2060,13 @@ impl<'a> World<'a> {
         // stands can go out and back, when that spot is closed off (such as
         // in front of an open wardrobe). A click this near is no walk at
         // all, as the original's (0x41d34a), and stops one under way.
+        // A `Langolier` room takes a click on its floor for itself: the
+        // player is told so, and does not walk (0x4c22bd).
+        if kind == EgoWalk::Click && scene.custom.as_deref() == Some("LANGOLIER") {
+            self.deferred
+                .push("wait CallSheep(\"glb_all\", \"FloorClick$\");".into());
+            return false;
+        }
         let near = if kind == EgoWalk::Click { CLICK_NEAR } else { AT_SPOT };
         if Vec3::new(goal.x - from.x, 0.0, goal.z - from.z).length() <= near {
             if kind == EgoWalk::Click {
@@ -3482,6 +3570,12 @@ impl<'a> World<'a> {
             self.change_location(renderer, &location);
         }
         self.keep_walkers_apart(now);
+        if self.gps.is_some() {
+            let on = self.state.flags.contains(&gk3_game::state::key("GPSOn"));
+            let at = self.ego_position().map(|(p, _)| (p.x, p.z));
+            let effects = self.gps.as_mut().map(|g| g.update(now, on, at)).unwrap_or_default();
+            self.gps_effects(effects);
+        }
         self.trip_triggers(renderer);
         if let Some(scene) = &mut self.scene {
             scene.cast.update(self.lib, now);

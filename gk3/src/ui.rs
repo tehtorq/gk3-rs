@@ -938,6 +938,73 @@ impl Ui {
         buttons
     }
 
+    /// Grace's GPS in the top left corner (`crate::gps`): its panel, power
+    /// button and, while on, the lines crossing where the player stands and
+    /// the latitude and longitude. Drawn at the size the original would
+    /// pick for a 4:3 screen as tall as the window, scaled to it. Returns
+    /// the panel's and the power button's places, for clicks.
+    pub fn gps(
+        &mut self,
+        lib: &Library,
+        renderer: &mut Renderer,
+        overlay: &mut Overlay,
+        gps: &crate::gps::Gps,
+        (pointer, held): ((f32, f32), bool),
+        size: (u32, u32),
+    ) -> Option<([f32; 4], [f32; 4])> {
+        if !gps.shown {
+            return None;
+        }
+        let layout = gps.config.layout(size.1).clone();
+        let cal = &gps.config.calibration;
+        let scale = size.1 as f32 / layout.screen_height as f32;
+        let at = |x: f32, y: f32, w: u32, h: u32| [x * scale, y * scale, w as f32 * scale, h as f32 * scale];
+        let (bx, by) = (layout.power_at.0 as f32, layout.power_at.1 as f32);
+        let button = self
+            .bitmap(lib, renderer, &layout.power_up)
+            .map_or([0.0; 4], |(_, w, h)| at(bx, by, w, h));
+        let font = layout.font.to_ascii_uppercase();
+        if gps.on
+            && !self.fonts.contains_key(&font)
+            && let Some(f) = load_font(lib, &font)
+        {
+            let texture = renderer.add_overlay_texture(&f.sheet);
+            self.fonts.insert(font.clone(), LoadedFont { font: f, texture });
+        }
+        let mut draw = |ui: &mut Self, name: &str, x: f32, y: f32| -> Option<[f32; 4]> {
+            let (tex, w, h) = ui.bitmap(lib, renderer, name)?;
+            let rect = at(x, y, w, h);
+            overlay.image(tex, [0.0, 0.0, w as f32, h as f32], rect, [255; 4]);
+            Some(rect)
+        };
+        let (px, py) = crate::gps::PANEL_AT;
+        let panel = draw(self, &format!("{}{}", cal.name, layout.ext), px, py)?;
+        let sprite = match (gps.on, inside(button, pointer), held) {
+            (false, _, _) => &layout.power_disabled,
+            (true, true, true) => &layout.power_down,
+            (true, true, false) => &layout.power_hover,
+            _ => &layout.power_up,
+        };
+        draw(self, sprite, bx, by);
+        if gps.on
+            && let Some(fix) = gps.fix
+        {
+            let (across, down) = crate::gps::cross(cal, layout.map_width, fix);
+            let (cx, cy) = layout.corner;
+            let half = layout.target_width / 2;
+            draw(self, &layout.v_line, (cx + across) as f32, cy as f32);
+            draw(self, &layout.h_line, cx as f32, (cy + down) as f32);
+            draw(self, &layout.target, (cx - half + across + 1) as f32, (cy - half + down) as f32);
+            let (lat, lng) = crate::gps::reading(cal, fix);
+            if self.fonts.contains_key(&font) {
+                let x = layout.text_x as f32 * scale;
+                self.text(overlay, &font, &lat, (x, layout.lat_y as f32 * scale), scale, [255; 4]);
+                self.text(overlay, &font, &lng, (x, layout.lng_y as f32 * scale), scale, [255; 4]);
+            }
+        }
+        Some((panel, button))
+    }
+
     /// The binoculars' frame and buttons over the view. `held` is whether
     /// the mouse button is down, so an arrow shows pressed. Returns the
     /// buttons' places for clicks.

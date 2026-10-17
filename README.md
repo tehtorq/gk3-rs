@@ -64,7 +64,9 @@ and click a verb icon; right-click or Esc closes the menu; while someone is
 speaking, a click or Space moves on to the next line. I, Tab or the button at
 the bottom left opens the inventory; click an item for INSPECT (close-up),
 its verbs, and PICKUP, which puts it in hand so it is offered as a verb on
-whatever you click next. Esc with nothing open quits.
+whatever you click next. Esc, as in the original, skips: what is playing is
+run on to its end (a conversation to the end of the topic), or with nothing
+playing, walks jump to where they were going. Ctrl+Q asks to quit.
 
 The camera moves as in the original: W/S or Up/Down go forward and back, A/D
 or Left/Right turn, Shift makes them pitch, Ctrl makes them rise, sink and

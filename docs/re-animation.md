@@ -48,3 +48,16 @@ walker's position and heading from the posed model, 0x41c0e8). So an
 actor posed by its `initAnim` stands where the pose puts them from the
 first frame, unless hidden; a hidden one's walker stays where it was
 made until it is shown.
+
+## Props in an actor's animation (0x420346)
+
+An animation's clips are written in one space for all the models it
+moves; a relative one (no placement on its `[ACTIONS]` line) does not
+place its models itself (a track sets its model's transform only when the
+line gives one, 0x54c4b0, 0x54c6b0). Starting an animation (0x4209ea →
+0x41fddc → 0x4201b9), once it plays, 0x420346 takes the transform of each
+actor it moves relatively, and gives every prop (a scene model of type 2)
+it moves relatively the last of them: Buthane's cigarette and smoke go
+with her (`MadSmokingStart` and the rest). With no such actor, the props
+are given the world's origin. A prop posed by an `initAnim` (0x50186f) does
+not go this way, and stays where it is.

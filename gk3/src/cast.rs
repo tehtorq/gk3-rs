@@ -124,6 +124,16 @@ struct Pause {
     started: f64,
 }
 
+/// The rest of a walk (`Cast::walk_left`).
+#[derive(Debug, Clone)]
+pub struct WalkLeft {
+    pub path: Vec<[f32; 2]>,
+    pub heading: Option<f32>,
+    pub tolerance: Tolerance,
+    /// The walker's size, which the original steps along the route by.
+    pub radius: f32,
+}
+
 /// What the world needs of each walker to keep them from walking into
 /// each other.
 #[derive(Debug, Clone)]
@@ -779,7 +789,12 @@ impl Cast {
             (None, Some(a)) => {
                 figure.world = placement::place(&figure.pose, &a.character, a.position, a.heading)
             }
-            (None, None) => {}
+            // A prop goes where the animation's actor is put.
+            (None, None) => {
+                if let Some(world) = how.reference {
+                    figure.world = world;
+                }
+            }
         }
         if how.scripted {
             figure.visible = true;
@@ -862,7 +877,20 @@ impl Cast {
             return (!anm.cues.is_empty() || !anm.sounds.is_empty() || !anm.faces.is_empty())
                 .then_some(seconds);
         };
-        for (index, (clips, placement)) in by_figure {
+        // The actors first: then a prop the animation moves relatively is
+        // put where its last relative actor is, as the original (0x420346),
+        // the clips all being written in one space (Buthane's cigarette in
+        // her hand); with no such actor, at the world's origin.
+        let mut entries: Vec<_> = by_figure.into_iter().collect();
+        entries.sort_by_key(|(i, _)| (self.figures[*i].actor.is_none(), *i));
+        let mut reference = None;
+        for (index, (clips, placement)) in entries {
+            if self.figures[index].actor.is_none() && reference.is_none() {
+                reference = Some(
+                    self.last_relative_actor(lib, anm)
+                        .map_or(Mat4::IDENTITY, |i| self.figures[i].world),
+                );
+            }
             let absolute = placement.map(absolute_transform);
             self.start(
                 index,
@@ -873,6 +901,7 @@ impl Cast {
                     looping,
                     scripted,
                     absolute,
+                    reference,
                     now,
                 },
             );
@@ -910,6 +939,7 @@ impl Cast {
                     looping: false,
                     scripted: true,
                     absolute,
+                    reference: None,
                     now,
                 },
             );
@@ -975,6 +1005,9 @@ impl Cast {
             (None, Some(a)) => {
                 figure.world = placement::place(&figure.pose, &a.character, a.position, a.heading)
             }
+            // A pose applied straight to a prop leaves it where it is: only
+            // an animation started on actors takes its props along
+            // (0x420346 is not on this way, 0x50186f).
             (None, None) => {}
         }
         sync_actor(figure);
@@ -1006,6 +1039,19 @@ impl Cast {
             .unwrap_or(0);
         let frames = anm.frames.max(longest).max(1);
         Some((by_figure, frames))
+    }
+
+    /// The last actor, in the animation's order, it moves relatively: whose
+    /// placement its relative props take (0x420346).
+    fn last_relative_actor(&mut self, lib: &Library, anm: &Animation) -> Option<usize> {
+        anm.actions.iter().rev().find_map(|action| {
+            if action.placement.is_some() {
+                return None;
+            }
+            let clip = self.clip(lib, &action.clip)?;
+            let i = self.find(&clip.model)?;
+            self.figures[i].actor.is_some().then_some(i)
+        })
     }
 
     /// Where an animation starts an actor: the floor point and heading of
@@ -2162,6 +2208,43 @@ impl Cast {
         }
     }
 
+    /// What is left of someone's walk, for skipping it: the original skips
+    /// a walk only while it sets off or strides (0x41d4f9: state below 3),
+    /// not once it is stopping. None if not walking so.
+    pub fn walk_left(&self, name: &str) -> Option<WalkLeft> {
+        let f = &self.figures[self.find(name)?];
+        let w = f.walk.as_ref()?;
+        if w.turning || w.path.is_empty() {
+            return None;
+        }
+        Some(WalkLeft {
+            path: w.path.clone(),
+            heading: w.heading,
+            tolerance: w.tolerance,
+            radius: f.radius,
+        })
+    }
+
+    /// Ends a walk at once, standing on a spot, as the original's skipped
+    /// walk arrives (0x418564): put there, in the stance, and free to idle
+    /// again as on arriving.
+    pub fn end_walk_at(&mut self, lib: &Library, name: &str, at: Vec3, heading: f32, now: f64) {
+        let Some(i) = self.find(name) else { return };
+        self.put(name, at, heading);
+        self.figures[i].playing = None;
+        self.stand_in_stance(lib, i);
+        self.figures[i].waiting_until = now;
+    }
+
+    /// The props shown now: models with no actor.
+    pub fn shown_props(&self) -> Vec<String> {
+        self.figures
+            .iter()
+            .filter(|f| f.actor.is_none() && f.visible)
+            .map(|f| f.name.clone())
+            .collect()
+    }
+
     pub fn is_walking(&self, name: &str) -> bool {
         self.find(name)
             .is_some_and(|i| self.figures[i].walk.is_some())
@@ -2722,6 +2805,8 @@ struct Start {
     looping: bool,
     scripted: bool,
     absolute: Option<Mat4>,
+    /// Where an actor in a relative animation was put, for its props.
+    reference: Option<Mat4>,
     now: f64,
 }
 

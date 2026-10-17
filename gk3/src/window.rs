@@ -1895,11 +1895,15 @@ impl ApplicationHandler for Game {
                             gfx.world.map_cancel();
                         } else if gfx.world.state.inventory_shown {
                             gfx.world.state.inventory_shown = false;
-                        } else if !gfx.world.idle() {
-                            gfx.world.skip();
                         } else {
-                            gfx.popup = Some(Popup::Quit);
+                            // As the original's Esc: skips what is playing,
+                            // or with nothing playing, the walks under way.
+                            gfx.world.skip_action(&gfx.renderer);
                         }
+                    }
+                    // Ctrl+Q asks to quit, as the original.
+                    PhysicalKey::Code(KeyCode::KeyQ) if gfx.controls.pan => {
+                        gfx.popup = Some(Popup::Quit);
                     }
                     // P stops the story until P again, as G-Engine.
                     PhysicalKey::Code(KeyCode::KeyP | KeyCode::Pause) => {

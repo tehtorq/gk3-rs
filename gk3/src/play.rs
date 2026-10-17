@@ -342,6 +342,11 @@ fn headless_run(lib: &Library, o: &Options) -> Result<ExitCode, String> {
             world.state.give_item(&ego, verb);
             continue;
         }
+        // `SKIP:ESC` is the player's Esc: skips what is playing, or walks.
+        if noun == "SKIP" {
+            world.skip_action(&renderer);
+            continue;
+        }
         // `GPS:POWER` presses the GPS's power button.
         if noun == "GPS" {
             world.gps_power();
@@ -813,6 +818,16 @@ fn headless_run(lib: &Library, o: &Options) -> Result<ExitCode, String> {
                 "  ({name} at {:.0},{:.0},{:.0}{facing}{walking}{hidden}{model}{lit})",
                 at[0], at[1], at[2]
             );
+        }
+    }
+    if o.where_actors
+        && let Some(scene) = &world.scene
+    {
+        // And the props shown, by the middle of each as drawn.
+        for name in scene.cast.shown_props() {
+            if let Some(c) = scene.cast.center(&name) {
+                println!("  (prop {name}; model centre {:.1},{:.1},{:.1})", c.x, c.y, c.z);
+            }
         }
     }
     if !world.idle()

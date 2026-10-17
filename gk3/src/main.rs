@@ -70,6 +70,7 @@ commands:
                         waiting for the walk;
                         --do GPS:POWER presses the GPS's power button.
                         --do GIVE:ITEM gives the ego an item.
+                        --do SKIP:ESC presses Esc (skips what is playing).
                         --do POINT:X,Y says what is under that pixel;
                         --do CALL:SCRIPT/FUNCTION runs a script function.
                         --title-screen draws the title screen; --movie NAME

@@ -40,6 +40,16 @@ pub struct Caption {
 }
 
 /// Something a waiting script is waiting for.
+/// What a skip runs on until (`World::skip_action`).
+#[derive(Debug, Clone)]
+enum SkipEnd {
+    /// The walk to an action: its approach (the original's action state 1,
+    /// whose skip ends on reaching state 2, 0x406c63).
+    Approach,
+    /// These actions' scripts (0x407317 ends the skip with the action).
+    Actions(Vec<ThreadId>),
+}
+
 enum Until {
     Time(f64),
     /// Until the full-screen movie is over.
@@ -276,6 +286,12 @@ pub struct World<'a> {
     /// original's walker keeps it (+0x374): a trigger trips on coming into
     /// it, not again until it has been left.
     last_trigger: Option<String>,
+    /// The player is skipping (the original's mode 2 on its stack, 0x4075f5):
+    /// until what was playing ends, every walk jumps to its end.
+    skip_lock: Option<SkipEnd>,
+    /// The story is being run on at speed for a skip: no speech or sound
+    /// effects start.
+    fast_forward: bool,
     next_location: Option<String>,
     /// A door's sound on going through it to another room (not in the
     /// original). The action under way is on a door; its change of room
@@ -460,6 +476,8 @@ impl<'a> World<'a> {
             restore: None,
             face_after: None,
             last_trigger: None,
+            skip_lock: None,
+            fast_forward: false,
             next_location: None,
             door_sounds: true,
             door_action: false,
@@ -630,6 +648,8 @@ impl<'a> World<'a> {
         self.end_conversation = false;
         self.approach = None;
         self.face_after = None;
+        self.skip_lock = None;
+        self.fast_forward = false;
         self.next_location = None;
         let last_location = state.last_location.clone();
         self.state = state;
@@ -3385,6 +3405,10 @@ impl<'a> World<'a> {
         if upper.contains("DOOR") && !upper.contains("LOCK") && !upper.contains("KNOCK") {
             self.door_heard = true;
         }
+        // Skipped through, nothing is heard but the music (0x4b18a5).
+        if self.fast_forward && bus != Bus::Music {
+            return None;
+        }
         match self.pcm(name) {
             Some(pcm) => Some(self.audio.play(pcm, gain, false, bus)),
             None => {
@@ -3416,6 +3440,9 @@ impl<'a> World<'a> {
         let upper = name.to_ascii_uppercase();
         if upper.contains("DOOR") && !upper.contains("LOCK") && !upper.contains("KNOCK") {
             self.door_heard = true;
+        }
+        if self.fast_forward && bus != Bus::Music {
+            return;
         }
         let Some(pcm) = self.pcm(name) else {
             self.log.push(format!("    (no sound {name})"));
@@ -3483,6 +3510,131 @@ impl<'a> World<'a> {
             scene.cast.cancel_faces(now, until);
         }
         self.advance_speeches();
+    }
+
+    /// The player's skip (Esc), as the original's. With the story playing
+    /// an action or walking to one (0x49dc78 → 0x49dd22): the player's walk
+    /// is skipped, then the story is run on ten seconds at a time, every
+    /// walk skipped each time and nothing heard but the music, until the
+    /// action ends (or, walking to one, until the walk does); a full-screen
+    /// movie stops the running on, and plays, though walks are skipped
+    /// until the end. With nothing playing (0x49d6c2), everyone's walk.
+    pub fn skip_action(&mut self, renderer: &Renderer) {
+        if self.skip_lock.is_some() {
+            return;
+        }
+        if self.idle() {
+            self.log.push("  (skips the walks)".into());
+            self.skip_walks(true);
+            return;
+        }
+        let end = if self.approach.is_some() {
+            SkipEnd::Approach
+        } else if !self.actions.is_empty() {
+            SkipEnd::Actions(self.actions.iter().map(|a| a.0).collect())
+        } else {
+            return;
+        };
+        self.log.push("  (skips what is playing)".into());
+        self.skip_walks(false);
+        self.skip_lock = Some(end);
+        self.fast_forward = true;
+        let mut steps = 0;
+        while self.skip_lock.is_some() && self.showing.is_none() && steps < SKIP_STEPS_MOST {
+            self.paused -= SKIP_STEP;
+            let outside = self.outside_clock;
+            self.update(renderer, outside);
+            steps += 1;
+        }
+        self.fast_forward = false;
+        // What was being said when the skip came is over.
+        self.audio.stop_bus(Bus::Dialogue);
+        self.scheduled.retain(|s| s.3 != Bus::Dialogue);
+    }
+
+    /// Whether the skip has run its course, and if so lets it go.
+    fn release_skip(&mut self) {
+        let done = match &self.skip_lock {
+            None => return,
+            Some(SkipEnd::Approach) => self.approach.is_none(),
+            Some(SkipEnd::Actions(ids)) => !self.actions.iter().any(|a| ids.contains(&a.0)),
+        };
+        if done {
+            self.skip_lock = None;
+        }
+    }
+
+    /// Skips walks under way, as the original's walker does on a skip
+    /// (0x41d4f9 → 0x418564 → 0x4e0e8f): each one setting off or striding
+    /// is put at the end of its route, facing as the walk asks, or along
+    /// its last leg. The player's own stops short at the first point (a
+    /// walker's width at a time along the route, from where they stand) in
+    /// a trigger not yet tripped, and walks on from there. Everyone in the
+    /// room's, or only the player's.
+    fn skip_walks(&mut self, everyone: bool) {
+        let Some(scene) = &self.scene else { return };
+        let ego = scene.ego.clone();
+        let names: Vec<String> = if everyone {
+            scene
+                .cast
+                .walkers()
+                .iter()
+                .map(|w| scene.cast.name_of(w.index))
+                .collect()
+        } else {
+            vec![ego.clone()]
+        };
+        let (lib, now) = (self.lib, self.clock);
+        for name in names {
+            let Some(scene) = &self.scene else { return };
+            let (Some(left), Some((from, _))) = (scene.cast.walk_left(&name), scene.cast.actor_position(&name))
+            else {
+                continue;
+            };
+            let mut stop = None;
+            if name.eq_ignore_ascii_case(&ego) {
+                let step = left.radius.max(1.0);
+                let mut at = from;
+                let mut gone = 0.0;
+                'route: for (leg, p) in left.path.iter().enumerate() {
+                    let to = Vec3::new(p[0], from.y, p[1]);
+                    let length = Vec3::new(to.x - at.x, 0.0, to.z - at.z).length();
+                    let mut s = gone;
+                    while s < length {
+                        let q = at.lerp(to, s / length.max(1e-4));
+                        if self.new_trigger_at(q) {
+                            stop = Some((q, leg, to - at));
+                            break 'route;
+                        }
+                        s += step;
+                    }
+                    gone = s - length;
+                    at = to;
+                }
+            }
+            let Some(scene) = &mut self.scene else { return };
+            match stop {
+                Some((q, leg, d)) => {
+                    scene.cast.put(&name, q, d.x.atan2(d.z));
+                    let rest = left.path[leg..].to_vec();
+                    scene.cast.walk_within(lib, &name, rest, left.heading, left.tolerance, now);
+                }
+                None => {
+                    let end = *left.path.last().unwrap();
+                    let before = left
+                        .path
+                        .len()
+                        .checked_sub(2)
+                        .map_or([from.x, from.z], |i| left.path[i]);
+                    let facing = left
+                        .heading
+                        .unwrap_or((end[0] - before[0]).atan2(end[1] - before[1]));
+                    scene
+                        .cast
+                        .end_walk_at(lib, &name, Vec3::new(end[0], from.y, end[1]), facing, now);
+                }
+            }
+        }
     }
 
     /// Moves the world on to `now`.
@@ -3584,6 +3736,11 @@ impl<'a> World<'a> {
         {
             self.map = None;
             self.change_location(renderer, &location);
+        }
+        // While a skip lasts, every walk jumps to its end (0x41838e →
+        // 0x41a55e → 0x41d4f9).
+        if self.skip_lock.is_some() {
+            self.skip_walks(true);
         }
         self.keep_walkers_apart(now);
         if self.gps.is_some() {
@@ -3839,6 +3996,7 @@ impl<'a> World<'a> {
         if self.actions.is_empty() {
             self.door_action = false;
         }
+        self.release_skip();
         self.place_sounds();
         // What the scripts set going this frame, or a new room's entry,
         // that is due at once (a texture set on an animation's first frame,
@@ -4967,6 +5125,11 @@ impl EgoWalk {
 }
 
 const CLICK_NEAR: f32 = 24.0;
+
+/// A skip runs the story on this many seconds at a time (0x49dcf1).
+const SKIP_STEP: f64 = 10.0;
+/// And gives up after this many steps, an hour of story.
+const SKIP_STEPS_MOST: u32 = 360;
 
 /// How near facing what an action approaches counts, as the original's
 /// walks of each kind (`docs/re-walking.md`): walking to see something

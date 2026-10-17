@@ -72,6 +72,20 @@ impl Pose {
         }
     }
 
+    /// Moves the whole pose by `m`, as if the model stood elsewhere: each
+    /// mesh's transform is taken through it.
+    pub fn transform_by(&mut self, m: Mat4) {
+        for mesh in &mut self.meshes {
+            let t = m * mesh.matrix();
+            mesh.transform = [
+                t.x_axis.truncate().to_array(),
+                t.y_axis.truncate().to_array(),
+                t.z_axis.truncate().to_array(),
+                t.w_axis.truncate().to_array(),
+            ];
+        }
+    }
+
     /// Mixes this pose back towards `from` by `weight` (0 leaves it, 1 is
     /// `from`): for easing from one pose into another. Meshes or submeshes
     /// that differ in shape are left as they are.

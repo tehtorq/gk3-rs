@@ -27,9 +27,8 @@ Read into the character's record, besides those we read already:
 | `StartTurnRightFrame` | 0xd8 | 0 |
 | `ClothesDefault` | string | "default" |
 
-Not yet used by us: `SoundMinDistance`, `SoundMaxDistance` (per-character
-sound falloff, likely for footsteps), `StartTurnRightFrame`,
-`ClothesDefault`.
+Not used by us: `SoundMinDistance`, `SoundMaxDistance` (no character
+sets them, and footsteps do not use them: see below), `ClothesDefault`.
 
 ## A walk request (save code 0x419929)
 
@@ -155,6 +154,50 @@ seeing the model, 2 on entering the region), not how it ends visually.
 0x41d34a): within 24 units, a walk that must be exact puts the walker on the
 spot and heading at once (0x41826b moves the models straight there); a
 click does nothing.
+
+## An action's approach (0x406d5a)
+
+A rule's `approach=` picks the walk made before its script runs, from the
+table at 0x6ee4d8: 1 `WalkTo`, 2 `WalkToAnim` (`Anim`), 3 `WalkNear`,
+4 `WalkNearModel` (`NearModel`), 5 `WalkToRegion` (`Region`), 6 `TurnTo`,
+7 `TurnToModel`, 8 `WalkToSee`, 9 `UserWalk`. In the action files:
+`WalkToSee` 2,120 rules, `WalkTo` 688, `Anim` 398, `TurnToModel` 397,
+none 105, `NearModel` 17, `Region` 1.
+
+- **`WalkToSee`** (0x41c595): the target is the middle of the model's
+  bounds, its reach half their diagonal (0x41c92c). Within reach there is
+  no walk; else a walk (arriving within 24, or the reach if more) that stops
+  once the model is in view (stop type 1). Either way it ends facing the
+  model's middle within 15° (`mUsePathEndAsDestHeading` 2: the heading is
+  set, on stopping, towards the model, 0x418860).
+- **`WalkNearModel`** (0x41c41d): towards the middle of the model's bounds,
+  arriving within its reach plus the given distance; it ends facing along
+  the route's end (`mUsePathEndAsDestHeading` 1: towards where it was
+  going) within 45°.
+- **`TurnToModel`** (0x41cbf8): a walk that does not move, its heading
+  towards the middle of the model's bounds, within 0.86°.
+- **`WalkNear`** (0x41c34d): to a named position, within the given
+  distance, at its heading within 45°. No action file uses it.
+
+The final turn of each is the walk's own (below): none if already facing
+within the tolerance, else at the walker's turning speed to within a
+quarter of it. The action's script runs once that is done.
+
+## Footsteps (0x40a23d)
+
+A `FOOTSTEP` cue (0x4a0d29) plays the walker's footstep through the sound
+system as a DirectSound 3D sound at the walker's position, at full volume,
+with a minimum distance of 60 and a maximum of 840 (0x6ec874, 0x6ec878:
+the same for everyone). DirectSound fades it as `min / (min + rolloff ×
+(distance − min))`, no further past the maximum; the sound system sets its
+listener's rolloff to 3 when it starts (0x5adae8, applied through
+0x5aef54) and its distance factor to 0.0254, a unit an inch (0x5aee30).
+The buffers are made to fall silent beyond their maximum
+(`DSBCAPS_MUTE3DATMAXDISTANCE`, 0x5b1985). So a footstep 200 units away
+is at an eighth of full volume, and one beyond 840 is not heard. How
+these are heard, and panned, is in `re-sound.md`. The characters' `SoundMinDistance` and
+`SoundMaxDistance` (read at 0x455028, default 10⁹ each, set by no
+character) are not used for footsteps.
 
 ## Setting off, and the final turn
 

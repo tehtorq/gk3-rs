@@ -137,15 +137,25 @@ Behaviour that is not yet the original's, with what is known.
 
 | What | The original | Ours | Status |
 |---|---|---|---|
-| Final heading after `WalkNear`, `WalkNearModel`, walks to see a thing | Tolerances of 45° or 15° *(traced)* | Turns exactly | To apply as the walks are matched |
 | Walkers' collisions switched off | During an interface mode, for every actor *(traced: 0x4403ac; the mode not identified)* | Always on | To identify the mode |
 | A click within 24 units while walking | Seems to stop the walk under way *(traced, unconfirmed)* | Ignored; the walk carries on | To confirm |
-| Footstep sound distances | Per character (`SoundMinDistance`, `SoundMaxDistance`) *(traced: keys read)* | One falloff for everyone | To trace and add |
 | Actors the scene gives no usable spot (`pos=` missing, or naming a position no scene file defines: 15 such names in the data) | Creating the actor, looks the name up and places the actor only if found *(traced: 0x502c9d)*; how the first animation then places them is not traced | Stand where their first animation puts the model, and are synced to it. A relative animation is played where its data has it, since some are authored where they play (Buthane at dinner at 306P, whose seat matches her absolute animation's at 207A). G-Engine instead substitutes another animation for Buthane | To trace the first animation's placement (the loader's deferred animation queue after 0x502e1e) |
-| `StartMorphAnimation(anim, 5, 3)` (4 uses, CS8202P) | Starts something on the animation before the script's own `StartAnimation` of it, apparently easing the pose in *(traced: 0x4aa4e4 checks the frame against the animation's length; the rest not)* | Ignored, as G-Engine: the animation starts with a snap | To trace |
 | A room's `custom=` mode (`Chess`, `Bridge`, `Laser` and others, 11 rooms) | Selects the room's puzzle code *(inferred: the names)* | Not read; each puzzle is chosen by its room | To trace |
 | Clicks on TE3's floor | Picking tests only visible room geometry, with hit-test areas made visible for it and `noClick` models hidden for it, then the nearer of that and any model *(traced: 0x52a0e2, 0x52b9ca, 0x564440, 0x565520)*. TE3's visible floor is `noClick`, its walk floor hidden, so a click meets the floor's unnamed rings | The same; a click on unnamed geometry that is not the walk floor does nothing | What the original does with such a click is not traced (the click handler is reached through virtual calls) |
 | The order TE5's stones glint in | Shuffled each round with the C library's `rand()` *(traced)*; how it was seeded is not | Shuffled each round from a sequence of our own | — |
+
+### Small differences in what is traced
+
+- **A morph's easing** (`StartMorphAnimation`): the original moves each
+  vertex in a straight line from where it was to the animation's frame;
+  ours mixes each mesh's placement and its vertices, which over the
+  quarter-second the game asks for looks the same. *(traced:
+  `re-animation.md`)*
+- **Sounds placed in the room** are heard as Wine's DirectSound hears the
+  original's 3D sounds (`re-sound.md`): its formulas for the fall-off and
+  the share between the speakers. Windows' own DirectSound, or a sound
+  card's, may place them differently. *(traced in the original; the
+  hearing is Wine's)*
 
 ## Followed from G-Engine, not yet checked
 

@@ -37,6 +37,9 @@ struct Voice {
     position: f64,
     step: f64,
     gain: f32,
+    /// Each output channel's share (left, right): 1 for both but for a
+    /// sound placed in the room.
+    pan: [f32; 2],
     looping: bool,
     bus: Bus,
     /// Held still and silent, as under a menu.
@@ -101,7 +104,7 @@ impl Mixer {
                 for (ch, slot) in frame.iter_mut().enumerate() {
                     let a = sample(i, ch);
                     let b = sample(j, ch);
-                    *slot += (a + (b - a) * t) * bus;
+                    *slot += (a + (b - a) * t) * bus * v.pan[ch];
                 }
                 v.position += v.step;
             }
@@ -181,12 +184,32 @@ impl Audio {
                 position: 0.0,
                 step,
                 gain,
+                pan: [1.0; 2],
                 looping,
                 bus,
                 held: false,
             });
         }
         SoundId(id)
+    }
+
+    /// A sound placed in the room, at a level and with each channel's
+    /// share (left, right) as it is heard from where the camera is.
+    pub fn play_placed(&self, pcm: Arc<Pcm>, gain: f32, pan: [f32; 2], looping: bool, bus: Bus) -> SoundId {
+        let sound = self.play(pcm, gain, looping, bus);
+        self.place(sound, gain, pan);
+        sound
+    }
+
+    /// How a playing sound is heard now: its level, and each channel's
+    /// share (left, right).
+    pub fn place(&self, sound: SoundId, gain: f32, pan: [f32; 2]) {
+        if let Some(mixer) = &self.mixer
+            && let Some(v) = mixer.lock().unwrap().voices.iter_mut().find(|v| v.id == sound.0)
+        {
+            v.gain = gain;
+            v.pan = pan;
+        }
     }
 
     pub fn stop(&self, sound: SoundId) {
@@ -413,6 +436,7 @@ mod tests {
             position: 0.0,
             step: 1.0,
             gain: 1.0,
+            pan: [1.0; 2],
             looping: false,
             bus: Bus::Effects,
             held: false,
@@ -433,6 +457,7 @@ mod tests {
             position: 0.0,
             step: 0.5,
             gain: 0.5,
+            pan: [1.0; 2],
             looping: true,
             bus: Bus::Music,
             held: false,

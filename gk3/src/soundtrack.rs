@@ -13,6 +13,21 @@ pub struct Clip {
     /// 0 to 1.
     pub volume: f32,
     pub looping: bool,
+    /// Heard from a place in the room (`3D`), not everywhere alike.
+    pub place: Option<ClipPlace>,
+}
+
+/// Where a soundtrack's sound is heard from, as the original reads it
+/// (0x51b52b): `X`, `Y`, `Z`, or the middle of the model `Follow` names
+/// while it plays (0x51b333), and how near it is heard in full (`MinDist`,
+/// 60 if not given) and how far before it is gone (`MaxDist`, a unit more
+/// than `MinDist` if not given; three times it if less).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClipPlace {
+    pub at: [f32; 3],
+    pub follow: Option<String>,
+    pub near: f32,
+    pub far: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -56,10 +71,22 @@ impl Soundtrack {
             let num = |key: &str| get(key).and_then(|v| v.trim().parse::<f64>().ok());
             let repeat = num("Repeat").map(|r| r as u32).filter(|&r| r > 0);
             let chance = num("Random").map_or(100, |r| r as u32);
+            let place = || {
+                num("3D").filter(|&v| v != 0.0)?;
+                let near = num("MinDist").unwrap_or(60.0) as f32;
+                let mut far = num("MaxDist").map_or(near + 1.0, |f| f as f32);
+                if far < near {
+                    far = near * 3.0;
+                }
+                let at = [num("X"), num("Y"), num("Z")].map(|v| v.unwrap_or(0.0) as f32);
+                let follow = get("Follow").map(str::trim).filter(|f| !f.is_empty()).map(str::to_string);
+                Some(ClipPlace { at, follow, near, far })
+            };
             let clip = || Clip {
                 name: get("Name").unwrap_or("").to_string(),
                 volume: (num("Volume").unwrap_or(100.0) / 100.0) as f32,
                 looping: num("Loop").is_some_and(|l| l != 0.0),
+                place: place(),
             };
             let name = section.name.to_ascii_uppercase();
             let is_prs = name == "PRS";
@@ -205,6 +232,33 @@ mod tests {
         // Round again: the once-only wait and theme are spent.
         let later = stk.update(10.0, &mut len);
         assert!(later.is_empty() || later[0].name == "Mood");
+    }
+
+    #[test]
+    fn three_d_sounds_are_placed_as_the_original_reads_them() {
+        let stk = Soundtrack::parse(
+            "T",
+            b"[SOUND]\nName=Fountain\n3D=1\nMinDist=100\nMaxDist=900\nX=10\nY=20\nZ=30\n\
+              [SOUND]\nName=Radio\n3D=1\nFollow=jea\n\
+              [SOUND]\nName=Odd\n3D=1\nMinDist=200\nMaxDist=50\n\
+              [SOUND]\nName=Flat\n",
+        );
+        let place = |i: usize| match &stk.steps[i].kind {
+            Kind::Sound(c) => c.place.clone(),
+            _ => None,
+        };
+        assert_eq!(
+            place(0),
+            Some(ClipPlace { at: [10.0, 20.0, 30.0], follow: None, near: 100.0, far: 900.0 })
+        );
+        // Unset: near 60, far a unit more.
+        assert_eq!(
+            place(1),
+            Some(ClipPlace { at: [0.0; 3], follow: Some("jea".into()), near: 60.0, far: 61.0 })
+        );
+        // Far less than near: three times near.
+        assert_eq!(place(2).map(|p| p.far), Some(600.0));
+        assert_eq!(place(3), None);
     }
 
     #[test]

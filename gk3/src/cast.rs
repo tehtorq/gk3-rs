@@ -233,6 +233,8 @@ struct Figure {
     /// A stopped fidget's tidying-up animations, each due when the last
     /// ends.
     cleanup: VecDeque<String>,
+    /// `StartMorphAnimation` under way: easing from a pose into another.
+    morph: Option<Morph>,
     /// Submeshes to repaint with another texture, by flat index and the
     /// texture's name.
     repaint: Vec<(usize, String)>,
@@ -645,6 +647,7 @@ impl Cast {
             world,
             gas,
             cleanup: VecDeque::new(),
+            morph: None,
             repaint: Vec::new(),
             hidden_parts: Default::default(),
             shadow: None,
@@ -726,9 +729,10 @@ impl Cast {
         // As G-Engine's `GKActor::StartAnimation`: a fidget never cuts into
         // what the story asked for, and the story's animations stop the
         // fidget (and any walk) until something starts it again.
-        if !how.scripted && figure.playing.as_ref().is_some_and(|p| !p.fidgeting) {
+        if !how.scripted && (figure.playing.as_ref().is_some_and(|p| !p.fidgeting) || figure.morph.is_some()) {
             return;
         }
+        figure.morph = None;
         if how.scripted {
             figure.gas = None;
             figure.fidget = None;
@@ -863,6 +867,60 @@ impl Cast {
             );
         }
         Some(frames as f32 / FRAMES_PER_SECOND)
+    }
+
+    /// `StartMorphAnimation(anim, start, frames)`, as the original's
+    /// (0x4aa4e4, 0x55acf0, 0x553700): what the animation moves is placed
+    /// where the animation puts it and eased, in a straight line, from
+    /// where it stood into the animation's frame `start`, over `frames`
+    /// less one of the animation's frames; it then holds there. Nothing if
+    /// `start` is past the animation's end or `frames` is not above 0.
+    /// Returns how long the easing takes, which the story waits for.
+    pub fn morph(&mut self, lib: &Library, anim: &str, start: u32, frames: u32, now: f64) -> f32 {
+        let Some(anm) = read_anm(lib, anim) else {
+            return 0.0;
+        };
+        let Some((by_figure, total)) = self.gather(lib, &anm) else {
+            return 0.0;
+        };
+        if start >= total || frames == 0 {
+            return 0.0;
+        }
+        let seconds = frames.saturating_sub(1) as f32 / FRAMES_PER_SECOND;
+        for (index, (clips, placement)) in by_figure {
+            let (from_pose, from_world) = (self.figures[index].pose.clone(), self.figures[index].world);
+            let absolute = placement.map(absolute_transform);
+            self.start(
+                index,
+                anim,
+                clips.clone(),
+                total,
+                Start {
+                    looping: false,
+                    scripted: true,
+                    absolute,
+                    now,
+                },
+            );
+            let f = &mut self.figures[index];
+            f.playing = None;
+            for (offset, clip) in &clips {
+                if start >= *offset {
+                    f.pose.apply(clip, (start - offset) as f32, false);
+                }
+            }
+            // Where it stood, as seen from where the animation puts it.
+            let mut from = from_pose;
+            from.transform_by(f.world.inverse() * from_world);
+            f.morph = Some(Morph {
+                from,
+                to: f.pose.clone(),
+                started: now,
+                seconds,
+            });
+            f.dirty = true;
+        }
+        seconds
     }
 
     /// Poses a figure on an animation's first frame, where it puts them, as
@@ -1408,17 +1466,6 @@ impl Cast {
         }
     }
 
-    /// Turns an actor on the spot.
-    pub fn turn(&mut self, name: &str, heading: f32) {
-        let Some(i) = self.find(name) else { return };
-        let f = &mut self.figures[i];
-        if let Some(a) = &mut f.actor {
-            a.heading = heading;
-            f.world = placement::place(&f.pose, &a.character, a.position, a.heading);
-            f.dirty = true;
-        }
-    }
-
     /// `SetWalkAnim`: someone walks with other animations from now on (a
     /// start and a cycle), as when Larry walks with a tray. False if there
     /// is no such actor.
@@ -1680,6 +1727,71 @@ impl Cast {
             walk.tolerance = tolerance;
         }
         started
+    }
+
+    /// Turns someone on the spot to face a heading, as the original's walks
+    /// that do not move (`TurnToModel`, a walk to see something already in
+    /// reach): a walk already at its end, turning to the heading at the
+    /// walker's turning speed, with the walk's own tolerance (0x4187fa):
+    /// none if already facing within `face` of it, else to within a
+    /// quarter of it. False if no turn is needed.
+    pub fn turn_on_spot(&mut self, name: &str, heading: f32, face: f32, now: f64) -> bool {
+        let Some(i) = self.find(name) else {
+            return false;
+        };
+        let f = &mut self.figures[i];
+        let Some(a) = &f.actor else {
+            return false;
+        };
+        if angle_between(a.heading, heading).abs() <= face {
+            return false;
+        }
+        let here = [a.position.x, a.position.z];
+        let ground = a.position.y;
+        f.playing = None;
+        f.gas = None;
+        f.fidget = None;
+        f.walk = Some(Walk {
+            path: Vec::new(),
+            clip: None,
+            started: now,
+            last: now,
+            speed: DEFAULT_WALK_SPEED,
+            heading: Some(heading),
+            stance: None,
+            opener: None,
+            turning_start: false,
+            turning: true,
+            fidget: false,
+            carried: false,
+            cycle: f.world,
+            cycle_started: now,
+            cycle_ground: ground,
+            opening: false,
+            goal: Some(here),
+            deadline: now + 10.0,
+            opening_steps: Vec::new(),
+            cycle_steps: Vec::new(),
+            clip_time: -1.0,
+            settle: None,
+            tolerance: Tolerance {
+                arrive: AT_END,
+                face: Some(face),
+            },
+            face_within: Some(if face > FINAL_TURN_SHARPEN_ABOVE { face * 0.25 } else { face }),
+            turned_right: false,
+            arrow_opener: Vec::new(),
+            arrow_cycle: Vec::new(),
+            arrow_standing: None,
+            builtin_turn: 0.0,
+            set_off_heading: heading,
+            steered: 0.0,
+            pause: None,
+            held_since: None,
+            ignore_others: false,
+            others: Vec::new(),
+        });
+        true
     }
 
     /// A walk a fidget script asked for: the script waits and goes on.
@@ -2052,6 +2164,20 @@ impl Cast {
                 continue;
             }
             let figure = &mut self.figures[i];
+            if let Some(m) = &figure.morph {
+                let t = if m.seconds > 0.0 {
+                    ((now - m.started) / m.seconds as f64).clamp(0.0, 1.0) as f32
+                } else {
+                    1.0
+                };
+                figure.pose = m.to.clone();
+                figure.pose.blend_from(&m.from, 1.0 - t);
+                figure.dirty = true;
+                if t >= 1.0 {
+                    figure.morph = None;
+                }
+                continue;
+            }
             if let Some(playing) = &figure.playing {
                 let mut t = ((now - playing.started) as f32) * FRAMES_PER_SECOND;
                 let finished = !playing.looping && t >= playing.frames as f32;
@@ -2534,6 +2660,13 @@ impl Cast {
             .collect();
         names.join(", ")
     }
+}
+
+struct Morph {
+    from: Pose,
+    to: Pose,
+    started: f64,
+    seconds: f32,
 }
 
 struct Start {

@@ -89,6 +89,54 @@ pub struct Sound {
     /// An audio asset, often with a dialogue code for its extension.
     pub name: String,
     pub volume: i32,
+    /// Where in the room it is heard from, for a sound placed there.
+    pub place: Option<SoundPlace>,
+}
+
+/// A sound heard from a place in the room, as the original reads a sound
+/// line (0x54c000): after the volume, a model's name or a position, then
+/// how near it is heard in full and how far before it is gone.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SoundPlace {
+    /// Heard from the middle of this model, as it stands when the sound
+    /// starts.
+    pub model: Option<String>,
+    /// From there (or the room's origin), this far: written x, z, y.
+    pub offset: [f32; 3],
+    pub near: f32,
+    pub far: f32,
+}
+
+/// What the original takes for a distance a sound line leaves out.
+pub const SOUND_DISTANCE_UNSET: f32 = 1.0e9;
+
+/// The rest of a sound line after its volume, as the original reads it
+/// (0x54c000): a field with a letter in it (but for an exponent's `e`) is a
+/// model; otherwise three numbers are a position. Either is followed by the
+/// near and far distances, each left at `SOUND_DISTANCE_UNSET` if missing
+/// or unreadable. Nothing more on the line: a sound not placed.
+fn sound_place(rest: &[&str]) -> Option<SoundPlace> {
+    let first = rest.first().filter(|f| !f.is_empty())?;
+    let distance = |i: usize| -> f32 {
+        rest.get(i).and_then(|v| v.parse().ok()).unwrap_or(SOUND_DISTANCE_UNSET)
+    };
+    let named = first.chars().any(|c| c.is_ascii_alphabetic() && !c.eq_ignore_ascii_case(&'e'));
+    if named {
+        return Some(SoundPlace {
+            model: Some(first.to_ascii_uppercase()),
+            offset: [0.0; 3],
+            near: distance(1),
+            far: distance(2),
+        });
+    }
+    let n = |i: usize| rest.get(i).and_then(|v| v.parse::<f32>().ok());
+    let (x, z, y) = (n(0)?, n(1)?, n(2)?);
+    Some(SoundPlace {
+        model: None,
+        offset: [x, y, z],
+        near: distance(3),
+        far: distance(4),
+    })
 }
 
 /// A line of dialogue shown on screen.
@@ -150,6 +198,7 @@ impl Animation {
                     frame,
                     name: name.to_string(),
                     volume: rest.first().and_then(|v| v.parse().ok()).unwrap_or(100),
+                    place: sound_place(rest.get(1..).unwrap_or(&[])),
                 });
             }
         }
@@ -380,6 +429,34 @@ impl Animation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sound_lines_place_their_sounds_as_the_original_reads_them() {
+        let anm = Animation::parse(
+            b"[HEADER]\r\n40\r\n[SOUNDS]\r\n5\r\n\
+              10,ChrSqk04.wav,100,ABE,50,300  //Abbe shifts\r\n\
+              7,DoorOpen.wav,100,EASTDOOR\r\n\
+              1,CS2StrMove1.wav,100,10,0,15,100,1000\r\n\
+              15,GraGrunt3.wav,100,gra,grashov2,100,650\r\n\
+              3,Plain.wav,80\r\n",
+        );
+        let place = |i: usize| anm.sounds[i].place.clone();
+        assert_eq!(
+            place(0),
+            Some(SoundPlace { model: Some("ABE".into()), offset: [0.0; 3], near: 50.0, far: 300.0 })
+        );
+        // A model alone: never faded, but still heard from it.
+        assert_eq!(place(1).unwrap().near, SOUND_DISTANCE_UNSET);
+        // A position, written x, z, y.
+        assert_eq!(
+            place(2),
+            Some(SoundPlace { model: None, offset: [10.0, 15.0, 0.0], near: 100.0, far: 1000.0 })
+        );
+        // What cannot be read as a distance is left unset.
+        assert_eq!(place(3).unwrap().near, SOUND_DISTANCE_UNSET);
+        assert_eq!(place(4), None);
+        assert_eq!(anm.sounds[4].volume, 80);
+    }
 
     #[test]
     fn visibility_of_models_and_parts() {

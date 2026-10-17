@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use gk3_audio::{Audio, Bus};
 use gk3_barn::Library;
-use gk3_formats::anm::{Animation, CueKind};
+use gk3_formats::anm::{Animation, CueKind, SoundPlace};
 use gk3_formats::bsp::Bsp;
 use gk3_formats::image;
 use gk3_game::actions::{self, ActionSet, Rule};
@@ -255,8 +255,9 @@ pub struct World<'a> {
     /// From a loaded game: where the player stood and the camera looked,
     /// put back once the room's entry has played.
     restore: Option<Restore>,
-    /// Something to turn to face when an approach walk ends.
-    face_after: Option<String>,
+    /// Something to turn to face when an approach walk ends, and within
+    /// what of it (radians).
+    face_after: Option<(String, f32)>,
     next_location: Option<String>,
     /// A door's sound on going through it to another room (not in the
     /// original). The action under way is on a door; its change of room
@@ -325,7 +326,9 @@ pub struct World<'a> {
     yaks: HashMap<String, Option<Animation>>,
     pub audio: Audio,
     /// Sounds due to start, by time.
-    scheduled: Vec<(f64, String, f32, Bus)>,
+    scheduled: Vec<(f64, String, f32, Bus, Option<SoundPlace>)>,
+    /// Sounds playing from places in the room, heard from the camera.
+    placed: Vec<Placed>,
     /// Lines and camera cuts animations have set off, by time.
     cues: Vec<(f64, CueKind)>,
     /// Each actor's mood, by noun: the animation that ends it.
@@ -468,6 +471,7 @@ impl<'a> World<'a> {
             yaks: HashMap::new(),
             audio,
             scheduled: Vec::new(),
+            placed: Vec::new(),
             cues: Vec::new(),
             moods: HashMap::new(),
             angels: Default::default(),
@@ -1614,19 +1618,13 @@ impl<'a> World<'a> {
             // view.
             "walktosee" => match self.walk_to_see(&target) {
                 Some(goal) => Some((goal, None)),
-                None => {
-                    // Turning only if it is well off to the side.
-                    if !self.facing(&target, 0.8) {
-                        self.face(&target);
-                    }
-                    None
-                }
+                // Already in sight: as the original's walk to see that
+                // does not move (0x41c595), only its end, turning to face
+                // the thing within 15 degrees.
+                None => return self.turn_then(renderer, rule, &target, FACE_TO_SEE),
             },
             "nearmodel" => self.standing_spot(&target).map(|p| (p, None)),
-            "turntomodel" => {
-                self.face(&target);
-                None
-            }
+            "turntomodel" => return self.turn_then(renderer, rule, &target, FACE_TURN_TO_MODEL),
             // Into the first pose of the animation the action plays.
             "anim" => scene
                 .cast
@@ -1652,8 +1650,10 @@ impl<'a> World<'a> {
                 goal.x, goal.y, goal.z
             ));
             if heading.is_none() && approach != "walkto" {
-                // Face what was approached on arrival.
-                self.face_after = Some(target);
+                // Face what was approached on arrival, as near as the
+                // original's walk of that kind turns (0x418860).
+                let within = if approach == "nearmodel" { FACE_NEAR_MODEL } else { FACE_TO_SEE };
+                self.face_after = Some((target, within));
             }
             self.approach = Some(Approach { rule, actor: ego });
             self.topic_bar = None;
@@ -1823,35 +1823,35 @@ impl<'a> World<'a> {
         Some(Vec3::new(x, from.y, z))
     }
 
-    /// Whether the player faces something nearly enough: the cosine of the
-    /// angle off their heading is at least `cos`.
-    fn facing(&self, target: &str, cos: f32) -> bool {
-        let Some(scene) = &self.scene else {
-            return false;
-        };
+    /// Turns the player on the spot to face something (the middle of its
+    /// bounds), as the original's walks that end facing a model: no turn if
+    /// already within `within`, else at turning speed to within a quarter
+    /// of it. True if a turn has begun.
+    fn face_within(&mut self, target: &str, within: f32) -> bool {
+        let Some(scene) = &mut self.scene else { return false };
         let center = scene
             .cast
             .center(target)
             .or_else(|| bsp_center(&scene.room.bsp, target));
-        let (Some(c), Some((p, heading))) = (center, scene.cast.actor_position(&scene.ego))
-        else {
+        let (Some(c), Some((p, _))) = (center, scene.cast.actor_position(&scene.ego)) else {
             return false;
         };
-        let to = Vec3::new(c.x - p.x, 0.0, c.z - p.z).normalize_or_zero();
-        to.dot(Vec3::new(heading.sin(), 0.0, heading.cos())) >= cos
+        let heading = (c.x - p.x).atan2(c.z - p.z);
+        let ego = scene.ego.clone();
+        scene.cast.turn_on_spot(&ego, heading, within, self.clock)
     }
 
-    fn face(&mut self, target: &str) {
-        let Some(scene) = &mut self.scene else { return };
-        let center = scene
-            .cast
-            .center(target)
-            .or_else(|| bsp_center(&scene.room.bsp, target));
-        if let (Some(c), Some((p, _))) = (center, scene.cast.actor_position(&scene.ego)) {
-            let heading = (c.x - p.x).atan2(c.z - p.z);
-            let ego = scene.ego.clone();
-            scene.cast.turn(&ego, heading);
+    /// An action whose approach is a turn on the spot: it runs once the
+    /// player has turned, or at once if no turn is needed.
+    fn turn_then(&mut self, renderer: &Renderer, rule: Rule, target: &str, within: f32) {
+        if self.face_within(target, within) {
+            let ego = self.scene.as_ref().map(|s| s.ego.clone()).unwrap_or_default();
+            self.log.push(format!("  (turns to face {target})"));
+            self.approach = Some(Approach { rule, actor: ego });
+            self.topic_bar = None;
+            return;
         }
+        self.run(renderer, rule, true);
     }
 
     /// Where the player stands and faces.
@@ -2487,7 +2487,7 @@ impl<'a> World<'a> {
                 None
             }
             "PLAYSOUND" => {
-                self.scheduled.push((now, e.string(0), 1.0, Bus::Effects));
+                self.scheduled.push((now, e.string(0), 1.0, Bus::Effects, None));
                 None
             }
             // The scripts' cutscenes. The `X` form's number is G-Engine's
@@ -2556,7 +2556,18 @@ impl<'a> World<'a> {
                 None
             }
             // A morph between two animations does nothing in G-Engine.
-            "STARTMORPHANIMATION" | "STOPMORPHANIMATION" => None,
+            "STARTMORPHANIMATION" => {
+                let lib = self.lib;
+                let seconds = scene.cast.morph(
+                    lib,
+                    &e.string(0),
+                    e.int(1).max(0) as u32,
+                    e.int(2).max(0) as u32,
+                    now,
+                );
+                Some(Until::Time(now + seconds as f64))
+            }
+            "STOPMORPHANIMATION" => None,
             // Which kind a camera angle is: a "Room" angle is one the player
             // may choose from the option bar; any other kind ("Cinematic")
             // is not (0x4ab8bf sets the angle's kind).
@@ -2880,11 +2891,7 @@ impl<'a> World<'a> {
         }
         let pick = (self.clock * 1000.0) as usize % sounds.len();
         let name = sounds[pick].clone();
-        let distance = (self.camera.position - at).length();
-        let gain = 1.0 - ((distance - 60.0) / (800.0 - 60.0)).clamp(0.0, 1.0);
-        if gain > 0.0 {
-            self.sound(&name, gain, Bus::Effects);
-        }
+        self.sound_at(&name, 1.0, Bus::Effects, at, FOOTSTEP_NEAR, FOOTSTEP_FAR);
     }
 
     /// The texture of the floor under a point: the room's floor object's
@@ -2924,6 +2931,7 @@ impl<'a> World<'a> {
                 sound.name.clone(),
                 sound.volume as f32 / 100.0,
                 Bus::Effects,
+                sound.place.clone(),
             ));
         }
         for cue in &anm.cues {
@@ -3071,6 +3079,7 @@ impl<'a> World<'a> {
                     s.name.clone(),
                     s.volume as f32 / 100.0,
                     Bus::Dialogue,
+                    s.place.clone(),
                 )
             })
             .collect();
@@ -3119,6 +3128,69 @@ impl<'a> World<'a> {
                 None
             }
         }
+    }
+
+    /// The middle of a model (or an object of the room) as it now stands.
+    fn model_center(&self, model: &str) -> Option<Vec3> {
+        let scene = self.scene.as_ref()?;
+        scene.cast.center(model).or_else(|| bsp_center(&scene.room.bsp, model))
+    }
+
+    /// A sound an animation places in the room (`SoundPlace`): heard from
+    /// the middle of its model as the model now stands, or from its own
+    /// position, as the original places it as it starts (0x54c2b0).
+    fn sound_from(&mut self, name: &str, gain: f32, bus: Bus, place: &SoundPlace) {
+        let base = place.model.as_deref().and_then(|m| self.model_center(m)).unwrap_or(Vec3::ZERO);
+        let at = base + Vec3::from(place.offset);
+        self.sound_at(name, gain, bus, at, place.near, place.far);
+    }
+
+    /// A sound heard from a point in the room, as DirectSound plays the
+    /// original's 3D sounds: fading and panned as the camera hears it, and
+    /// followed as the camera moves (`place_sounds`).
+    fn sound_at(&mut self, name: &str, gain: f32, bus: Bus, at: Vec3, near: f32, far: f32) {
+        let upper = name.to_ascii_uppercase();
+        if upper.contains("DOOR") && !upper.contains("LOCK") && !upper.contains("KNOCK") {
+            self.door_heard = true;
+        }
+        let Some(pcm) = self.pcm(name) else {
+            self.log.push(format!("    (no sound {name})"));
+            return;
+        };
+        let (level, pan) = heard(&self.camera, at, near, far);
+        let sound = self.audio.play_placed(pcm, gain * level, pan, false, bus);
+        self.placed.push(Placed {
+            sound,
+            at,
+            follow: None,
+            near,
+            far,
+            gain,
+        });
+    }
+
+    /// Each sound placed in the room, heard again from where the camera now
+    /// is, as the original's listener follows its camera (0x44b55a).
+    fn place_sounds(&mut self) {
+        let moved: Vec<Option<Vec3>> = self
+            .placed
+            .iter()
+            .map(|p| p.follow.as_deref().and_then(|m| self.model_center(m)))
+            .collect();
+        for (p, at) in self.placed.iter_mut().zip(moved) {
+            if let Some(at) = at {
+                p.at = at;
+            }
+        }
+        let (audio, camera) = (&self.audio, self.camera);
+        self.placed.retain(|p| {
+            if !audio.is_playing(p.sound) {
+                return false;
+            }
+            let (level, pan) = heard(&camera, p.at, p.near, p.far);
+            audio.place(p.sound, p.gain * level, pan);
+            true
+        });
     }
 
     /// Hurries through what is being said: the current lines end now.
@@ -3272,8 +3344,13 @@ impl<'a> World<'a> {
             .cloned()
             .collect();
         self.scheduled.retain(|s| s.0 > now);
-        for (_, name, gain, bus) in due {
-            self.sound(&name, gain, bus);
+        for (_, name, gain, bus, place) in due {
+            match place {
+                Some(place) => self.sound_from(&name, gain, bus, &place),
+                None => {
+                    self.sound(&name, gain, bus);
+                }
+            }
         }
         let steps = self
             .scene
@@ -3348,10 +3425,31 @@ impl<'a> World<'a> {
                 |clip: &crate::soundtrack::Clip| self.pcm(&clip.name).map(|p| p.seconds());
             let clips = track.update(now, &mut length);
             for clip in clips {
-                if let Some(pcm) = self.pcm(&clip.name) {
-                    let id = self.audio.play(pcm, clip.volume, clip.looping, bus);
-                    self.soundtrack_sounds.push((track.name.clone(), id));
-                }
+                let Some(pcm) = self.pcm(&clip.name) else { continue };
+                let id = match &clip.place {
+                    // Heard from its place (0x51b12a), and following its
+                    // model while it plays (0x51b333).
+                    Some(place) => {
+                        let follow = place.follow.clone().filter(|m| self.model_center(m).is_some());
+                        let at = follow
+                            .as_deref()
+                            .and_then(|m| self.model_center(m))
+                            .unwrap_or(Vec3::from(place.at));
+                        let (level, pan) = heard(&self.camera, at, place.near, place.far);
+                        let id = self.audio.play_placed(pcm, clip.volume * level, pan, clip.looping, bus);
+                        self.placed.push(Placed {
+                            sound: id,
+                            at,
+                            follow,
+                            near: place.near,
+                            far: place.far,
+                            gain: clip.volume,
+                        });
+                        id
+                    }
+                    None => self.audio.play(pcm, clip.volume, clip.looping, bus),
+                };
+                self.soundtrack_sounds.push((track.name.clone(), id));
             }
         }
         self.soundtracks = soundtracks;
@@ -3382,11 +3480,16 @@ impl<'a> World<'a> {
                 .as_ref()
                 .is_some_and(|s| s.cast.is_walking(&approach.actor))
         {
-            let approach = self.approach.take().unwrap();
-            if let Some(target) = self.face_after.take() {
-                self.face(&target);
+            // Turning to face what was approached is the end of the walk:
+            // the action waits for it.
+            let turning = self
+                .face_after
+                .take()
+                .is_some_and(|(target, within)| self.face_within(&target, within));
+            if !turning {
+                let approach = self.approach.take().unwrap();
+                self.run(renderer, approach.rule, true);
             }
-            self.run(renderer, approach.rule, true);
         }
 
         // Release scripts whose waits are over.
@@ -3439,12 +3542,13 @@ impl<'a> World<'a> {
             // Shut behind them, once in.
             if door && self.scene.is_some() {
                 self.scheduled
-                    .push((self.clock + DOOR_SHUT_AFTER, "DOORCLOSE".into(), 1.0, Bus::Effects));
+                    .push((self.clock + DOOR_SHUT_AFTER, "DOORCLOSE".into(), 1.0, Bus::Effects, None));
             }
         }
         if self.actions.is_empty() {
             self.door_action = false;
         }
+        self.place_sounds();
         // What the scripts set going this frame, or a new room's entry,
         // that is due at once (a texture set on an animation's first frame,
         // as R25's view out of the window) is in place before it is drawn.
@@ -4566,6 +4670,86 @@ impl EgoWalk {
 
 const CLICK_NEAR: f32 = 24.0;
 
+/// How near facing what an action approaches counts, as the original's
+/// walks of each kind (`docs/re-walking.md`): walking to see something
+/// (0x41c595), near a model (0x41c41d), turning to one (0x41cbf8).
+const FACE_TO_SEE: f32 = 0.261_799_4;
+const FACE_NEAR_MODEL: f32 = std::f32::consts::FRAC_PI_4;
+const FACE_TURN_TO_MODEL: f32 = 0.015;
+
+/// A footstep is a sound at the walker, as near as `FOOTSTEP_NEAR` heard
+/// in full and fading no further past `FOOTSTEP_FAR` (0x40a23d: 60 and
+/// 840, the same for everyone; the characters' `SoundMinDistance` and
+/// `SoundMaxDistance` are read but not used for them).
+const FOOTSTEP_NEAR: f32 = 60.0;
+const FOOTSTEP_FAR: f32 = 840.0;
+
+/// The original's rolloff for every sound placed in the room, set as its
+/// sound system starts (0x5adae8) and handed to DirectSound's listener.
+const SOUND_ROLLOFF: f32 = 3.0;
+
+/// A sound placed in the room and playing.
+struct Placed {
+    sound: gk3_audio::SoundId,
+    at: Vec3,
+    /// A model it moves with, as a soundtrack's `Follow`.
+    follow: Option<String>,
+    near: f32,
+    far: f32,
+    gain: f32,
+}
+
+/// How a sound at `at` is heard from the camera: its level and each
+/// channel's share (left, right). As DirectSound plays the original's 3D
+/// sounds, here as Wine does (`dlls/dsound/sound3d.c`, `DSOUND_Calc3DBuffer`):
+/// the original makes them muted beyond their far distance
+/// (`DSBCAPS_MUTE3DATMAXDISTANCE`, 0x5b1985), near and far each between 1
+/// and 10^9 (0x5b1828); within the near distance in full; beyond it, the
+/// distance past it times the rolloff, the level falling by
+/// `20 log10(d / near)` decibels. The camera's left is its forward crossed
+/// with its up, as DirectSound's; the angle from it (negated behind the
+/// camera, less a right angle) is shared between the left speaker at -90
+/// degrees and the right at +90, by the square roots of how far between.
+fn heard(camera: &gk3_render::Camera, at: Vec3, near: f32, far: f32) -> (f32, [f32; 2]) {
+    use std::f32::consts::{FRAC_PI_2, PI, TAU};
+    let near = near.clamp(1.0, 1.0e9);
+    let far = far.clamp(1.0, 1.0e9);
+    let to = at - camera.position;
+    let distance = to.length();
+    if distance > far {
+        return (0.0, [0.0; 2]);
+    }
+    let d = near + (distance.max(near) - near) * SOUND_ROLLOFF;
+    let millibels = -1000.0 * ((d / near) * (d / near)).log10();
+    let level = 2f32.powf(millibels / 600.0);
+    let front = camera.forward();
+    let top = camera.rotation() * Vec3::Y;
+    let left = front.cross(top);
+    let angle = if to.length_squared() == 0.0 {
+        0.0
+    } else {
+        let mut a = left.angle_between(to);
+        if front.angle_between(to) > FRAC_PI_2 {
+            a = -a;
+        }
+        a -= FRAC_PI_2;
+        if a < -PI {
+            a += TAU;
+        }
+        a
+    };
+    let pan = if (-FRAC_PI_2..=FRAC_PI_2).contains(&angle) {
+        let a = (angle + FRAC_PI_2) / PI;
+        [(1.0 - a).sqrt(), a.sqrt()]
+    } else {
+        // Round the back, from the right speaker to the left.
+        let t = if angle < -FRAC_PI_2 { angle + TAU } else { angle };
+        let a = ((t - FRAC_PI_2) / PI).clamp(0.0, 1.0);
+        [a.sqrt(), (1.0 - a).sqrt()]
+    };
+    (level, pan)
+}
+
 /// How long after a door opens it shuts, in the new room.
 const DOOR_SHUT_AFTER: f64 = 0.7;
 
@@ -4738,6 +4922,34 @@ impl crate::mechanism::Room for World<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placed_sounds_are_heard_as_directsound_hears_them() {
+        // A camera at the origin looking along +Z (its right is +X).
+        let camera = gk3_render::Camera {
+            position: Vec3::ZERO,
+            yaw: 0.0,
+            pitch: 0.0,
+            fov_y: 1.0,
+        };
+        let level = |at: Vec3| heard(&camera, at, FOOTSTEP_NEAR, FOOTSTEP_FAR).0;
+        let pan = |at: Vec3| heard(&camera, at, FOOTSTEP_NEAR, FOOTSTEP_FAR).1;
+        // In full within the near distance; about an eighth at 200 (a
+        // rolloff of 3); muted past the far distance.
+        assert_eq!(level(Vec3::new(0.0, 0.0, 50.0)), 1.0);
+        assert!((level(Vec3::new(0.0, 0.0, 200.0)) - 0.125).abs() < 0.002);
+        assert_eq!(level(Vec3::new(0.0, 0.0, 841.0)), 0.0);
+        // Ahead: shared equally; to the right: all right; to the left: all
+        // left; behind and to the left: mostly left.
+        let ahead = pan(Vec3::new(0.0, 0.0, 100.0));
+        assert!((ahead[0] - ahead[1]).abs() < 1e-5 && (ahead[0] - 0.5f32.sqrt()).abs() < 1e-5);
+        let right = pan(Vec3::new(100.0, 0.0, 0.0));
+        assert!(right[0] < 1e-3 && (right[1] - 1.0).abs() < 1e-5);
+        let left = pan(Vec3::new(-100.0, 0.0, 0.0));
+        assert!((left[0] - 1.0).abs() < 1e-5 && left[1] < 1e-3);
+        let behind_left = pan(Vec3::new(-100.0, 0.0, -100.0));
+        assert!(behind_left[0] > behind_left[1]);
+    }
 
     #[test]
     fn trigger_rects_read_as_the_original_reads_them() {

@@ -476,14 +476,16 @@ impl Cast {
                         .push(format!("{name}: no entry in CHARACTERS.TXT"));
                     continue;
                 };
-                // Somebody with no spot is placed by the story when it wants
-                // them; until then they are not seen.
+                // Somebody with no spot, or one the scene never defines, is
+                // left where their walker was made (0x502c9d).
                 if spot.is_none()
                     && let Some(p) = line.get("pos")
                 {
                     cast.warnings.push(format!("{name}: no position {p} in the scene"));
                 }
-                let (position, heading) = spot.unwrap_or((Vec3::ZERO, 0.0));
+                // Unplaced, a walker stands where it was made: the origin,
+                // facing 180 degrees (0x416873).
+                let (position, heading) = spot.unwrap_or((Vec3::ZERO, 180.0));
                 let placement = ActorPlacement {
                     character,
                     position,
@@ -540,9 +542,14 @@ impl Cast {
                     // them, wherever they stand; their idle often places them.
                     figure.visible = !hidden(line);
                     cast.figures.push(figure);
-                    if let Some(anim) = line.get("initanim") {
-                        let i = cast.figures.len() - 1;
-                        cast.sample(lib, i, anim);
+                    // As the scene starts (0x500a77 → 0x501920): posed in
+                    // the first frame of their `initAnim`, where it puts
+                    // them (0x50186f); else standing where they are, in
+                    // their walk's stance.
+                    let i = cast.figures.len() - 1;
+                    match line.get("initanim") {
+                        Some(anim) => cast.sample(lib, i, anim),
+                        None => cast.stand_in_stance(lib, i),
                     }
                 }
             }
@@ -1079,6 +1086,15 @@ impl Cast {
         let Some(i) = self.find(name) else {
             return false;
         };
+        self.figures[i].playing = None;
+        self.stand_in_stance(lib, i);
+        true
+    }
+
+    /// Stands an actor where they are in the first frame of their walk's
+    /// start, as the original poses one by starting that animation and
+    /// stopping it at once (0x41d50a).
+    fn stand_in_stance(&mut self, lib: &Library, i: usize) {
         let model = self.figures[i].name.clone();
         let stance = self.figures[i]
             .actor
@@ -1087,13 +1103,11 @@ impl Cast {
             .and_then(|anim| self.clips_for(lib, &anim, &model).into_iter().next())
             .map(|(_, c)| c);
         let f = &mut self.figures[i];
-        f.playing = None;
         if let (Some(clip), Some(a)) = (stance, &f.actor) {
             f.pose.apply(&clip, 0.0, false);
             f.world = placement::place(&f.pose, &a.character, a.position, a.heading);
             f.dirty = true;
         }
-        true
     }
 
     /// Paints one group of one mesh of a model with another texture, as an

@@ -23,3 +23,28 @@ The game's only uses are four in CS8 at 202P, each
 first frame of `GabCseLookDown` (which then holds) or of `GabCs8AhNo`
 (which the script then plays). `StopMorphAnimation` and
 `StopAllMorphAnimations` are used by no script.
+
+## Actors and props at the start of a scene
+
+Creating an actor from a scene file's `[ACTORS]` line (0x502c9d), its
+walker is placed at its `pos=` if the scene defines that position;
+otherwise it stays where the walker was made: the origin, facing 180
+degrees (0x416873). The actor's model is built from the same model
+definition a prop has (0x50db23 → 0x4d6810), which keeps the `initAnim`
+(+0x20 on the model).
+
+As the scene starts (0x500a77), each model, then each actor (0x501920),
+is posed (0x50186f): with an `initAnim`, that animation is loaded, its
+first frame applied to the model (0x54d880 → 0x549630: each mesh as the
+animation has it), and let go again (0x54d930). It does not play, and the
+walker is not moved. An actor without one (+0xa4 still 3, from setup at
+0x409467) has its walk's start animation started and stopped at once
+(0x41d50a → 0x417774): it stands at its walker in that animation's first
+frame. Then its idle fidget is started (0x40a3db, 0x40a1b5).
+
+A walker that is not walking (state 5) follows its model every frame
+while the model is visible (0x41838e: 0x4d6d81, then 0x417e56 takes the
+walker's position and heading from the posed model, 0x41c0e8). So an
+actor posed by its `initAnim` stands where the pose puts them from the
+first frame, unless hidden; a hidden one's walker stays where it was
+made until it is shown.

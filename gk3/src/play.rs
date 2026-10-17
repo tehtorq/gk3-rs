@@ -311,7 +311,8 @@ fn headless_run(lib: &Library, o: &Options) -> Result<ExitCode, String> {
             continue;
         }
         // `PENDULUM:GRAB` and `PENDULUM:DROP` work TE3's pendulum as a
-        // player would; `WAIT:SECONDS` lets the story run on.
+        // player would (`PENDULUM:DIE` steps where the blade will strike);
+        // `WAIT:SECONDS` lets the story run on.
         if noun == "PENDULUM" {
             let start = world.outside();
             while !world.pendulum_goal(&renderer, verb, STEP) {
@@ -368,11 +369,16 @@ fn headless_run(lib: &Library, o: &Options) -> Result<ExitCode, String> {
         // `FLOOR:OBJECT` is a click on a piece of the room.
         if noun == "TILE" || noun == "FLOOR" {
             let object = if noun == "TILE" { format!("TE1FLOOR{verb}") } else { verb.clone() };
-            world.hover_object(Some(&object));
             if noun == "FLOOR" {
                 if !world.click_object(&renderer, Some(&object)) {
                     world.log.push(format!("the room takes no click on {object}"));
                 }
+                settle(&mut world, &renderer, PATIENCE);
+                continue;
+            }
+            // The click tells the scripts about the tile first, as the
+            // window's does.
+            if world.click_object(&renderer, Some(&object)) {
                 settle(&mut world, &renderer, PATIENCE);
                 continue;
             }

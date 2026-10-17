@@ -2776,6 +2776,18 @@ impl Cast {
         best
     }
 
+    /// How far along a ray one figure, if shown, is first met.
+    pub fn ray_figure(&self, name: &str, origin: Vec3, direction: Vec3) -> Option<f32> {
+        let f = self.figures.get(self.find(name)?).filter(|f| f.visible)?;
+        f.triangles
+            .iter()
+            .filter_map(|t| {
+                let [a, b, c] = t.map(|i| f.world_vertices.get(i as usize).copied().unwrap_or(Vec3::ZERO));
+                ray_triangle(origin, direction, a, b, c)
+            })
+            .min_by(f32::total_cmp)
+    }
+
     /// Whether an animation is still moving anyone.
     pub fn is_playing(&self, anim: &str) -> bool {
         self.figures

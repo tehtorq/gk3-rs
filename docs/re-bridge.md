@@ -108,7 +108,8 @@ him there. Nor is the camera cut on reaching the far side: the scripts do.
 
 The scene object takes two commands from outside its room's scripts:
 `restart` (0x44635f: an animation ending in message 1, so `bGabeAnimating`
-off, and the glimmer off) and `BridgeStart`. `restart` is referred to from
-0x456f87, 0x45846e and 0x4d5c49; which is the death screen's retry is not
-traced. TE5's scripts after a fall show the death screen, then `Restart$`
-puts everyone back.
+off, and the glimmer off) and `BridgeStart`. `restart` is sent by the death
+screen as it comes up (0x4d5b85, at 0x4d5c49), to whatever scene is current;
+TE5's scripts after a fall show the death screen, then `Restart$` puts
+everyone back. Ours sends it too, and also counts the bridge recovered once
+the scripts after a fall are done.

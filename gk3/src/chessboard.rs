@@ -1,75 +1,68 @@
 //! TE1's chessboard: Gabriel crosses the temple floor by a knight's moves,
-//! and must land on all sixteen sword tiles without landing anywhere twice.
-//! A plain tile falls away behind him; landing where he has been, or on one
-//! of the trap tiles, drops him to his death. The original keeps this in its
-//! code; this follows G-Engine's `Chessboard` (GPL-3.0).
+//! and must land on all sixteen sword tiles, landing nowhere twice. A plain
+//! tile falls away behind him; landing again where he has been, or on one
+//! of the traps, drops him. The original's `Chess` scene (`custom=Chess`,
+//! 0x456801; `docs/re-chess.md`).
 //!
-//! The scripts do the jumping. The engine tells them which tile is under the
-//! pointer (`Te1TileRow`/`Te1TileColumn`), whether that is a knight's move
-//! from where Gabriel stands (`Te1MoveType`: 1 yes, 2 no), and which way it
-//! lies (`Te1MoveCode`, which picks his turn and jump). The scripts' scene
-//! functions then call back here as he takes off and lands.
+//! The scripts do the jumping. A click on a tile tells them which
+//! (`Te1TileRow`, `Te1TileColumn`, `Te1TileState`), whether a knight's move
+//! takes Gabriel there (`Te1MoveType`: 1 yes, 2 near but no, 0 too far) and
+//! which way it lies (`Te1MoveCode`); the scripts' scene functions then call
+//! back here as he takes off and lands.
 
 use gk3_game::state::{GameState, key};
 
 /// What the room must show or play.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
-    /// A tile (by model) shown or fallen away.
+    /// A tile (by model) shown or gone.
     Show(String, bool),
-    /// The same, a moment from now: a tile falls once he has left it.
-    ShowLater(String, bool, f64),
-    /// A sword tile lit or not, by its new texture.
+    /// A tile falls away this many seconds from now, with the trapdoor's
+    /// sound.
+    FallLater(String, f64),
+    /// A sword tile lit or not, by its texture.
     Texture(String, &'static str),
     Sound(&'static str),
     /// The way out at the far end shut again.
     DoorShut,
-    /// Gabriel stood square on a tile, facing up the board.
-    Center(String),
+    /// A line said, the click taken.
+    Say(&'static str),
 }
 
-/// Move types the scripts know.
-const VALID: i32 = 1;
-const INVALID: i32 = 2;
-const SWORD_TILES: u32 = 16;
+/// A tile's state (the board at +0x17c).
+const PLAIN: i32 = 0;
+const SWORD_LIT: i32 = 1;
+const SWORD_DARK: i32 = 2;
+const TRAP: i32 = 3;
+const GONE: i32 = 4;
+const SWORD_TILES: i32 = 16;
 
-#[derive(Debug, Clone, Default)]
-pub struct Chessboard {
-    /// How many times he has landed on each tile, by row then column.
-    landed: [[u8; 8]; 8],
-    swords: u32,
-}
+/// The board as it starts (0x6ee23c), by column then row: 2 a sword, 3 a
+/// trap, 0 plain.
+const START: [[i32; 8]; 8] = [
+    [0, 0, 0, 2, 2, 0, 0, 0],
+    [0, 0, 2, 3, 3, 2, 0, 0],
+    [0, 2, 0, 0, 0, 0, 2, 0],
+    [2, 3, 0, 3, 3, 0, 3, 2],
+    [2, 3, 0, 3, 3, 0, 3, 2],
+    [0, 2, 0, 0, 0, 0, 2, 0],
+    [0, 0, 2, 3, 3, 2, 0, 0],
+    [0, 0, 0, 2, 2, 0, 0, 0],
+];
 
 /// A tile's model: `te1floor` and its column letter and row number.
 pub fn tile_model(row: usize, col: usize) -> String {
     format!("TE1FLOOR{}{}", (b'A' + col as u8) as char, row + 1)
 }
 
-/// The tile a model is, if it is one: row and column from 0.
+/// The tile a model is, if it is one: row and column from 0 (0x456b81:
+/// ten letters, `te1floor`, a column letter and a row digit).
 pub fn tile_of(model: &str) -> Option<(usize, usize)> {
-    let rest = model.to_ascii_uppercase();
-    let rest = rest.strip_prefix("TE1FLOOR")?;
-    let mut chars = rest.chars();
-    let col = chars.next()?;
-    let row = chars.next()?;
-    if chars.next().is_some() || !('A'..='H').contains(&col) || !('1'..='8').contains(&row) {
-        return None;
-    }
-    Some((row as usize - '1' as usize, col as usize - 'A' as usize))
-}
-
-fn white_sword(row: usize, col: usize) -> bool {
-    matches!(
-        (col, row),
-        (3, 0) | (2, 1) | (1, 2) | (0, 3) | (7, 4) | (6, 5) | (5, 6) | (4, 7)
-    )
-}
-
-fn black_sword(row: usize, col: usize) -> bool {
-    matches!(
-        (col, row),
-        (4, 0) | (5, 1) | (6, 2) | (7, 3) | (0, 4) | (1, 5) | (2, 6) | (3, 7)
-    )
+    let name = model.to_ascii_lowercase();
+    let rest = name.strip_prefix("te1floor").filter(|_| name.len() == 10)?;
+    let b = rest.as_bytes();
+    let (col, row) = (b[0].wrapping_sub(b'a') as usize, b[1].wrapping_sub(b'1') as usize);
+    (col < 8 && row < 8).then_some((row, col))
 }
 
 fn var(state: &GameState, name: &str) -> i32 {
@@ -80,188 +73,163 @@ fn set(state: &mut GameState, name: &str, value: i32) {
     state.variables.insert(key(name), value);
 }
 
-/// Where Gabriel stands, if on the board.
-fn gabe(state: &GameState) -> Option<(usize, usize)> {
-    let (row, col) = (var(state, "Te1GabeRow"), var(state, "Te1GabeColumn"));
-    ((0..8).contains(&row) && (0..8).contains(&col)).then_some((row as usize, col as usize))
+/// What became of a click.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Click {
+    /// Left to the room's actions (a tile, with the variables set).
+    NotTaken,
+    /// Taken, doing these.
+    Taken(Vec<Effect>),
+    /// The floor round the board while on it: `SCENE JUMP` runs.
+    Jump,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Chessboard {
+    /// Each tile's state, by column and row.
+    board: [[i32; 8]; 8],
 }
 
 impl Chessboard {
-    /// A sword tile's look, lit or not; None if it is no sword tile.
-    fn glow(row: usize, col: usize, lit: bool) -> Option<Effect> {
-        let texture = match (white_sword(row, col), black_sword(row, col), lit) {
-            (true, _, true) => "TE1SWORDW_GLOW",
-            (true, _, false) => "TE1SWORDW",
-            (_, true, true) => "TE1SWORDB_GLOW",
-            (_, true, false) => "TE1SWORDB",
-            _ => return None,
+    fn at(&mut self, row: i32, col: i32) -> Option<&mut i32> {
+        self.board.get_mut(usize::try_from(col).ok()?)?.get_mut(usize::try_from(row).ok()?)
+    }
+
+    /// A sword tile's look, lit or not (0x4574b9: black where row and
+    /// column sum even).
+    fn sword_texture(row: usize, col: usize, lit: bool) -> Effect {
+        let texture = match ((row + col).is_multiple_of(2), lit) {
+            (true, true) => "TE1SWORDB_GLOW",
+            (true, false) => "TE1SWORDB",
+            (false, true) => "TE1SWORDW_GLOW",
+            (false, false) => "TE1SWORDW",
         };
-        Some(Effect::Texture(tile_model(row, col), texture))
+        Effect::Texture(tile_model(row, col), texture)
     }
 
-    /// Everything as at the start: every tile back, the swords lit (or
-    /// not), no landings but on the traps, which count as landed already.
-    pub fn reset(&mut self, lit: bool, state: &mut GameState) -> Vec<Effect> {
-        set(state, "Te1GabeRow", -1);
-        set(state, "Te1GabeColumn", -1);
-        set(state, "Te1MoveType", VALID);
-        set(state, "Te1TileState", 0);
-        set(state, "Te1TileRow", 0);
-        set(state, "Te1TileColumn", 0);
-        // G-Engine leaves `AllSwords` alone here: clearing it on a death
-        // strands a script. It is cleared on the next landing instead.
+    /// One of the room's scene functions (0x456f39). None if not its own.
+    pub fn call(&mut self, function: &str, state: &mut GameState) -> Option<Vec<Effect>> {
+        let (row, col) = (var(state, "Te1GabeRow"), var(state, "Te1GabeColumn"));
+        let mut swords = var(state, "Te1SwordCount");
         let mut out = Vec::new();
-        self.landed = [[0; 8]; 8];
-        for row in 0..8 {
-            for col in 0..8 {
-                out.push(Effect::Show(tile_model(row, col), true));
-                out.extend(Self::glow(row, col, lit));
+        match function.to_ascii_lowercase().as_str() {
+            // Off the board, and the door shut (0x456e54).
+            "restart" => {
+                set(state, "Te1GabeRow", -1);
+                set(state, "Te1GabeColumn", -1);
+                for noun in ["FLOOR", "FLOOR_TILES"] {
+                    for who in ["GABRIEL", "GRACE"] {
+                        state.set_noun_verb(who, noun, "WALK", 0);
+                    }
+                }
+                set(state, "Te1SwordCount", 0);
+                state.flags.remove(&key("AllSwords"));
+                out.push(Effect::DoorShut);
+                return Some(out);
             }
-        }
-        for (row, col) in [
-            (1, 3),
-            (1, 4),
-            (6, 3),
-            (6, 4),
-            (3, 1),
-            (4, 1),
-            (3, 6),
-            (4, 6),
-            (3, 3),
-            (4, 3),
-            (3, 4),
-            (4, 4),
-        ] {
-            self.landed[row][col] = 2;
-        }
-        self.swords = 0;
-        set(state, "Te1SwordCount", 0);
-        out.push(Effect::DoorShut);
-        out
-    }
-
-    /// He is jumping off a tile: a plain one falls away just after.
-    pub fn takeoff(&mut self, state: &GameState) -> Vec<Effect> {
-        match gabe(state) {
-            Some((row, col)) if !white_sword(row, col) && !black_sword(row, col) => {
-                vec![Effect::ShowLater(tile_model(row, col), false, 1.0)]
+            // Whether he stands at the way out with every sword done.
+            "centerme" => {
+                let done = swords == SWORD_TILES && col == 4 && row == 7;
+                set(state, "Te1MoveCode", i32::from(done));
             }
-            _ => Vec::new(),
-        }
-    }
-
-    /// He has landed. A sword goes dark the first time; a tile landed on
-    /// before gives way. The scripts read `Te1TileState` for which.
-    pub fn landed(&mut self, state: &mut GameState) -> Vec<Effect> {
-        state.flags.remove(&key("AllSwords"));
-        let Some((row, col)) = gabe(state) else {
-            return Vec::new();
-        };
-        self.landed[row][col] = self.landed[row][col].saturating_add(1);
-        let count = self.landed[row][col];
-        set(state, "Te1TileState", count as i32);
-        let mut out = Vec::new();
-        if count == 1 {
-            if let Some(dark) = Self::glow(row, col, false) {
-                out.push(dark);
-                out.push(Effect::Sound("TE1SWORDOFF"));
-                self.swords += 1;
-                set(state, "Te1SwordCount", self.swords as i32);
-                if self.swords == SWORD_TILES {
-                    state.flags.insert(key("AllSwords"));
+            "landed" => {
+                let tile = *self.at(row, col)?;
+                let (r, c) = (row as usize, col as usize);
+                match tile {
+                    SWORD_LIT => {
+                        out.push(Self::sword_texture(r, c, false));
+                        out.push(Effect::Sound("TE1SWORDOFF"));
+                        swords += 1;
+                        *self.at(row, col)? = SWORD_DARK;
+                        if swords == SWORD_TILES {
+                            state.flags.insert(key("AllSwords"));
+                        }
+                    }
+                    SWORD_DARK | TRAP => {
+                        out.push(Effect::Show(tile_model(r, c), false));
+                        out.push(Effect::Sound("TE1TRAPDOOROPEN"));
+                        *self.at(row, col)? = GONE;
+                    }
+                    PLAIN => {}
+                    _ => return None,
                 }
             }
-        } else {
-            out.extend(trapdoor(row, col));
+            "badland" => {
+                out.push(Effect::Show(tile_model(row.max(0) as usize, col.max(0) as usize), false));
+                out.push(Effect::Sound("TE1TRAPDOOROPEN"));
+                *self.at(row, col)? = GONE;
+            }
+            // A plain tile falls three quarters of a second after he leaves
+            // it; swords stay.
+            "takeoff" => match *self.at(row, col)? {
+                PLAIN => {
+                    out.push(Effect::FallLater(tile_model(row as usize, col as usize), 0.75));
+                    *self.at(row, col)? = GONE;
+                }
+                SWORD_DARK => {}
+                _ => return None,
+            },
+            // Every tile back; the swords lit, or not.
+            f @ ("reset" | "cleartiles") => {
+                let lit = f == "reset";
+                for (c, column) in START.iter().enumerate() {
+                    for (r, &tile) in column.iter().enumerate() {
+                        self.board[c][r] = if lit && tile == SWORD_DARK { SWORD_LIT } else { tile };
+                        out.push(Effect::Show(tile_model(r, c), true));
+                        if tile == SWORD_DARK {
+                            out.push(Self::sword_texture(r, c, lit));
+                        }
+                    }
+                }
+                swords = 0;
+                state.flags.remove(&key("AllSwords"));
+            }
+            "fell" => {}
+            "hidecurrenttile" => {
+                out.push(Effect::Show(tile_model(row.max(0) as usize, col.max(0) as usize), false));
+            }
+            _ => return None,
         }
-        out
+        set(state, "Te1SwordCount", swords);
+        Some(out)
     }
 
-    /// The tile he stands on gives way (a bad landing, or a fall).
-    pub fn drop_current(&self, state: &GameState) -> Vec<Effect> {
-        gabe(state).map_or(Vec::new(), |(row, col)| trapdoor(row, col))
-    }
-
-    /// He is put square on his tile again: the jumps drift.
-    pub fn center(&self, state: &GameState) -> Vec<Effect> {
-        gabe(state).map_or(Vec::new(), |(row, col)| vec![Effect::Center(tile_model(row, col))])
-    }
-
-    /// The pointer is on a tile: the scripts learn which, whether he can
-    /// get there by a knight's move, and which way it lies.
-    pub fn hover(state: &mut GameState, row: usize, col: usize) {
-        set(state, "Te1TileRow", row as i32);
-        set(state, "Te1TileColumn", col as i32);
-        let Some((gr, gc)) = gabe(state) else {
-            // Off the board, the first row is the only way on.
-            set(state, "Te1MoveType", if row == 0 { VALID } else { INVALID });
-            return;
-        };
-        let (dr, dc) = (row.abs_diff(gr), col.abs_diff(gc));
-        let knight = dr > 0 && dc > 0 && dr + dc == 3;
-        set(state, "Te1MoveType", if knight { VALID } else { INVALID });
-        set(state, "Te1MoveCode", move_code((gr, gc), (row, col)));
-    }
-
-    /// A click on the floor around the board while on it: from the first
-    /// row he can jump back off; from anywhere else it is too far. Returns
-    /// whether the scripts' `SCENE JUMP` should run.
-    pub fn floor_click(state: &mut GameState) -> bool {
-        let Some((row, _)) = gabe(state) else {
-            return false;
-        };
-        set(state, "Te1MoveType", if row == 0 { VALID } else { INVALID });
-        true
-    }
-}
-
-fn trapdoor(row: usize, col: usize) -> Vec<Effect> {
-    vec![
-        Effect::Show(tile_model(row, col), false),
-        Effect::Sound("TE1TRAPDOOROPEN"),
-    ]
-}
-
-/// The scripts' number for which way a tile lies from where he stands,
-/// which picks his turn and jump: G-Engine's table.
-fn move_code((gr, gc): (usize, usize), (row, col): (usize, usize)) -> i32 {
-    let (dr, dc) = (row.abs_diff(gr), col.abs_diff(gc));
-    let (back, left) = (row < gr, col < gc);
-    if dr == 0 && dc == 0 {
-        12
-    } else if dc == 0 {
-        match (back, dr == 1) {
-            (true, true) => 7,
-            (true, false) => 2,
-            (false, true) => 17,
-            (false, false) => 22,
+    /// A click on a piece of the room (0x456b81), `on_floor` whether it is
+    /// the floor round the board.
+    pub fn click(&self, object: &str, state: &mut GameState) -> Click {
+        let (gr, gc) = (var(state, "Te1GabeRow"), var(state, "Te1GabeColumn"));
+        let on_board = gr >= 0;
+        if let Some((row, col)) = tile_of(object) {
+            let (row, col) = (row as i32, col as i32);
+            set(state, "Te1TileRow", row);
+            set(state, "Te1TileColumn", col);
+            set(state, "Te1TileState", self.board[col as usize][row as usize]);
+            let kind = if !on_board {
+                // Onto the board only by its first row.
+                if row == 0 { 1 } else { 0 }
+            } else {
+                let (dr, dc) = (row - gr, col - gc);
+                if dr.abs() < 3 && dc.abs() < 3 && dr.abs() + dc.abs() < 4 {
+                    set(state, "Te1MoveCode", dr * 5 + 12 + dc);
+                    if dr.abs() + dc.abs() == 3 { 1 } else { 2 }
+                } else {
+                    0
+                }
+            };
+            set(state, "Te1MoveType", kind);
+            return Click::NotTaken;
         }
-    } else if dr == 0 {
-        match (left, dc == 1) {
-            (true, true) => 11,
-            (true, false) => 10,
-            (false, true) => 13,
-            (false, false) => 14,
+        if object.eq_ignore_ascii_case("te1tilefloor") {
+            if !on_board {
+                return Click::NotTaken;
+            }
+            set(state, "Te1MoveType", if gr == 0 { 1 } else { 2 });
+            return Click::Jump;
         }
-    } else if dr == dc {
-        match (back, left) {
-            (true, true) => 6,
-            (true, false) => 8,
-            (false, true) => 16,
-            (false, false) => 18,
+        if on_board {
+            return Click::Taken(vec![Effect::Say("1SERM44V51")]);
         }
-    } else {
-        let steep = dr > dc;
-        match (back, left, steep) {
-            (true, true, true) => 1,
-            (true, true, false) => 5,
-            (true, false, true) => 3,
-            (true, false, false) => 9,
-            (false, true, true) => 21,
-            (false, true, false) => 15,
-            (false, false, true) => 23,
-            (false, false, false) => 19,
-        }
+        Click::NotTaken
     }
 }
 
@@ -283,52 +251,73 @@ mod tests {
     }
 
     #[test]
-    fn only_knight_moves_are_valid() {
+    fn knight_moves_near_and_far() {
         let mut state = GameState::default();
-        // Off the board, only the first row.
+        let board = Chessboard::default();
         at(&mut state, -1, -1);
-        Chessboard::hover(&mut state, 0, 3);
-        assert_eq!(var(&state, "Te1MoveType"), VALID);
-        Chessboard::hover(&mut state, 1, 3);
-        assert_eq!(var(&state, "Te1MoveType"), INVALID);
+        assert_eq!(board.click("TE1FLOORD1", &mut state), Click::NotTaken);
+        assert_eq!(var(&state, "Te1MoveType"), 1);
+        board.click("TE1FLOORD2", &mut state);
+        assert_eq!(var(&state, "Te1MoveType"), 0);
         at(&mut state, 0, 3);
-        Chessboard::hover(&mut state, 2, 4);
-        assert_eq!((var(&state, "Te1MoveType"), var(&state, "Te1MoveCode")), (VALID, 23));
-        Chessboard::hover(&mut state, 1, 5);
-        assert_eq!((var(&state, "Te1MoveType"), var(&state, "Te1MoveCode")), (VALID, 19));
-        Chessboard::hover(&mut state, 2, 3);
-        assert_eq!((var(&state, "Te1MoveType"), var(&state, "Te1MoveCode")), (INVALID, 22));
+        board.click("TE1FLOORE3", &mut state);
+        assert_eq!((var(&state, "Te1MoveType"), var(&state, "Te1MoveCode")), (1, 23));
+        board.click("TE1FLOORD3", &mut state);
+        assert_eq!((var(&state, "Te1MoveType"), var(&state, "Te1MoveCode")), (2, 22));
+        board.click("TE1FLOORD6", &mut state);
+        assert_eq!(var(&state, "Te1MoveType"), 0, "too far");
+        assert_eq!(board.click("TE1TILEFLOOR", &mut state), Click::Jump);
+        assert_eq!(var(&state, "Te1MoveType"), 1);
+        assert_eq!(
+            board.click("TE1_SKULLS", &mut state),
+            Click::Taken(vec![Effect::Say("1SERM44V51")])
+        );
     }
 
     #[test]
-    fn swords_count_once_and_tiles_twice_kill() {
+    fn swords_go_dark_once_then_drop_him() {
         let mut state = GameState::default();
         let mut board = Chessboard::default();
-        board.reset(true, &mut state);
+        board.call("reset", &mut state);
         at(&mut state, 0, 3); // a white sword
-        let first = board.landed(&mut state);
+        let first = board.call("landed", &mut state).unwrap();
         assert!(first.contains(&Effect::Texture("TE1FLOORD1".into(), "TE1SWORDW")));
         assert_eq!(var(&state, "Te1SwordCount"), 1);
-        assert_eq!(var(&state, "Te1TileState"), 1);
-        let again = board.landed(&mut state);
-        assert_eq!(var(&state, "Te1TileState"), 2);
+        let again = board.call("landed", &mut state).unwrap();
         assert!(again.contains(&Effect::Show("TE1FLOORD1".into(), false)));
-        // A trap tile counts as landed on already.
+        assert_eq!(var(&state, "Te1SwordCount"), 1);
+        // A trap drops him at once.
         at(&mut state, 3, 3);
-        board.landed(&mut state);
-        assert_eq!(var(&state, "Te1TileState"), 3);
+        let trap = board.call("landed", &mut state).unwrap();
+        assert!(trap.contains(&Effect::Sound("TE1TRAPDOOROPEN")));
     }
 
     #[test]
     fn plain_tiles_fall_behind_him() {
         let mut state = GameState::default();
         let mut board = Chessboard::default();
+        board.call("reset", &mut state);
         at(&mut state, 0, 0);
         assert_eq!(
-            board.takeoff(&state),
-            [Effect::ShowLater("TE1FLOORA1".into(), false, 1.0)]
+            board.call("takeoff", &mut state).unwrap(),
+            [Effect::FallLater("TE1FLOORA1".into(), 0.75)]
         );
         at(&mut state, 0, 3);
-        assert!(board.takeoff(&state).is_empty(), "swords stay");
+        assert_eq!(board.call("takeoff", &mut state), None, "a lit sword is not the scene's");
+        board.call("landed", &mut state);
+        assert!(board.call("takeoff", &mut state).unwrap().is_empty(), "swords stay");
+    }
+
+    #[test]
+    fn the_way_out_needs_every_sword() {
+        let mut state = GameState::default();
+        let mut board = Chessboard::default();
+        at(&mut state, 7, 4);
+        set(&mut state, "Te1SwordCount", 16);
+        board.call("centerMe", &mut state);
+        assert_eq!(var(&state, "Te1MoveCode"), 1);
+        set(&mut state, "Te1SwordCount", 15);
+        board.call("centerMe", &mut state);
+        assert_eq!(var(&state, "Te1MoveCode"), 0);
     }
 }

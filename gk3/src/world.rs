@@ -377,6 +377,9 @@ pub struct World<'a> {
     moods: HashMap<String, String>,
     /// The church's four angels puzzle.
     angels: crate::angels::Angels,
+    /// When the solved square is to be wiped, freeing the script waiting
+    /// on it (0x41e9fe).
+    angels_erase_at: Option<f64>,
     /// CS2's turning heads, while there.
     laser_heads: Option<crate::laser_heads::LaserHeads>,
     /// TE1's chessboard, while there; and pieces of the room due to be
@@ -385,9 +388,6 @@ pub struct World<'a> {
     /// TE3's pendulum and TE5's bridge, while there.
     pendulum: Option<crate::pendulum::Pendulum>,
     bridge: Option<crate::bridge::Bridge>,
-    /// TE6, the fight with the demon: a click on the floor is a call for
-    /// the scripts' own moves, not a walk.
-    demon_fight: bool,
     timed_shows: Vec<(f64, String, bool)>,
     /// Sheep to run as an action once the actions running now are over.
     deferred: Vec<String>,
@@ -524,11 +524,11 @@ impl<'a> World<'a> {
             cues: Vec::new(),
             moods: HashMap::new(),
             angels: Default::default(),
+            angels_erase_at: None,
             laser_heads: None,
             chessboard: None,
             pendulum: None,
             bridge: None,
-            demon_fight: false,
             timed_shows: Vec::new(),
             deferred: Vec::new(),
             inspect: None,
@@ -642,6 +642,7 @@ impl<'a> World<'a> {
         self.cues.clear();
         self.moods.clear();
         self.angels = Default::default();
+        self.angels_erase_at = None;
         self.deferred.clear();
         self.audio.stop_all();
         self.topic_bar = None;
@@ -937,9 +938,12 @@ impl<'a> World<'a> {
             untouchable,
             triggers,
         });
-        // The camera's forced cuts are the old room camera's, as G-Engine;
-        // so is anything it was inspecting.
-        self.forced_cuts = false;
+        // Entering, the camera's forced cuts are cleared (0x50094d), but
+        // not in a `Holy` room, whose set-up leaves them (0x4b623f); and
+        // the camera inspects nothing.
+        if self.scene.as_ref().and_then(|s| s.custom.as_deref()) != Some("HOLY") {
+            self.forced_cuts = false;
+        }
         self.inspecting = None;
         self.inspect_from = None;
         self.tasks.clear();
@@ -975,7 +979,6 @@ impl<'a> World<'a> {
         self.chessboard = None;
         self.pendulum = None;
         self.bridge = None;
-        self.demon_fight = false;
         self.last_trigger = None;
         // A `CoordinateDevice` room has the GPS, off (0x46f37a).
         if self.scene.as_ref().and_then(|s| s.custom.as_deref()) == Some("COORDINATEDEVICE") {
@@ -1005,6 +1008,30 @@ impl<'a> World<'a> {
             self.run(renderer, rule, false);
         }
         Ok(())
+    }
+
+    /// Does what the church's angels ask of the room.
+    fn angel_effects(&mut self, renderer: &Renderer, effects: Vec<crate::angels::Effect>) {
+        use crate::angels::Effect as A;
+        for effect in effects {
+            match effect {
+                A::Show(model, show) => self.show_model(renderer, &model, show),
+                A::SetCount(verb, n) => {
+                    for who in ["GABRIEL", "GRACE"] {
+                        self.state.set_noun_verb(who, "FOUR_ANGELS", verb, n);
+                    }
+                }
+                A::AddCount(verb) => {
+                    for who in ["GABRIEL", "GRACE"] {
+                        let n = self.state.noun_verb(who, "FOUR_ANGELS", verb);
+                        self.state.set_noun_verb(who, "FOUR_ANGELS", verb, n + 1);
+                    }
+                }
+                A::Say(plate) => {
+                    self.speak(plate, 1);
+                }
+            }
+        }
     }
 
     /// Does what the GPS asks of the game.
@@ -1064,79 +1091,94 @@ impl<'a> World<'a> {
         }
         match (location.as_str(), f.as_str()) {
             ("CHU", _) => {
+                let grace = self.state.ego.eq_ignore_ascii_case("GRACE");
                 let ego = self.state.ego.clone();
-                for effect in self.angels.call(&f, &ego)? {
-                    use crate::angels::Effect as A;
-                    match effect {
-                        A::Show(model, show) => self.show_model(renderer, &model, show),
-                        A::Count(verb, n) => {
-                            for who in ["GABRIEL", "GRACE"] {
-                                self.state.set_noun_verb(who, "FOUR_ANGELS", verb, n);
-                            }
-                        }
-                        A::FirstDot(plate) => self
-                            .deferred
-                            .push(format!("wait StartDialogue(\"{plate}\", 1);")),
-                        A::Solved(plate) => self.deferred.push(format!(
-                            "wait StartDialogue(\"{plate}\", 1); wait SetTimerSeconds(2); CallSceneFunction(\"Erase\");"
-                        )),
+                let traced = self.state.noun_verb(&ego, "FOUR_ANGELS", "TRACE") > 0;
+                let (effects, wait) = self.angels.call(&f, grace, traced)?;
+                self.angel_effects(renderer, effects);
+                use crate::angels::Wait as W;
+                Some(match wait {
+                    W::Nothing => None,
+                    W::Line(plate) => Some(Until::Speech(self.speak(plate, 1).0)),
+                    W::Solved(seconds) => {
+                        let at = self.clock + seconds;
+                        self.angels_erase_at = Some(at);
+                        Some(Until::Time(at))
                     }
-                }
-                Some(None)
+                })
             }
             // The heads start facing the middle, every time.
+            // The heads where the story last left them, the middle the first
+            // time (0x4c2912).
             ("CS2", "init") => {
-                let heads = crate::laser_heads::LaserHeads::default();
-                for (i, turn) in heads.turns().iter().enumerate() {
+                let settings = std::array::from_fn(|i| {
                     self.state
                         .variables
-                        .insert(crate::laser_heads::variable(i), *turn as i32);
+                        .get(&gk3_game::state::key(&crate::laser_heads::variable(i)))
+                        .map(|v| *v as usize)
+                });
+                let heads = crate::laser_heads::LaserHeads::new(settings);
+                for (i, setting) in heads.settings().iter().enumerate() {
+                    self.state
+                        .variables
+                        .insert(crate::laser_heads::variable(i), *setting as i32);
                 }
                 self.laser_heads = Some(heads);
                 self.place_laser_heads();
                 Some(None)
             }
+            // The lasers on or off, the heads lit or not and the music
+            // stopped by the animations played (0x4c3023).
             ("CS2", "togglelasers") => {
                 let on = {
                     let heads = self.laser_heads.as_mut()?;
                     heads.lasers_on = !heads.lasers_on;
                     heads.lasers_on
                 };
+                self.place_laser_heads();
                 for i in 0..5 {
                     self.show_model(renderer, &crate::laser_heads::laser_model(i), on);
                 }
-                // Turning the lasers on also ends the library's music.
-                self.stop_soundtrack(Some("NocturneSlow"));
+                let effect = Effect {
+                    name: "StartAnimation".into(),
+                    args: vec![
+                        gk3_sheep::Value::from(if on { "cs2lasersOn" } else { "cs2lasersOff" }),
+                        gk3_sheep::Value::Int(1),
+                    ],
+                    thread: None,
+                };
+                self.perform_one(renderer, &effect);
                 Some(None)
             }
-            ("CS2", f) if f.starts_with("turnl") || f.starts_with("turnr") => {
-                let head: usize = f[5..].parse::<usize>().ok()?.checked_sub(1)?;
-                let step = if f.starts_with("turnl") { 1 } else { -1 };
-                let anim = self.laser_heads.as_mut()?.turn(head, step);
-                let Some(anim) = anim else {
-                    return Some(None);
+            // A head turned: unsolved again until it ends; the script waits
+            // while Grace turns it (0x4c3197).
+            ("CS2", f) if f.starts_with("turn") => {
+                let left = match f.as_bytes().get(4) {
+                    Some(b'l') => true,
+                    Some(b'r') => false,
+                    _ => return None,
                 };
-                let turn = self.laser_heads.as_ref()?.turns()[head];
-                self.state
-                    .variables
-                    .insert(crate::laser_heads::variable(head), turn as i32);
-                // The script waits while Grace turns it.
+                let head = (*f.as_bytes().get(5)? as usize).checked_sub(b'1' as usize)?;
+                self.state.flags.remove(&gk3_game::state::key("StaircaseOpen"));
+                let now = self.clock;
+                let anim = self.laser_heads.as_mut()?.ask(head, left, now)?;
                 let effect = Effect {
                     name: "StartAnimation".into(),
                     args: vec![gk3_sheep::Value::from(anim.as_str()), gk3_sheep::Value::Int(1)],
                     thread: None,
                 };
-                Some(self.perform_one(renderer, &effect))
+                let wait = self.perform_one(renderer, &effect);
+                let end = match wait {
+                    Some(Until::Time(at)) => at,
+                    _ => now,
+                };
+                if let Some(heads) = &mut self.laser_heads {
+                    heads.anim_ends(end);
+                }
+                Some(wait)
             }
             // TE1's chessboard: the scripts reset it, and call back as
             // Gabriel takes off, lands, falls or needs straightening.
-            // In the fight Gabriel does not walk where clicked: the click
-            // is a flag the scripts answer with his backing away, as
-            // G-Engine's `DemonFight`.
-            ("TE6", "init") => {
-                self.demon_fight = true;
-                Some(None)
-            }
             ("TE5", "init") => {
                 let mut bridge = crate::bridge::Bridge::default();
                 bridge.start(self);
@@ -1149,24 +1191,28 @@ impl<'a> World<'a> {
                 self.pendulum = Some(pendulum);
                 Some(None)
             }
+            ("TE5", "restart") => {
+                self.bridge.as_mut()?.recovered();
+                Some(None)
+            }
+            ("TE3", "restart") => {
+                let mut pendulum = self.pendulum.take()?;
+                pendulum.restart(self);
+                self.pendulum = Some(pendulum);
+                Some(None)
+            }
+            // Off the board to begin with: the scripts' first move needs
+            // `Te1GabeRow` below 0 (where the original first sets it is not
+            // traced; after a death, `restart` does).
             ("TE1", "init") => {
                 self.chessboard = Some(Default::default());
+                for v in ["Te1GabeRow", "Te1GabeColumn"] {
+                    self.state.variables.entry(gk3_game::state::key(v)).or_insert(-1);
+                }
                 Some(None)
             }
             ("TE1", f) => {
-                let board = self.chessboard.as_mut()?;
-                let state = &mut self.state;
-                let effects = match f {
-                    "cleartiles" => board.reset(false, state),
-                    "reset" => board.reset(true, state),
-                    "takeoff" => board.takeoff(state),
-                    "landed" => board.landed(state),
-                    "hidecurrenttile" | "badland" => board.drop_current(state),
-                    "centerme" => board.center(state),
-                    // G-Engine does nothing here either.
-                    "fell" => Vec::new(),
-                    _ => return None,
-                };
+                let effects = self.chessboard.as_mut()?.call(f, &mut self.state)?;
                 self.chessboard_effects(renderer, effects);
                 Some(None)
             }
@@ -1200,8 +1246,14 @@ impl<'a> World<'a> {
         for effect in effects {
             match effect {
                 E::Show(model, show) => self.show_model(renderer, &model, show),
-                E::ShowLater(model, show, after) => {
-                    self.timed_shows.push((self.clock + after, model, show));
+                E::FallLater(model, after) => {
+                    let at = self.clock + after;
+                    self.timed_shows.push((at, model, false));
+                    self.scheduled
+                        .push((at, "TE1TRAPDOOROPEN".into(), 1.0, Bus::Effects, None));
+                }
+                E::Say(plate) => {
+                    self.speak(plate, 1);
                 }
                 E::Texture(model, texture) => {
                     if let Some(scene) = &mut self.scene {
@@ -1216,17 +1268,6 @@ impl<'a> World<'a> {
                         scene.cast.sample_first_frame(self.lib, "Te1GoDoor");
                     }
                 }
-                E::Center(tile) => {
-                    let Some(scene) = &mut self.scene else { continue };
-                    let Some((lo, hi)) = bsp_bounds(&scene.room.bsp, &tile) else {
-                        continue;
-                    };
-                    let ego = scene.ego.clone();
-                    if let Some((at, _)) = scene.cast.actor_position(&ego) {
-                        let middle = Vec3::new((lo.x + hi.x) / 2.0, at.y, (lo.z + hi.z) / 2.0);
-                        scene.cast.put(&ego, middle, 0.0);
-                    }
-                }
             }
         }
         if retextured && let Some(scene) = &mut self.scene {
@@ -1235,17 +1276,6 @@ impl<'a> World<'a> {
         }
     }
 
-    /// The piece of the room under the pointer: on TE1's chessboard the
-    /// scripts learn which tile, and whether Gabriel can jump to it, as
-    /// G-Engine's `Chessboard::OnUpdate` tells them.
-    pub fn hover_object(&mut self, object: Option<&str>) {
-        if self.chessboard.is_none() || !self.idle() {
-            return;
-        }
-        if let Some((row, col)) = object.and_then(crate::chessboard::tile_of) {
-            crate::chessboard::Chessboard::hover(&mut self.state, row, col);
-        }
-    }
 
     /// The cursor the room's own code wants over something, if any (the
     /// pendulum's grab).
@@ -1306,8 +1336,9 @@ impl<'a> World<'a> {
             return false;
         };
         let done = match goal {
-            "GRAB" => pendulum.gabe() == crate::pendulum::Gabe::OnPendulum,
-            "DROP" => pendulum.gabe() == crate::pendulum::Gabe::AtAltar,
+            "GRAB" => pendulum.state() == crate::pendulum::State::OnBlade,
+            "DROP" => pendulum.state() == crate::pendulum::State::AtAltar,
+            "DIE" => pendulum.state() == crate::pendulum::State::Dying,
             _ => return true,
         };
         if done {
@@ -1340,40 +1371,43 @@ impl<'a> World<'a> {
             self.bridge = Some(bridge);
             return taken;
         }
-        if self.demon_fight {
-            let floor = self.scene.as_ref().and_then(|s| s.floor.clone());
-            if object.is_some() && object.map(str::to_ascii_uppercase) == floor {
-                if !self.state.flags.contains(&gk3_game::state::key("Te6GabeWalk")) {
-                    self.state.flags.insert(gk3_game::state::key("Te6ClickedOnFloor"));
-                }
+        // In a `Holy` room (TE6's fight, 0x4b62b4) Gabriel does not walk
+        // where clicked: the floor is a flag the scripts answer with his
+        // backing away; the demon, the tomb's lid and the sarcophagus'
+        // walls are left to the room; anything else, not now.
+        if self.scene.as_ref().and_then(|s| s.custom.as_deref()) == Some("HOLY") {
+            let object = object.unwrap_or("").to_ascii_lowercase();
+            if object == "te6_floor" {
+                self.state.flags.insert(gk3_game::state::key("Te6ClickedOnFloor"));
                 return true;
             }
+            if ["dem", "te6_tomblid", "te6_sarc_walls"].contains(&object.as_str()) {
+                return false;
+            }
+            self.deferred.push("StartDialogue(\"1SERM44V51\", 1);".to_string());
+            return true;
+        }
+        if !self.idle() {
             return false;
         }
-        if self.chessboard.is_none() || !self.idle() {
+        // TE1's own clicks (0x456b81): a tile sets what the scripts read
+        // and is left to them; the floor round the board jumps off it; on
+        // the board anything else is not for now.
+        let (Some(board), Some(object)) = (&self.chessboard, object) else {
             return false;
-        }
-        let gabe_on_board = self
-            .state
-            .variables
-            .get(&gk3_game::state::key("Te1GabeRow"))
-            .is_some_and(|r| *r >= 0);
-        if !gabe_on_board {
-            return false;
-        }
-        let object = object.map(str::to_ascii_uppercase);
-        match object.as_deref() {
-            Some("TE1TILEFLOOR") => {
-                if crate::chessboard::Chessboard::floor_click(&mut self.state)
-                    && let Some(rule) = self.rule_for("SCENE", "JUMP")
-                {
+        };
+        match board.click(object, &mut self.state) {
+            crate::chessboard::Click::NotTaken => false,
+            crate::chessboard::Click::Taken(effects) => {
+                self.chessboard_effects(renderer, effects);
+                true
+            }
+            crate::chessboard::Click::Jump => {
+                if let Some(rule) = self.rule_for("SCENE", "JUMP") {
                     self.run(renderer, rule, true);
                 }
                 true
             }
-            // Elsewhere on the floor nothing happens: no walking off.
-            Some("TE1_HITTESTFLOOR" | "TE1FLOOREDGES" | "TE1_FLOORSTAND") => true,
-            _ => false,
         }
     }
 
@@ -1386,9 +1420,40 @@ impl<'a> World<'a> {
             scene
                 .cast
                 .set_world(&crate::laser_heads::head_model(i), heads.head_world(i));
+        }
+        if !heads.lasers_on {
+            return;
+        }
+        // Each laser reaches the first thing it meets: the room, another
+        // head, or Grace (0x4c349c).
+        for i in 0..5 {
+            let (from, d) = heads.laser_ray(i);
+            let mut reach = crate::laser_heads::LASER_REACH;
+            let bsp = &scene.room.bsp;
+            for polygon in &bsp.polygons {
+                let surface = &bsp.surfaces[polygon.surface as usize];
+                if scene.room.hidden.contains(&bsp.objects[surface.object as usize].to_ascii_uppercase()) {
+                    continue;
+                }
+                for t in bsp.triangles(polygon) {
+                    let [a, b, c] = t.map(|v| Vec3::from(bsp.vertices[v as usize]));
+                    if let Some(hit) = ray_triangle(from, d, a, b, c).filter(|h| *h < reach) {
+                        reach = hit;
+                    }
+                }
+            }
+            let others = (0..5)
+                .filter(|j| *j != i)
+                .map(crate::laser_heads::head_model)
+                .chain(std::iter::once("GRA".to_string()));
+            for model in others {
+                if let Some(hit) = scene.cast.ray_figure(&model, from, d).filter(|h| *h < reach) {
+                    reach = hit;
+                }
+            }
             scene
                 .cast
-                .set_world(&crate::laser_heads::laser_model(i), heads.laser_world(i));
+                .set_world(&crate::laser_heads::laser_model(i), heads.laser_world(i, reach));
         }
     }
 
@@ -2838,7 +2903,14 @@ impl<'a> World<'a> {
                     _ => ScreenRequest::Quit,
                 };
                 self.log.push(format!("  ({screen:?} screen)"));
+                // Coming up, the death screen has the room's scene set
+                // itself up again (0x4d5b85); its `Restart$` it leaves to
+                // the script that showed it, which is still running.
+                let death = screen == ScreenRequest::Death;
                 self.screen = Some(screen);
+                if death {
+                    self.scene_function(renderer, "restart");
+                }
                 None
             }
             "SHOWBINOCS" => {
@@ -3662,7 +3734,20 @@ impl<'a> World<'a> {
         self.clock = now;
         self.run_game_timers(renderer, dt);
         if let Some(heads) = &mut self.laser_heads {
-            heads.tick(dt as f32);
+            use crate::laser_heads::Event as L;
+            for event in heads.tick(now, dt as f32) {
+                match event {
+                    L::Setting { head, setting } => {
+                        self.state
+                            .variables
+                            .insert(crate::laser_heads::variable(head), setting as i32);
+                    }
+                    L::Turned { solved: true } => {
+                        self.state.flags.insert(gk3_game::state::key("StaircaseOpen"));
+                    }
+                    L::Turned { solved: false } => {}
+                }
+            }
             self.place_laser_heads();
         }
         if let Some(mut pendulum) = self.pendulum.take() {
@@ -3939,6 +4024,12 @@ impl<'a> World<'a> {
             self.skip();
         }
 
+        // The solved square goes before its script goes on.
+        if self.angels_erase_at.is_some_and(|at| at <= now) {
+            self.angels_erase_at = None;
+            let effects = self.angels.erase();
+            self.angel_effects(renderer, effects);
+        }
         // Release scripts whose waits are over.
         let mut ready = Vec::new();
         self.tasks.retain(|task| {
@@ -5296,12 +5387,6 @@ impl crate::mechanism::Room for World<'_> {
     fn play(&mut self, anim: &str, looping: bool) -> f32 {
         self.log.push(format!("  (machinery: {anim})"));
         self.start_anim(anim, looping)
-    }
-
-    fn stop(&mut self, anim: &str) {
-        if let Some(scene) = &mut self.scene {
-            scene.cast.stop(anim);
-        }
     }
 
     fn is_playing(&self, anim: &str) -> bool {

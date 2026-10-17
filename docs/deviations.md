@@ -140,7 +140,9 @@ Behaviour that is not yet the original's, with what is known.
 | Where a hidden actor posed by its `initAnim` stands | A walker that is not walking follows its model each frame, but only while the model is visible *(traced: 0x41838e → 0x4d6d81 → 0x417e56)*: a hidden actor's walker stays where it was made (its `pos=`, else the origin) until shown | Stood where the posed model is at once, shown or not | — |
 | Sound while skipping | Sound types 1 and 8 are switched off while the story is run on *(traced: 0x4b18a5; which sounds those types are, not traced)* | Speech and sound effects do not start; music and the rooms' ambient sound go on | To trace the types |
 | The GPS's size | Picked by the screen's width (1024, 800) and drawn unscaled *(traced: 0x46f7ca)* | Picked by the window's height as a 4:3 screen (768, 600) and scaled to the window, as the rest of the interface | — |
-| TE3's pendulum | The `Circle` scene's own code *(clicks traced: `re-pendulum.md`)* | G-Engine's `Pendulum` for the motion and timing; the clicks as traced | To trace the motion (0x457eed) |
+| Asmodeus's height while walking (TE6) | The `Holy` scene sets his walker's `mFloorClamp` to 5, which holds him above the floor by his walk's own heights *(traced in outline: 0x4b625d, 0x418000; the height tables not)* | Our walker's height for him | To trace the walker's clamp modes |
+| The camera entering TE6 | Left where it was: the `Holy` scene's set-up does not cut to the room's first camera *(traced: 0x4b623f)* | Starts on the room's first camera; TE6's scripts cut at once | — |
+| Where TE3's pendulum carries the blood | Each step the floor's `groundblood` is given `gabmic`'s matrix *(traced: 0x457eed writes the wrong matrix back)* | Left alone; `Restart$` hides it | — |
 | The order TE5's stones glint in | Shuffled each round with the C library's `rand()` *(traced)*; how it was seeded is not | Shuffled each round from a sequence of our own | — |
 
 ### Small differences in what is traced

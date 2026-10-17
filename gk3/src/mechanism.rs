@@ -9,7 +9,6 @@ use glam::{Mat4, Vec3};
 pub trait Room {
     /// Plays an animation; its length in seconds (0 if there is none).
     fn play(&mut self, anim: &str, looping: bool) -> f32;
-    fn stop(&mut self, anim: &str);
     /// Whether an animation is still moving anyone in the room.
     fn is_playing(&self, anim: &str) -> bool;
     /// Poses what an animation moves as in its first frame.

@@ -1247,8 +1247,6 @@ impl Gfx {
             let (pick, object) =
                 self.world
                     .pick_object(self.pointer.0, self.pointer.1, size.0, size.1);
-            // The room's own code may want to know (TE1's chessboard).
-            self.world.hover_object(object.as_deref());
             self.room_cursor = self.world.object_cursor(object.as_deref());
             if let Pick::Noun(noun) = pick {
                 self.hover = Some(noun);

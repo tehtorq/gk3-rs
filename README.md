@@ -53,10 +53,11 @@ gk3 play LBY --time 207A     # anywhere, any time
 scripts/gk3-jump             # pick a time and a place from a list
 ```
 
-`gk3-jump` is a small launcher window (kdialog or zenity): it lists every
-timeblock and the places the story has then, by the game's own names
-(`gk3 scenes` prints the same list), and opens the game at the one picked.
-Close the game to pick another.
+`gk3-jump` is a small launcher window (kdialog or zenity): pick by time of
+day (every timeblock, then the places the story has then) or by place
+(every location, then the times it is there), by the game's own names
+(`gk3 scenes` prints the same list), and it opens the game at the one
+picked. Close the game to pick another.
 
 Left-click the floor to walk; left-click a thing to see what can be done to it
 and click a verb icon; right-click or Esc closes the menu; while someone is

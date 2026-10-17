@@ -2419,7 +2419,16 @@ impl<'a> World<'a> {
                     .positions
                     .get(&e.string(1).to_ascii_uppercase())?;
                 let from = scene.cast.actor_position(&actor)?.0;
-                let Some(path) = route(scene.walk.as_ref(), &scene.cast, &actor, from, goal, true)
+                // Zoomed in with the binoculars the walk goes straight
+                // there, minding no walk map (see `keep_walkers_apart`).
+                let Some(path) = route(
+                    scene.walk.as_ref().filter(|_| self.binocs.as_ref().is_none_or(|b| b.zoomed.is_none())),
+                    &scene.cast,
+                    &actor,
+                    from,
+                    goal,
+                    true,
+                )
                 else {
                     self.log.push(format!(
                         "    (no way for {actor} from {:.0},{:.0} to {:.0},{:.0})",
@@ -2447,7 +2456,14 @@ impl<'a> World<'a> {
                 let actor = e.string(0);
                 let (goal, heading) = scene.cast.anim_start(lib, &e.string(1), &actor)?;
                 let from = scene.cast.actor_position(&actor)?.0;
-                let path = route(scene.walk.as_ref(), &scene.cast, &actor, from, goal, true)?;
+                let path = route(
+                    scene.walk.as_ref().filter(|_| self.binocs.as_ref().is_none_or(|b| b.zoomed.is_none())),
+                    &scene.cast,
+                    &actor,
+                    from,
+                    goal,
+                    true,
+                )?;
                 let path = if scene.cast.find(&actor) == scene.cast.find(&scene.ego) {
                     self.skip_into_view(&actor, from, path, Some(heading))
                 } else {
@@ -3659,7 +3675,7 @@ impl<'a> World<'a> {
                 };
                 let path = match (from, goal) {
                     (Some(from), Some((to, heading))) => route(
-                        scene.walk.as_ref(),
+                        scene.walk.as_ref().filter(|_| self.binocs.as_ref().is_none_or(|b| b.zoomed.is_none())),
                         &scene.cast,
                         &who,
                         from,
@@ -4320,6 +4336,12 @@ impl<'a> World<'a> {
     /// walker does each frame (0x418c91, 0x4190cf, 0x41938c; see
     /// `docs/re-walking.md`). Only where there is a walk map.
     fn keep_walkers_apart(&mut self, now: f64) {
+        // Zoomed in with the binoculars, nobody keeps to the walk map or
+        // minds anyone else (0x43fd28 clears every actor's
+        // `mbUseBoundary`; 0x440171 sets it again on zooming out).
+        if self.binocs.as_ref().is_some_and(|b| b.zoomed.is_some()) {
+            return;
+        }
         let lib = self.lib;
         let Some(scene) = &mut self.scene else { return };
         let Some(walk) = scene.walk.as_ref() else { return };

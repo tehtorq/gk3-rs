@@ -285,9 +285,12 @@ scene has a walk map and the walker's `mbUseBoundary` is set:
   length of half their width and depth together, at most 36. (Ours had
   counted the trailing points, which lie far out, so every radius was 36.)
 
-`mbUseBoundary` is cleared for every actor at 0x43fd28 and set again at
-0x440171, from an interface mode's code (0x4403ac) still to identify; not
-around scripted scenes.
+`mbUseBoundary` is cleared for every actor on zooming in with the
+binoculars (0x43fd28, the binoculars' class at 0x43ec00) and set again on
+zooming out (0x440171): what is looked at is another place, whose
+walkers the room's walk map does not cover. So while zoomed in, the
+binocular scripts' walks (Buthane leaving L'Homme Mort at 104P) go
+straight, and nobody gives way.
 
 ### Applied to gk3-rs
 
@@ -363,6 +366,5 @@ end.
 
 ## Still to trace
 
-- The interface mode that switches walkers' collisions off (0x4403ac).
 - Characters without a heading model still have each clip placed by the
   hip, and do not steer during a turning start (none of them has one).

@@ -38,6 +38,8 @@ const IDLE: &str = "gabBreathMic";
 const NORMAL_BLADE: &str = "TE3_PENDULUM_CENTER_CODE";
 const GABE_BLADE: &str = "TE3__PENDULUM_GABE";
 pub const ALTAR: &str = "TE3_HPALTAR";
+/// The room itself, whose clicks the puzzle leaves to the room.
+const ROOM_SHELL: [&str; 4] = ["TE3_CIELING", "TE3_INNERWALLS", "TE3_OUTER_WALLS", "TE3_WALLSLOTS"];
 
 /// Where Gabriel is in the puzzle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -422,7 +424,8 @@ impl Pendulum {
             }
             return true;
         }
-        if model == NORMAL_BLADE && self.can_grab() {
+        // Any of the blade's pieces is the blade (0x4593d6).
+        if model.starts_with("TE3_PEND") && self.can_grab() {
             let right = self.blade == Blade::DangerRight;
             self.gabe = Gabe::OnPendulum;
             self.grabbed_right = right;
@@ -437,12 +440,21 @@ impl Pendulum {
             room.score("e_temple_grab_pendulum");
             return true;
         }
-        if self.gabe == Gabe::OnPendulum {
-            if model == ALTAR && self.can_drop() {
+        if self.gabe == Gabe::OnPendulum && model == ALTAR {
+            if self.can_drop() {
                 let d = room.play("GABJMPOFFPEN", false);
                 self.after(d, Step::DropLand);
             }
-            // Nothing else answers while he hangs on.
+            return true;
+        }
+        // On a platform or the blade, the room's ceiling and walls answer
+        // as anywhere; anything else, he says he cannot (0x4593d6,
+        // 0x459736).
+        if matches!(self.gabe, Gabe::OnPlatform | Gabe::OnPendulum) {
+            if ROOM_SHELL.contains(&model.as_str()) {
+                return false;
+            }
+            room.script("StartDialogue(\"1SERM44V51\", 1);");
             return true;
         }
         false

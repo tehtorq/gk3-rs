@@ -24,9 +24,9 @@ The game's keys include `UIKeyType_SkipDialogueLine` (key type 15, beside
 `SkipAction`, `SkipGlide`, `SkipEgoWalk` and `SkipMovie`, at 0x6ee59c): a
 skip of the line being said. As each line is its own object ending at its
 own cue, skipping one ends that line, and the request goes on to its next;
-nothing else the story is doing is hurried. (The input routine 0x491f7d
-that maps the keys is long; the line's own stop on a skip is not traced in
-detail.)
+nothing else the story is doing is hurried. (Where the keys are mapped is
+not found yet: 0x491f7d, once taken for it, answers whether a noun's verb
+may be offered. The line's own stop on a skip is not traced in detail.)
 
 ## Ours
 

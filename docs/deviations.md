@@ -137,11 +137,10 @@ Behaviour that is not yet the original's, with what is known.
 
 | What | The original | Ours | Status |
 |---|---|---|---|
-| Walkers' collisions switched off | During an interface mode, for every actor *(traced: 0x4403ac; the mode not identified)* | Always on | To identify the mode |
 | Where a hidden actor posed by its `initAnim` stands | A walker that is not walking follows its model each frame, but only while the model is visible *(traced: 0x41838e → 0x4d6d81 → 0x417e56)*: a hidden actor's walker stays where it was made (its `pos=`, else the origin) until shown | Stood where the posed model is at once, shown or not | — |
 | The GPS's size | Picked by the screen's width (1024, 800) and drawn unscaled *(traced: 0x46f7ca)* | Picked by the window's height as a 4:3 screen (768, 600) and scaled to the window, as the rest of the interface | — |
-| Clicks on TE3's floor | Picking tests only visible room geometry, with hit-test areas made visible for it and `noClick` models hidden for it, then the nearer of that and any model *(traced: 0x52a0e2, 0x52b9ca, 0x564440, 0x565520)*. TE3's visible floor is `noClick`, its walk floor hidden, so a click meets the floor's unnamed rings | The same; a click on unnamed geometry that is not the walk floor does nothing | What the original does with such a click is not traced (the click handler is reached through virtual calls) |
-| Skipping the player's walk (`SkipEgoWalk`) | Jumps along the route to the first trigger not yet tripped, which trips, or to the end *(traced: 0x41d4f9 → 0x418564 → 0x4e0e8f)* | No walk is skipped | To do |
+| TE3's pendulum | The `Circle` scene's own code *(clicks traced: `re-pendulum.md`)* | G-Engine's `Pendulum` for the motion and timing; the clicks as traced | To trace the motion (0x457eed) |
+| Skipping a running action | The player can skip what is playing; while skipping (the mode stack at state +0x3c topped by 2), every walker jumps along its route to the first trigger not yet tripped, which trips, or to the end *(traced: 0x41838e → 0x41a55e, 0x41d4f9 → 0x418564 → 0x4e0e8f)*; the rest of the skip and its key not traced | Only a line of dialogue can be skipped | To trace and build |
 | The order TE5's stones glint in | Shuffled each round with the C library's `rand()` *(traced)*; how it was seeded is not | Shuffled each round from a sequence of our own | — |
 
 ### Small differences in what is traced

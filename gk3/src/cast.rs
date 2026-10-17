@@ -1177,6 +1177,20 @@ impl Cast {
         }
     }
 
+    /// Drops the lip-sync and other face changes due after `from` and up
+    /// to `until` (a line cut short), and closes the mouths they would have
+    /// moved.
+    pub fn cancel_faces(&mut self, from: f64, until: f64) {
+        for f in &mut self.figures {
+            let Some(face) = &mut f.face else { continue };
+            let before = face.events.len();
+            face.events.retain(|(at, _)| *at <= from || *at > until);
+            if face.events.len() != before {
+                face.events.push((from, FaceChange::Clear('M')));
+            }
+        }
+    }
+
     fn roll(&mut self) -> f64 {
         self.rng ^= self.rng << 13;
         self.rng ^= self.rng >> 7;

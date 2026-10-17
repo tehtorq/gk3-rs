@@ -334,6 +334,12 @@ fn headless_run(lib: &Library, o: &Options) -> Result<ExitCode, String> {
             settle(&mut world, &renderer, PATIENCE);
             continue;
         }
+        // `SKIPLINES:0.5` clicks through every line half a second in, from
+        // here on.
+        if noun == "SKIPLINES" {
+            world.skip_lines_after = verb.parse::<f64>().ok();
+            continue;
+        }
         if noun == "WAIT" {
             let end = world.outside() + verb.parse::<f64>().unwrap_or(1.0);
             while world.outside() < end {

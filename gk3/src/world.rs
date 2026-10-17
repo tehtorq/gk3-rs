@@ -7,7 +7,7 @@
 //! lines, walking people, and timing all of it, releasing each script that
 //! waits when what it waits on is over.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use gk3_audio::{Audio, Bus};
@@ -47,6 +47,17 @@ enum Until {
     Walk(String),
     /// Until the actor has walked out of a walk-map region (or stopped).
     LeftRegion(String, u8),
+    /// Until a speech's last line is over.
+    Speech(u64),
+}
+
+/// Lines being said, one after another (`speak`).
+struct Speech {
+    id: u64,
+    /// The lines still to come, by plate.
+    plates: VecDeque<String>,
+    /// When the line being said ends.
+    line_end: f64,
 }
 
 struct Task {
@@ -329,6 +340,12 @@ pub struct World<'a> {
     scheduled: Vec<(f64, String, f32, Bus, Option<SoundPlace>)>,
     /// Sounds playing from places in the room, heard from the camera.
     placed: Vec<Placed>,
+    /// Lines being said, and the last speech's number.
+    speeches: Vec<Speech>,
+    next_speech: u64,
+    /// For headless runs: each line is skipped this long after it starts,
+    /// as a player clicking through.
+    pub skip_lines_after: Option<f64>,
     /// Lines and camera cuts animations have set off, by time.
     cues: Vec<(f64, CueKind)>,
     /// Each actor's mood, by noun: the animation that ends it.
@@ -472,6 +489,9 @@ impl<'a> World<'a> {
             audio,
             scheduled: Vec::new(),
             placed: Vec::new(),
+            speeches: Vec::new(),
+            next_speech: 0,
+            skip_lines_after: None,
             cues: Vec::new(),
             moods: HashMap::new(),
             angels: Default::default(),
@@ -586,6 +606,7 @@ impl<'a> World<'a> {
         self.audio.solo(None);
         self.vm = Vm::new();
         self.tasks.clear();
+        self.speeches.clear();
         self.actions.clear();
         self.captions.clear();
         self.scheduled.clear();
@@ -631,6 +652,7 @@ impl<'a> World<'a> {
                 Until::Movie => "a script waits for a movie".into(),
                 Until::Walk(who) => format!("a script waits for {who} to arrive"),
                 Until::LeftRegion(who, r) => format!("a script waits for {who} to leave region {r}"),
+                Until::Speech(_) => "a script waits for lines to be said".into(),
             });
         }
         if !self.actions.is_empty() && self.tasks.is_empty() {
@@ -871,6 +893,7 @@ impl<'a> World<'a> {
         self.inspecting = None;
         self.inspect_from = None;
         self.tasks.clear();
+        self.speeches.clear();
         self.captions.clear();
         for (_, id) in self.soundtrack_sounds.drain(..) {
             self.audio.stop(id);
@@ -2219,14 +2242,14 @@ impl<'a> World<'a> {
             | "STARTDIALOGUENONOFIDGETS"
             | "STARTDIALOGUENOFIDGETS" => {
                 self.dialogue_fidgets = name == "STARTDIALOGUE";
-                let seconds = self.speak(&e.string(0), e.int(1).max(1));
-                Some(Until::Time(now + seconds))
+                let (speech, _) = self.speak(&e.string(0), e.int(1).max(1));
+                Some(Until::Speech(speech))
             }
             "CONTINUEDIALOGUE" | "CONTINUEDIALOGUENOFIDGETS" => {
                 self.dialogue_fidgets = name == "CONTINUEDIALOGUE";
                 let plate = self.last_plate.as_deref().map(next_plate)?;
-                let seconds = self.speak(&plate, e.int(0).max(1));
-                Some(Until::Time(now + seconds))
+                let (speech, _) = self.speak(&plate, e.int(0).max(1));
+                Some(Until::Speech(speech))
             }
             "STARTYAK" => {
                 let seconds = self.yak(&e.string(0)).map_or(0.0, |(s, _)| s);
@@ -3000,7 +3023,12 @@ impl<'a> World<'a> {
         }
     }
 
-    fn speak(&mut self, plate: &str, count: i32) -> f64 {
+    /// Says lines, starting with `plate` and going on through the next
+    /// `count - 1`, one after another, as the original's dialogue request
+    /// plays them (0x478218, 0x4782f6): each line in turn, the next when
+    /// one ends (at its cue) or is skipped. Returns the speech, to wait on,
+    /// and how long its lines take if none is skipped.
+    fn speak(&mut self, plate: &str, count: i32) -> (u64, f64) {
         let mut plate = plate.to_ascii_uppercase();
         // A few scripts leave off the plate's sequence number (`2F9DB44PF`
         // for `2F9DB44PF1`): start from the first line.
@@ -3011,42 +3039,95 @@ impl<'a> World<'a> {
         if !exists(&plate) && exists(&format!("{plate}1")) {
             plate.push('1');
         }
-        let mut at = self.clock;
-        for i in 0..count {
+        let mut plates = VecDeque::new();
+        for i in 0..count.max(1) {
             if i > 0 {
                 plate = next_plate(&plate);
             }
-            // Spoken lines are localised: English adds an E.
-            let line = self
-                .yak_at(&format!("E{plate}"), at)
-                .or_else(|| self.yak_at(&plate, at));
-            if let Some((seconds, captions)) = line {
-                for c in &captions {
-                    if let Some(who) = &c.speaker {
-                        self.speaker_changes
-                            .push((at + c.frame as f64 / 15.0, who.clone()));
-                    }
-                }
-                for c in captions {
-                    self.captions.push(Caption {
-                        text: c.text.clone(),
-                        speaker: c.speaker.clone(),
-                        from: at + c.frame as f64 / 15.0,
-                        until: at + seconds as f64,
-                    });
-                    self.log.push(format!(
-                        "    {}: {}",
-                        c.speaker.as_deref().unwrap_or("?"),
-                        c.text
-                    ));
-                }
-                at += seconds as f64;
-            } else {
-                self.log.push(format!("    (no line {plate})"));
-            }
-            self.last_plate = Some(plate.clone());
+            plates.push_back(plate.clone());
         }
-        at - self.clock
+        let total = plates.iter().map(|p| self.line_length(p)).sum::<f64>();
+        // `ContinueDialogue` goes on from the last of them.
+        self.last_plate = Some(plate);
+        self.next_speech += 1;
+        let id = self.next_speech;
+        self.speeches.push(Speech {
+            id,
+            plates,
+            line_end: self.clock,
+        });
+        self.advance_speeches();
+        (id, total)
+    }
+
+    /// How long a line takes: to its cue, or its end.
+    fn line_length(&mut self, plate: &str) -> f64 {
+        let lib = self.lib;
+        [format!("E{plate}"), plate.to_string()]
+            .iter()
+            .find_map(|name| {
+                self.yaks
+                    .entry(name.to_ascii_uppercase())
+                    .or_insert_with(|| lib.read(&format!("{name}.YAK")).ok().map(|b| Animation::parse(&b)))
+                    .as_ref()
+                    .map(|anm| anm.dialogue_cue.filter(|&c| c > 0).unwrap_or(anm.frames) as f64 / 15.0)
+            })
+            .unwrap_or(0.0)
+    }
+
+    /// Starts each speech's next line once the one before has ended, and
+    /// lets speeches with no lines left end.
+    fn advance_speeches(&mut self) {
+        let now = self.clock;
+        let mut i = 0;
+        while i < self.speeches.len() {
+            if self.speeches[i].line_end > now {
+                i += 1;
+                continue;
+            }
+            match self.speeches[i].plates.pop_front() {
+                Some(plate) => {
+                    let seconds = self.say_line(&plate);
+                    self.speeches[i].line_end = now + seconds;
+                }
+                None => {
+                    self.speeches.remove(i);
+                }
+            }
+        }
+    }
+
+    /// One line, now: its sound, lip-sync and captions, and who speaks.
+    fn say_line(&mut self, plate: &str) -> f64 {
+        let at = self.clock;
+        // Spoken lines are localised: English adds an E.
+        let line = self
+            .yak_at(&format!("E{plate}"), at)
+            .or_else(|| self.yak_at(plate, at));
+        let Some((seconds, captions)) = line else {
+            self.log.push(format!("    (no line {plate})"));
+            return 0.0;
+        };
+        for c in &captions {
+            if let Some(who) = &c.speaker {
+                self.speaker_changes
+                    .push((at + c.frame as f64 / 15.0, who.clone()));
+            }
+        }
+        for c in captions {
+            self.captions.push(Caption {
+                text: c.text.clone(),
+                speaker: c.speaker.clone(),
+                from: at + c.frame as f64 / 15.0,
+                until: at + seconds as f64,
+            });
+            self.log.push(format!(
+                "    {}: {}",
+                c.speaker.as_deref().unwrap_or("?"),
+                c.text
+            ));
+        }
+        seconds as f64
     }
 
     /// A line's length and captions, with its sounds scheduled from `at`.
@@ -3198,15 +3279,27 @@ impl<'a> World<'a> {
         if self.captions.is_empty() {
             return;
         }
+        // As the original's `SkipDialogueLine`: the line being said ends
+        // now (its voice, captions, lip-sync and who is to speak next in
+        // it), and its speech goes on to the next line. Nothing else is
+        // hurried: animations and the story's other waits keep their time.
         let now = self.clock;
-        for task in &mut self.tasks {
-            if let Until::Time(t) = &mut task.until {
-                *t = t.min(now);
-            }
+        let until = self
+            .speeches
+            .iter()
+            .map(|s| s.line_end)
+            .fold(now, f64::max);
+        for speech in &mut self.speeches {
+            speech.line_end = speech.line_end.min(now);
         }
         self.captions.clear();
         self.scheduled.retain(|s| s.3 != Bus::Dialogue);
         self.audio.stop_bus(Bus::Dialogue);
+        self.speaker_changes.retain(|c| c.0 <= now);
+        if let Some(scene) = &mut self.scene {
+            scene.cast.cancel_faces(now, until);
+        }
+        self.advance_speeches();
     }
 
     /// Moves the world on to `now`.
@@ -3267,7 +3360,7 @@ impl<'a> World<'a> {
             for event in map.tick(dt) {
                 match event {
                     crate::map::Event::Say(plate, lines) => {
-                        let seconds = self.speak(&plate, lines);
+                        let (_, seconds) = self.speak(&plate, lines);
                         if let Some((at, _)) = &mut self.map_leave {
                             *at = at.max(now + seconds);
                         }
@@ -3492,12 +3585,21 @@ impl<'a> World<'a> {
             }
         }
 
+        self.advance_speeches();
+        if let Some(after) = self.skip_lines_after
+            && self.captions.iter().any(|c| c.from + after <= now)
+        {
+            self.log.push("  (skips the line)".into());
+            self.skip();
+        }
+
         // Release scripts whose waits are over.
         let mut ready = Vec::new();
         self.tasks.retain(|task| {
             let done = match &task.until {
                 Until::Time(t) => *t <= now,
                 Until::Movie => self.showing.as_ref().is_none_or(|s| s.ended),
+                Until::Speech(id) => !self.speeches.iter().any(|s| s.id == *id),
                 Until::Walk(actor) => !self
                     .scene
                     .as_ref()
@@ -3612,6 +3714,7 @@ impl<'a> World<'a> {
         // left running with no room, their waits would end at once and a
         // script waiting on a timer in a loop would spin forever.
         self.tasks.clear();
+        self.speeches.clear();
         self.scheduled.clear();
         self.cues.clear();
         self.deferred.clear();

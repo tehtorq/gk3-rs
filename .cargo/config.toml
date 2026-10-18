@@ -1,0 +1,5 @@
+# The browser build may use WebAssembly's 128-bit SIMD, which every browser
+# that has WebGPU or WebGL2 also has: loops over vertices and samples are
+# done four at a time.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]

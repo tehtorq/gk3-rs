@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smoothness test</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #000; color: #ccc; font: 15px/1.4 system-ui, sans-serif; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  nav { position: fixed; left: 1em; top: 1em; display: flex; gap: .5em; }
+  nav a { color: #ccc; padding: .3em .8em; border: 1px solid #666; border-radius: 4px; text-decoration: none; background: #111; }
+  nav a.on { background: #444; }
+</style>
+</head>
+<body>
+<!-- A bar sliding across a WebGL2 canvas, drawn three ways, to see which
+     the browser shows smoothly: on the page, from a worker on the worker's
+     own animation frames (as the game is drawn), and from a worker driven by
+     the page's animation frames. -->
+<nav>
+  <a href="?page">page</a>
+  <a href="?worker">worker (own frames)</a>
+  <a href="?ticked">worker (page's frames)</a>
+</nav>
+<canvas id="c"></canvas>
+<script type="module">
+const mode = location.search.slice(1) || "page";
+document.querySelector(`nav a[href="?${mode}"]`)?.classList.add("on");
+const canvas = document.getElementById("c");
+const dpr = window.devicePixelRatio || 1;
+canvas.width = Math.round(canvas.clientWidth * dpr);
+canvas.height = Math.round(canvas.clientHeight * dpr);
+
+// The drawing, the same everywhere: a bar crossing the screen every two
+// seconds, by the clock.
+const draw = `
+  let gl;
+  function setup(canvas) { gl = canvas.getContext("webgl2"); }
+  function frame(ms) {
+    const w = gl.drawingBufferWidth, h = gl.drawingBufferHeight;
+    gl.disable(gl.SCISSOR_TEST);
+    gl.clearColor(0.1, 0.1, 0.12, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.enable(gl.SCISSOR_TEST);
+    const x = ((ms / 2000) % 1) * (w - 80);
+    gl.scissor(x | 0, 0, 80, h);
+    gl.clearColor(0.9, 0.8, 0.3, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+  }`;
+
+if (mode === "page") {
+  new Function("canvas", draw + "; setup(canvas); const loop = (t) => { frame(t); requestAnimationFrame(loop); }; requestAnimationFrame(loop);")(canvas);
+} else {
+  const source = draw + `
+    onmessage = (e) => {
+      if (e.data.canvas) {
+        setup(e.data.canvas);
+        if (!e.data.ticked) {
+          const loop = (t) => { frame(t); requestAnimationFrame(loop); };
+          requestAnimationFrame(loop);
+        }
+      } else frame(e.data.t);
+    };`;
+  const worker = new Worker(URL.createObjectURL(new Blob([source], { type: "text/javascript" })));
+  const offscreen = canvas.transferControlToOffscreen();
+  const ticked = mode === "ticked";
+  worker.postMessage({ canvas: offscreen, ticked }, [offscreen]);
+  if (ticked) {
+    const loop = (t) => { worker.postMessage({ t }); requestAnimationFrame(loop); };
+    requestAnimationFrame(loop);
+  }
+}
+</script>
+</body>
+</html>

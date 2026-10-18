@@ -112,6 +112,9 @@ struct Gfx {
     /// window asked for: for the host to carry out.
     cursor_visible: bool,
     fullscreen_toggle: bool,
+    /// Frames shown, and frames not for want of a surface to draw to.
+    presented: u64,
+    skipped: u64,
     overlay: Overlay,
     /// Where the presentation before the game has got to, if it is on.
     front: Option<Front>,
@@ -275,6 +278,8 @@ impl Gfx {
             time: 0.0,
             cursor_visible: true,
             fullscreen_toggle: false,
+            presented: 0,
+            skipped: 0,
             overlay: Overlay::default(),
             front,
             title_buttons: Vec::new(),
@@ -1613,11 +1618,13 @@ impl Gfx {
             wgpu::CurrentSurfaceTexture::Success(f)
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.skipped += 1;
                 self.surface.configure(self.renderer.device(), &self.config);
                 self.overlay = overlay;
                 return;
             }
             _ => {
+                self.skipped += 1;
                 self.overlay = overlay;
                 return;
             }
@@ -1657,6 +1664,7 @@ impl Gfx {
         }
         before_present();
         self.renderer.queue().present(frame);
+        self.presented += 1;
         self.overlay = overlay;
     }
 }
@@ -2141,6 +2149,11 @@ impl Frontend {
     /// The sound system, for a host that drives its output itself.
     pub fn audio(&self) -> &gk3_audio::Audio {
         &self.0.world.audio
+    }
+
+    /// Frames shown so far, and frames not shown for want of a surface.
+    pub fn frames(&self) -> (u64, u64) {
+        (self.0.presented, self.0.skipped)
     }
 
     /// Whether the player has quit.

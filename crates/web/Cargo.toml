@@ -29,6 +29,7 @@ web-sys = { version = "0.3", features = [
     "MessagePort",
     "OffscreenCanvas",
     "Performance",
+    "WebGl2RenderingContext",
     "WorkerGlobalScope",
     "XmlHttpRequest",
     "XmlHttpRequestResponseType",

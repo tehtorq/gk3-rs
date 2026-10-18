@@ -131,6 +131,12 @@ it is a new game. Sound plays once you first click or press a key (the
 browser's rule), and the game's own cursors are shown. There is no saving
 in the browser yet.
 
+For finding what is slow: `?stats` shows the frame rate, the steps between
+frames and the engine's time a frame; `?sync` counts the GPU's time in that
+too, `?webgl` draws with WebGL2 even where WebGPU is to be had, and
+`?scale=0.5` draws at half resolution. `smooth.html` beside the page is a
+bare WebGL test of how smoothly the browser shows a canvas.
+
 ## Building
 
 ```sh

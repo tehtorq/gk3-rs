@@ -9,11 +9,15 @@ onmessage = async (e) => {
     case "start":
       try {
         await init();
-        await gk3.start(m.canvas, m.files, m.audio, m.args);
-        postMessage({ status: "" });
+        await gk3.start(m.canvas, m.files, m.audio, m.args, m.stats, m.webgl, m.sync);
+        postMessage({ status: "", started: true });
       } catch (err) {
         postMessage({ error: String(err) });
       }
+      break;
+    case "frame":
+      gk3.frame();
+      postMessage({ framed: true });
       break;
     case "moved": gk3.moved(m.x, m.y); break;
     case "mouse": gk3.mouse(m.button, m.down); break;

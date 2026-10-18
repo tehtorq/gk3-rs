@@ -9,6 +9,15 @@ const status = document.getElementById("status");
 const args = (new URLSearchParams(location.search).get("args") ?? "")
   .split(/\s+/)
   .filter((a) => a);
+// `?stats` shows how fast frames come.
+const stats = new URLSearchParams(location.search).has("stats");
+// `?webgl` draws with WebGL2 even where WebGPU is to be had.
+const webgl = new URLSearchParams(location.search).has("webgl");
+// `?sync` counts the GPU's time in the stats; `?scale=0.5` draws at half
+// the window's resolution, shown in hard pixels: both for finding what is
+// slow.
+const sync = new URLSearchParams(location.search).has("sync");
+const resolution = Number(new URLSearchParams(location.search).get("scale")) || 1;
 
 // Keys the browser would otherwise act on itself.
 const OURS = new Set([
@@ -47,7 +56,8 @@ function sound() {
 function begin(files) {
   document.getElementById("start").hidden = true;
   canvas.hidden = false;
-  const scale = () => window.devicePixelRatio || 1;
+  const scale = () => (window.devicePixelRatio || 1) * resolution;
+  if (resolution !== 1) canvas.style.imageRendering = "pixelated";
   const size = () => [
     Math.max(1, Math.round(canvas.clientWidth * scale())),
     Math.max(1, Math.round(canvas.clientHeight * scale())),
@@ -56,15 +66,30 @@ function begin(files) {
   const offscreen = canvas.transferControlToOffscreen();
   const worker = new Worker("worker.js", { type: "module" });
   const send = (m, transfer = []) => worker.postMessage(m, transfer);
+  // A frame on each of the page's animation frames, which keep time with
+  // the display (a worker's own keep to 60 a second); the next asked for
+  // only once the last is drawn, so they never queue up behind a long load.
+  let drawing = false;
+  const tick = () => {
+    if (!drawing) {
+      drawing = true;
+      send({ type: "frame" });
+    }
+    requestAnimationFrame(tick);
+  };
   worker.onmessage = (e) => {
     const m = e.data;
-    if ("cursor" in m) canvas.style.cursor = m.cursor;
+    if (m.framed) drawing = false;
+    else if (m.started) {
+      status.textContent = "";
+      requestAnimationFrame(tick);
+    } else if ("cursor" in m) canvas.style.cursor = m.cursor;
     else if (m.quit) status.textContent = "The game has ended.";
     else status.textContent = m.error ?? m.status ?? "";
   };
   status.textContent = "Starting…";
   const audio = sound();
-  send({ type: "start", canvas: offscreen, files, audio, args }, audio ? [offscreen, audio] : [offscreen]);
+  send({ type: "start", canvas: offscreen, files, audio, args, stats, webgl, sync }, audio ? [offscreen, audio] : [offscreen]);
 
   // The pointer, in the canvas's own pixels.
   const at = (e) => {

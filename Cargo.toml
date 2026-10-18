@@ -35,9 +35,7 @@ lto = "fat"
 codegen-units = 1
 strip = true
 
-# The browser build: optimised, but without the release build's whole-
-# program optimisation, which takes more memory than most machines spare.
+# The browser build: optimised as the release build is, the whole program
+# at once.
 [profile.web]
 inherits = "release"
-lto = false
-codegen-units = 16

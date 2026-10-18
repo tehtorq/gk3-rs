@@ -19,7 +19,8 @@ use js_sys::{Array, Float32Array, Uint8Array};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use web_sys::{
-    DedicatedWorkerGlobalScope, File, FileReaderSync, MessageEvent, MessagePort, OffscreenCanvas, XmlHttpRequest,
+    DedicatedWorkerGlobalScope, File, FileReaderSync, MessageEvent, MessagePort, OffscreenCanvas, WebGl2RenderingContext,
+    XmlHttpRequest,
     XmlHttpRequestResponseType,
 };
 
@@ -228,9 +229,6 @@ fn log(text: &str) {
     web_sys::console::log_1(&text.into());
 }
 
-/// What the browser calls for each frame.
-type Tick = Closure<dyn FnMut(f64)>;
-
 /// The game and the canvas it draws to, once started.
 struct Running {
     game: Frontend,
@@ -239,6 +237,80 @@ struct Running {
     /// The CSS cursor up, and those made so far, by name, scale and frame.
     cursor: Option<String>,
     cursors: HashMap<(String, u32, usize), String>,
+    stats: Stats,
+}
+
+/// How fast frames come, for `?stats`: counted over a second at a time.
+struct Stats {
+    shown: bool,
+    /// With `?sync`, the canvas's WebGL2 context, read from after each frame
+    /// so that the time counted is the GPU's too, not only the asking.
+    want_sync: bool,
+    sync: Option<WebGl2RenderingContext>,
+    /// What draws (the GPU and backend), and the second's start, frames,
+    /// and seconds spent in the engine.
+    what: String,
+    since: f64,
+    frames: u32,
+    busy: f64,
+    /// The game's count of frames shown and skipped at the second's start.
+    shown_at: (u64, u64),
+    /// The time each frame was drawn at, and the steps between, this
+    /// second.
+    last: f64,
+    steps: Vec<f64>,
+}
+
+impl Stats {
+    /// One frame done, `busy` seconds of it in the engine; once a second,
+    /// tells the page.
+    fn frame(&mut self, at: f64, busy: f64, size: (u32, u32), shown: (u64, u64)) {
+        if !self.shown {
+            return;
+        }
+        if self.last > 0.0 {
+            self.steps.push((at - self.last) * 1000.0);
+        }
+        self.last = at;
+        self.frames += 1;
+        self.busy += busy;
+        let now = now();
+        if now - self.since >= 1.0 {
+            let seconds = now - self.since;
+            let fps = self.frames as f64 / seconds;
+            let presented = (shown.0 - self.shown_at.0) as f64 / seconds;
+            let skipped = (shown.1 - self.shown_at.1) as f64 / seconds;
+            self.shown_at = shown;
+            self.steps.sort_by(f64::total_cmp);
+            let step = |q: f64| {
+                self.steps
+                    .get(((self.steps.len().saturating_sub(1)) as f64 * q) as usize)
+                    .copied()
+                    .unwrap_or(0.0)
+            };
+            let steps = format!(
+                "steps {:.1}/{:.1}/{:.1}/{:.1} ms (min/median/90%/max)",
+                step(0.0),
+                step(0.5),
+                step(0.9),
+                step(1.0)
+            );
+            self.steps.clear();
+            let ms = self.busy * 1000.0 / self.frames.max(1) as f64;
+            tell(
+                "status",
+                format!(
+                    "{fps:.0} calls/s, {presented:.0} frames shown, {skipped:.0} skipped · {steps} · {ms:.1} ms a frame {} · {}×{} · {}",
+                    if self.sync.is_some() { "with the GPU's work" } else { "in the engine" },
+                    size.0,
+                    size.1,
+                    self.what
+                )
+                    .into(),
+            );
+            (self.since, self.frames, self.busy) = (now, 0, 0.0);
+        }
+    }
 }
 
 /// How far ahead of what is playing the mix is kept, in seconds: enough to
@@ -442,18 +514,79 @@ pub fn resized(width: u32, height: u32) {
     feed(Input::Resized(width, height));
 }
 
-/// Starts the game in the worker, as `gk3 play` would with `args` (none: a
-/// new game), drawn to `canvas` from then on, a frame each time the browser
-/// asks.
+/// Draws the next frame: the page asks, on each of its own animation
+/// frames, which keep time with the display (a worker's own run at 60 a
+/// second whatever the display's rate), and waits for one before asking
+/// for the next.
 #[wasm_bindgen]
-/// `files` are the player's own, picked on the page, or with none, those the
-/// page's server has at `data/`.
-/// `audio` is the way to the page's sound output, if it has one.
+pub fn frame() {
+    let quit = RUNNING.with_borrow_mut(|running| {
+        let Some(r) = running else {
+            return false;
+        };
+    let start = now();
+    r.game.frame(start);
+    if r.stats.sync.is_none() && r.stats.want_sync {
+        // The context wgpu made: asking again gives the same one.
+        r.stats.sync = r
+            .canvas
+            .get_context("webgl2")
+            .ok()
+            .flatten()
+            .and_then(|c| c.dyn_into::<WebGl2RenderingContext>().ok());
+    }
+    if let Some(gl) = &r.stats.sync {
+        let mut pixel = [0u8; 4];
+        gl.bind_framebuffer(WebGl2RenderingContext::FRAMEBUFFER, None);
+        let _ = gl.read_pixels_with_opt_u8_array(
+            0,
+            0,
+            1,
+            1,
+            WebGl2RenderingContext::RGBA,
+            WebGl2RenderingContext::UNSIGNED_BYTE,
+            Some(&mut pixel),
+        );
+    }
+    for line in r.game.take_log() {
+        log(&line);
+    }
+    r.sound.feed(r.game.audio());
+    let shown = r.game.frames();
+    r.stats.frame(start, now() - start, (r.canvas.width(), r.canvas.height()), shown);
+    let cursors = &mut r.cursors;
+    let cursor = match r.game.cursor() {
+        Some(((name, scale), art, frame)) => cursors
+            .entry((name.clone(), *scale, frame))
+            .or_insert_with(|| css_cursor(art, frame))
+            .clone(),
+        None => "none".into(),
+    };
+    if r.cursor.as_ref() != Some(&cursor) {
+        tell("cursor", cursor.as_str().into());
+        r.cursor = Some(cursor);
+    }
+        r.game.quit()
+    });
+    if quit {
+        tell("quit", true.into());
+    }
+}
+
+/// Starts the game in the worker, as `gk3 play` would with `args` (none: a
+/// new game), drawn to `canvas` a frame each time the page asks (`frame`).
+/// `files` are the player's own, picked on the page, or with none, those
+/// the page's server has at `data/`; `audio` is the way to the page's sound
+/// output, if it has one.
+#[wasm_bindgen]
 pub async fn start(
     canvas: OffscreenCanvas,
     files: Option<Array>,
     audio: Option<MessagePort>,
     args: Vec<String>,
+    stats: bool,
+    webgl: bool,
+    sync: bool,
 ) -> Result<(), JsValue> {
     std::panic::set_hook(Box::new(|info| web_sys::console::error_1(&info.to_string().into())));
     let lib = match files {
@@ -464,7 +597,12 @@ pub async fn start(
     log(&format!("{} archives, {} assets", lib.barns().len(), lib.assets().len()));
 
     let instance = wgpu::util::new_instance_with_webgpu_detection(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
+        // WebGPU where the browser has it, else WebGL2; or WebGL2 if asked.
+        backends: if webgl {
+            wgpu::Backends::GL
+        } else {
+            wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL
+        },
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     })
     .await;
@@ -503,6 +641,7 @@ pub async fn start(
     config.format = format;
     surface.configure(&device, &config);
 
+    let what = format!("{} ({:?})", info.name, info.backend);
     let mut renderer = Renderer::new(device, queue, format);
     renderer.adapter_name = info.name;
     let game = Frontend::new(lib, &args, surface, config, renderer)?;
@@ -513,46 +652,20 @@ pub async fn start(
             sound: Sound::new(audio),
             cursor: None,
             cursors: HashMap::new(),
+            stats: Stats {
+                shown: stats,
+                want_sync: sync,
+                sync: None,
+                what,
+                since: now(),
+                frames: 0,
+                busy: 0.0,
+                shown_at: (0, 0),
+                last: 0.0,
+                steps: Vec::new(),
+            },
         })
     });
 
-    // A frame each time the browser asks for one.
-    let tick: Rc<RefCell<Option<Tick>>> = Rc::new(RefCell::new(None));
-    let again = tick.clone();
-    *tick.borrow_mut() = Some(Closure::new(move |_: f64| {
-        let quit = RUNNING.with_borrow_mut(|running| {
-            let Some(r) = running else {
-                return true;
-            };
-            r.game.frame(now());
-            for line in r.game.take_log() {
-                log(&line);
-            }
-            r.sound.feed(r.game.audio());
-            let cursors = &mut r.cursors;
-            let cursor = match r.game.cursor() {
-                Some(((name, scale), art, frame)) => cursors
-                    .entry((name.clone(), *scale, frame))
-                    .or_insert_with(|| css_cursor(art, frame))
-                    .clone(),
-                None => "none".into(),
-            };
-            if r.cursor.as_ref() != Some(&cursor) {
-                tell("cursor", cursor.as_str().into());
-                r.cursor = Some(cursor);
-            }
-            r.game.quit()
-        });
-        if quit {
-            tell("quit", true.into());
-            return;
-        }
-        if let Some(f) = again.borrow().as_ref() {
-            let _ = scope().request_animation_frame(f.as_ref().unchecked_ref());
-        }
-    }));
-    if let Some(f) = tick.borrow().as_ref() {
-        scope().request_animation_frame(f.as_ref().unchecked_ref())?;
-    }
     Ok(())
 }

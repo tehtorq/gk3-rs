@@ -86,6 +86,33 @@ impl Pose {
         }
     }
 
+    /// A pose part way, `t` (0 to 1), from `from` to `to`, as the original
+    /// morphs (0x553700): each vertex in a straight line between where it
+    /// stood and where `to` has it, in the model's space (both poses seen
+    /// from the same place). The meshes carry no transform of their own
+    /// meanwhile; their vertices are where they are drawn. Meshes or
+    /// submeshes that differ in shape keep `to`'s.
+    pub fn morph(from: &Pose, to: &Pose, t: f32) -> Pose {
+        let mut out = to.clone();
+        for (mesh, old) in out.meshes.iter_mut().zip(&from.meshes) {
+            let (a, b) = (old.matrix(), mesh.matrix());
+            if mesh.positions.len() != old.positions.len()
+                || mesh.positions.iter().zip(&old.positions).any(|(x, y)| x.len() != y.len())
+            {
+                continue;
+            }
+            for (positions, earlier) in mesh.positions.iter_mut().zip(&old.positions) {
+                for (p, e) in positions.iter_mut().zip(earlier) {
+                    let start = a.transform_point3(Vec3::from(*e));
+                    let end = b.transform_point3(Vec3::from(*p));
+                    *p = start.lerp(end, t).to_array();
+                }
+            }
+            mesh.transform = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0]];
+        }
+        out
+    }
+
     /// Mixes this pose back towards `from` by `weight` (0 leaves it, 1 is
     /// `from`): for easing from one pose into another. Meshes or submeshes
     /// that differ in shape are left as they are.
@@ -237,5 +264,25 @@ mod tests {
         p.meshes[0].positions[0][0] = [7.0, 7.0, 7.0];
         p.apply(&clip(&[]), 1.0, false);
         assert_eq!(p.meshes[0].positions[0][0], [7.0, 7.0, 7.0]);
+    }
+
+    #[test]
+    fn a_morph_moves_each_vertex_in_a_straight_line() {
+        // A mesh turned a quarter round between the poses: blending its
+        // transform would swing the vertex round an arc; the morph takes it
+        // straight across.
+        let turned = |quarter: bool| Pose {
+            meshes: vec![MeshPose {
+                transform: if quarter {
+                    [[0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+                } else {
+                    [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0]]
+                },
+                positions: vec![vec![[10.0, 0.0, 0.0]]],
+            }],
+        };
+        let half = Pose::morph(&turned(false), &turned(true), 0.5);
+        let p = half.meshes[0].point(0, 0).unwrap();
+        assert!((p - Vec3::new(5.0, 0.0, -5.0)).length() < 1e-4, "{p}");
     }
 }

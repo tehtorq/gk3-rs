@@ -6,6 +6,7 @@ mod binocs;
 mod bridge;
 mod camera;
 mod cast;
+mod crt;
 mod check;
 mod chessboard;
 mod cursor;

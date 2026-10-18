@@ -58,10 +58,9 @@ Overrides:
   his height comes from his walk's own heights (+0x144), or a set height
   (+0xf0), above the floor. The pendulum sets Gabriel's to 0 (none).
 
-Ours takes the clicks as above. On entering, it keeps forced cuts but
-still starts on the room's first camera, which TE6's scripts cut away from
-at once. Asmodeus's height while walking is our walker's, not mode 5's
-(see `deviations.md`).
+Ours takes the clicks as above. On entering, it keeps forced cuts and the
+camera where it was. Asmodeus's height while walking is our walker's, not
+mode 5's (see `deviations.md`).
 
 ## `Langolier`
 

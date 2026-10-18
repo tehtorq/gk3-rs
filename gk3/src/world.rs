@@ -913,7 +913,12 @@ impl<'a> World<'a> {
             .iter()
             .map(|c| (c.name.to_ascii_uppercase(), c.clone()))
             .collect();
-        self.camera = shoot::start_camera(&room, None)?;
+        // A `Holy` room's set-up leaves the camera where it was (0x4b623f);
+        // any other cuts to the room's first (0x50094d).
+        let start = shoot::start_camera(&room, None)?;
+        if custom.as_deref() != Some("HOLY") {
+            self.camera = start;
+        }
         self.log.push(format!(
             "enter {location} as {scene_name} at {time}: {} action files, {} rules, cast {}",
             files.len() + global.len(),
@@ -3486,8 +3491,8 @@ impl<'a> World<'a> {
         if upper.contains("DOOR") && !upper.contains("LOCK") && !upper.contains("KNOCK") {
             self.door_heard = true;
         }
-        // Skipped through, nothing is heard but the music (0x4b18a5).
-        if self.fast_forward && bus != Bus::Music {
+        // Skipped through, effects and dialogue are off (0x4b18a5).
+        if self.fast_forward && silenced_by_skip(bus) {
             return None;
         }
         match self.pcm(name) {
@@ -3522,7 +3527,7 @@ impl<'a> World<'a> {
         if upper.contains("DOOR") && !upper.contains("LOCK") && !upper.contains("KNOCK") {
             self.door_heard = true;
         }
-        if self.fast_forward && bus != Bus::Music {
+        if self.fast_forward && silenced_by_skip(bus) {
             return;
         }
         let Some(pcm) = self.pcm(name) else {
@@ -3619,6 +3624,10 @@ impl<'a> World<'a> {
         self.log.push("  (skips what is playing)".into());
         self.skip_walks(false);
         self.skip_lock = Some(end);
+        // The skip switches the effects and dialogue off, which stops those
+        // playing (0x4b18a5, 0x5af981); music and ambient sound go on.
+        self.audio.stop_bus(Bus::Effects);
+        self.audio.stop_bus(Bus::Dialogue);
         self.fast_forward = true;
         let mut steps = 0;
         while self.skip_lock.is_some() && self.showing.is_none() && steps < SKIP_STEPS_MOST {
@@ -3954,15 +3963,15 @@ impl<'a> World<'a> {
         self.run_cues(renderer, now);
         let mut soundtracks = std::mem::take(&mut self.soundtracks);
         for track in &mut soundtracks {
-            let bus = if track.music {
-                Bus::Music
-            } else {
-                Bus::Effects
-            };
+            let bus = sound_bus(track.kind);
             let mut length =
                 |clip: &crate::soundtrack::Clip| self.pcm(&clip.name).map(|p| p.seconds());
             let clips = track.update(now, &mut length);
             for clip in clips {
+                // Skipped through, effects and dialogue are off (0x4b18a5).
+                if self.fast_forward && silenced_by_skip(bus) {
+                    continue;
+                }
                 let Some(pcm) = self.pcm(&clip.name) else { continue };
                 let id = match &clip.place {
                     // Heard from its place (0x51b12a), and following its
@@ -5058,6 +5067,23 @@ impl<'a> World<'a> {
     }
 }
 
+/// The bus a soundtrack of a kind plays on.
+fn sound_bus(kind: crate::soundtrack::SoundKind) -> Bus {
+    use crate::soundtrack::SoundKind as K;
+    match kind {
+        K::Sfx => Bus::Effects,
+        K::Ambient => Bus::Ambient,
+        K::Music => Bus::Music,
+        K::Dialogue => Bus::Dialogue,
+    }
+}
+
+/// The kinds of sound a skip switches off (0x4b18a5): types 1 and 8,
+/// effects and dialogue.
+fn silenced_by_skip(bus: Bus) -> bool {
+    matches!(bus, Bus::Effects | Bus::Dialogue)
+}
+
 /// The next line's plate: the last character counts 0-9 then A-Z.
 pub fn next_plate(plate: &str) -> String {
     let mut chars: Vec<char> = plate.chars().collect();
@@ -5461,6 +5487,10 @@ impl crate::mechanism::Room for World<'_> {
         if let Some(scene) = &mut self.scene {
             scene.cast.set_world(model, world);
         }
+    }
+
+    fn world_of(&self, model: &str) -> Option<glam::Mat4> {
+        self.scene.as_ref()?.cast.world_of(model)
     }
 
     fn set_flag(&mut self, flag: &str, on: bool) {

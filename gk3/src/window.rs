@@ -23,6 +23,12 @@ use crate::world::{AfterMovie, Pick, ScreenRequest, World};
 use gk3_game::actions::Rule;
 
 pub fn run(lib: Library, options: Options) -> Result<ExitCode, String> {
+    // The game's random numbers start from the clock, as the original's
+    // `srand` as it starts (0x499b40).
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u32);
+    crate::crt::srand(millis);
     // The world borrows the library for the whole run.
     let lib: &'static Library = Box::leak(Box::new(lib));
     let event_loop = EventLoop::new().map_err(|e| format!("cannot open a window: {e}"))?;

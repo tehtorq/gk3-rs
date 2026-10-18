@@ -324,6 +324,8 @@ impl Settings {
         let level = |v: f32, muted: bool| if muted { 0.0 } else { v };
         audio.set_master(level(self.master, self.mute_all));
         audio.set_volume(Bus::Effects, level(self.effects, self.mute_effects));
+        // The effects volume is the ambient sound's too (0x4e463d).
+        audio.set_volume(Bus::Ambient, level(self.effects, self.mute_effects));
         audio.set_volume(Bus::Dialogue, level(self.dialogue, self.mute_dialogue));
         audio.set_volume(Bus::Music, level(self.music, self.mute_music));
     }

@@ -112,6 +112,8 @@ enum Message {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Pendulum {
     state: State,
+    /// Gabriel was carried round by a step of this update.
+    carried: bool,
     /// The scene's clock, ms, and its steps' (`lastUpdate`, `nextUpdate`,
     /// `startCycle`); `lastUpdate` 0 until the first step.
     now: f64,
@@ -162,6 +164,7 @@ impl Default for Pendulum {
         let swing = PENDULUM_ANGLE.to_radians();
         Self {
             state: State::Doorway,
+            carried: false,
             now: 0.0,
             last_update: 0.0,
             next_update: 0.0,
@@ -381,6 +384,16 @@ impl Pendulum {
             if let Some((at, heading)) = self.ego {
                 room.put_ego(at, heading);
             }
+            // Where Gabriel is carried round, the original writes his
+            // model's transform back to the floor's blood as well as to
+            // him, in place of the blood's own (0x457eed): the blood goes
+            // where he goes.
+            if self.carried
+                && let Some(world) = room.world_of("GABMIC")
+            {
+                room.set_world("GROUNDBLOOD", world);
+            }
+            self.carried = false;
         }
         while let Some(i) = self.due.iter().position(|(at, _)| *at <= self.now) {
             let (_, message) = self.due.remove(i);
@@ -404,6 +417,7 @@ impl Pendulum {
         // Gabriel goes round with his platform, and over to the next in a
         // jump.
         if matches!(self.state, State::OnPlatform | State::LandingOn | State::Jumping) {
+            self.carried = true;
             let mut his = turn;
             if self.time_left != 0 {
                 let step = (dt as i32).min(self.time_left);
@@ -860,6 +874,9 @@ mod tests {
         }
         fn show(&mut self, _: &str, _: bool) {}
         fn set_world(&mut self, _: &str, _: Mat4) {}
+        fn world_of(&self, _: &str) -> Option<Mat4> {
+            None
+        }
         fn set_flag(&mut self, flag: &str, on: bool) {
             self.flags.push((flag.into(), on));
         }

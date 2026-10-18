@@ -21,6 +21,8 @@ pub trait Room {
     fn put_ego(&mut self, at: Vec3, heading: f32);
     fn show(&mut self, model: &str, shown: bool);
     fn set_world(&mut self, model: &str, world: Mat4);
+    /// A model's whole transform now, if there is such a model.
+    fn world_of(&self, model: &str) -> Option<Mat4>;
     fn set_flag(&mut self, flag: &str, on: bool);
     fn score(&mut self, event: &str);
     /// Runs a piece of script as an action.

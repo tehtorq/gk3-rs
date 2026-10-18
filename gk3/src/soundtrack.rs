@@ -7,6 +7,35 @@
 
 use gk3_formats::ini::{Document, Split};
 
+/// The original's kinds of sound (0x46543a): each its own volume (the
+/// effects slider sets effects and ambient sound), and effects and dialogue
+/// are what a skip silences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SoundKind {
+    Sfx,
+    Ambient,
+    Music,
+    Dialogue,
+}
+
+impl SoundKind {
+    fn music() -> Self {
+        Self::Music
+    }
+
+    /// From a `SoundType`, as the original reads it (0x46546b); none if it
+    /// is no kind it knows.
+    pub fn named(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_uppercase().as_str() {
+            "SFX" => Some(Self::Sfx),
+            "AMBIENT" => Some(Self::Ambient),
+            "MUSIC" => Some(Self::Music),
+            "DIALOGUE" => Some(Self::Dialogue),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Clip {
     pub name: String,
@@ -49,7 +78,12 @@ struct Step {
 pub struct Soundtrack {
     /// Upper-cased, without `.STK`, for stopping it by name.
     pub name: String,
-    pub music: bool,
+
+    /// What kind of sound it is (`SoundType`), which says which volume it
+    /// answers to and whether a skip silences it. Read from a save that
+    /// does not have it, as a soundtrack whose file does not say: music.
+    #[serde(default = "SoundKind::music")]
+    pub kind: SoundKind,
     /// Runs through its list once rather than round and round, as an
     /// animation's `PLAYSOUNDTRACKTBS` asks.
     pub once: bool,
@@ -67,7 +101,9 @@ impl Soundtrack {
     pub fn parse(name: &str, bytes: &[u8]) -> Self {
         let doc = Document::parse(bytes, Split::Whole);
         let mut steps: Vec<Step> = Vec::new();
-        let mut music = false;
+        // A soundtrack that does not say is music, as the original makes
+        // one (0x51bccc).
+        let mut kind = SoundKind::Music;
         let mut previous_was_prs = false;
         for section in &doc.sections {
             let get = |key: &str| section.lines.iter().find_map(|l| l.get(key));
@@ -95,7 +131,9 @@ impl Soundtrack {
             let is_prs = name == "PRS";
             match name.as_str() {
                 "SOUNDTRACK" => {
-                    music = get("SoundType").is_some_and(|t| t.eq_ignore_ascii_case("Music"))
+                    if let Some(t) = get("SoundType").and_then(SoundKind::named) {
+                        kind = t;
+                    }
                 }
                 "WAIT" => steps.push(Step {
                     kind: Kind::Wait {
@@ -136,7 +174,7 @@ impl Soundtrack {
             .fold(0x2545_F491_4F6C_DD1Du64, |h, b| h.rotate_left(7) ^ b as u64);
         Self {
             name: name.to_ascii_uppercase(),
-            music,
+            kind,
             once: false,
             steps,
             at: 0,
@@ -286,5 +324,13 @@ mod tests {
         );
         assert_eq!(stk.steps.len(), 2);
         assert!(matches!(&stk.steps[0].kind, Kind::OneOf(c) if c.len() == 3));
+    }
+
+    #[test]
+    fn a_soundtrack_that_does_not_say_is_music() {
+        let plain = Soundtrack::parse("A", b"[Sound]\nName=a\n");
+        assert_eq!(plain.kind, SoundKind::Music);
+        let sfx = Soundtrack::parse("B", b"[SoundTrack]\nSoundType=SFX\n[Sound]\nName=b\n");
+        assert_eq!(sfx.kind, SoundKind::Sfx);
     }
 }

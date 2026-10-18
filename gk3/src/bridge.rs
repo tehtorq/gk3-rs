@@ -127,7 +127,6 @@ pub struct Bridge {
     due: Vec<(f64, String, u32)>,
     /// Waiting for the scripts after a fall.
     dying: bool,
-    seed: u64,
 }
 
 impl Default for Bridge {
@@ -148,9 +147,6 @@ impl Default for Bridge {
             shown: [false; STONES],
             due: Vec::new(),
             dying: false,
-            // Its own sequence, so the story's random numbers stay as they
-            // were.
-            seed: 0x2545_f491_4f6c_dd1d,
         }
     }
 }
@@ -178,11 +174,14 @@ impl Bridge {
         room.show(&stone_model(i), shown);
     }
 
-    fn random(&mut self, n: usize) -> usize {
-        self.seed ^= self.seed << 13;
-        self.seed ^= self.seed >> 7;
-        self.seed ^= self.seed << 17;
-        ((self.seed >> 11) % n as u64) as usize
+    /// Which of `n` stones left to take next (0x445688): the C library's
+    /// number, over 32767, times `n`, cut down to a whole number. Its
+    /// highest number would take one past the last; the original then
+    /// reads past the stones left, and this takes the last.
+    fn random(n: usize) -> usize {
+        let scale = (1.0f32 / 32767.0) as f64;
+        let k = (crate::crt::rand() as f64 * scale * n as f64) as usize;
+        k.min(n - 1)
     }
 
     /// Plays an animation, then sends a message, as the original's
@@ -235,7 +234,7 @@ impl Bridge {
         if self.shuffle_due {
             let mut left: Vec<usize> = (0..STONES).collect();
             for slot in 0..STONES {
-                let k = self.random(left.len());
+                let k = Self::random(left.len());
                 self.order[slot] = left.remove(k);
             }
             self.shuffle_due = false;

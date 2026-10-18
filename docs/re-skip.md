@@ -35,8 +35,13 @@ The `Skip Walk` key: every actor in the room has their walk skipped
 Taken unless already skipping (mode 2 on top). Then:
 
 1. the player's walk, if any, is skipped (0x41d4f9);
-2. mode 2 is pushed (0x4075f5), and sound types 1 and 8 are switched off
-   (0x4b18a5), as is a game setting (+0x449, 0x4995f1);
+2. mode 2 is pushed (0x4075f5), and sound types 1 and 8, effects and
+   dialogue (0x46543a names them: 1 `SFX`, 2 `Ambient`, 4 `Music`, 8
+   `Dialogue`), are switched off (0x4b18a5), as is a game setting (+0x449,
+   0x4995f1). Switching a type off stops every sound of it playing
+   (0x5adcff → 0x5af981) and none starts while it is off; music and
+   ambient sound go on. A soundtrack's type is its `SoundType`, Music if
+   it gives none (0x51bccc);
 3. while mode 2 is on top, the game is run on ten seconds at a time
    (0x49dcf1: the engine's clock, then the game's timed things, 10000 ms);
 4. the settings are put back.

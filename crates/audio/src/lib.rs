@@ -25,7 +25,13 @@ pub enum Bus {
     Music,
     /// A full-screen movie's sound.
     Movie,
+    /// A room's ambient soundtracks: the original's `Ambient` sounds, which
+    /// its effects volume sets too.
+    Ambient,
 }
+
+/// How many buses there are.
+const BUSES: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SoundId(u64);
@@ -49,9 +55,9 @@ struct Voice {
 struct Mixer {
     voices: Vec<Voice>,
     /// Each bus's level in the mix.
-    gains: [f32; 4],
+    gains: [f32; BUSES],
     /// The player's volume for each bus, and for everything.
-    volumes: [f32; 4],
+    volumes: [f32; BUSES],
     master: f32,
     /// While set, only this bus is heard; the rest play on silently.
     solo: Option<Bus>,
@@ -61,8 +67,8 @@ impl Default for Mixer {
     fn default() -> Self {
         Self {
             voices: Vec::new(),
-            gains: [1.0; 4],
-            volumes: [1.0; 4],
+            gains: [1.0; BUSES],
+            volumes: [1.0; BUSES],
             master: 1.0,
             solo: None,
         }
@@ -142,7 +148,7 @@ impl Audio {
         match Pulse::open(application) {
             Ok(pulse) => {
                 let mixer = Arc::new(Mutex::new(Mixer {
-                    gains: [1.0, 0.8, 0.6, 1.0],
+                    gains: [1.0, 0.8, 0.6, 1.0, 0.8],
                     ..Mixer::default()
                 }));
                 let running = Arc::new(AtomicBool::new(true));

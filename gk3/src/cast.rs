@@ -1603,6 +1603,11 @@ impl Cast {
         true
     }
 
+    /// A figure's whole transform now.
+    pub fn world_of(&self, name: &str) -> Option<Mat4> {
+        Some(self.figures[self.find(name)?].world)
+    }
+
     /// Stands an actor at a spot, facing a heading in radians.
     pub fn put(&mut self, name: &str, position: Vec3, heading: f32) {
         let Some(i) = self.find(name) else { return };
@@ -2320,8 +2325,11 @@ impl Cast {
                 } else {
                     1.0
                 };
-                figure.pose = m.to.clone();
-                figure.pose.blend_from(&m.from, 1.0 - t);
+                figure.pose = if t >= 1.0 {
+                    m.to.clone()
+                } else {
+                    Pose::morph(&m.from, &m.to, t)
+                };
                 figure.dirty = true;
                 if t >= 1.0 {
                     figure.morph = None;
@@ -2463,6 +2471,13 @@ impl Cast {
             }
             if keep {
                 self.figures[i].gas = Some(gas);
+            }
+        }
+        // A walker that is not walking follows its model, every frame,
+        // while the model is shown (0x41838e).
+        for figure in &mut self.figures {
+            if figure.walk.is_none() {
+                sync_actor(figure);
             }
         }
     }
@@ -2848,9 +2863,13 @@ struct Start {
     now: f64,
 }
 
-/// Stands an actor where their model is, facing its way, as G-Engine's
-/// `SyncActorToModelPositionAndRotation`.
+/// Stands an actor where their model is, facing its way, as the original's
+/// walker takes its place from the posed model (0x417e56). Only while the
+/// model is shown (0x41838e): a hidden actor's walker stays where it was.
 fn sync_actor(figure: &mut Figure) {
+    if !figure.visible {
+        return;
+    }
     if let Some(a) = &mut figure.actor
         && let Some((floor, facing)) = placement::floor_and_facing(&figure.pose, &a.character)
     {

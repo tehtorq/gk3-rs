@@ -155,4 +155,9 @@ The above, with our animation lengths standing in for the original's
 messages. The platform Gabriel lands on is placed from the platforms'
 layout (each 15° round, the first 7.5° from +Z) rather than its model's
 centre; the two differ by the model's height, which the original's
-normalising lets in. `groundblood` is not moved (see `deviations.md`).
+normalising lets in. In the steps that carry Gabriel round (states 1, 6,
+8, 9) the original reads the centre's, `gabmic`'s and `groundblood`'s
+transforms, turns the first two, and writes `gabmic`'s back to both
+`gabmic` and `groundblood` (0x457eed): the blood goes where Gabriel's
+model goes. Ours gives `groundblood` `gabmic`'s transform after each such
+update.

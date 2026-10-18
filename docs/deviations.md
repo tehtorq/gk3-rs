@@ -137,21 +137,12 @@ Behaviour that is not yet the original's, with what is known.
 
 | What | The original | Ours | Status |
 |---|---|---|---|
-| Where a hidden actor posed by its `initAnim` stands | A walker that is not walking follows its model each frame, but only while the model is visible *(traced: 0x41838e → 0x4d6d81 → 0x417e56)*: a hidden actor's walker stays where it was made (its `pos=`, else the origin) until shown | Stood where the posed model is at once, shown or not | — |
-| Sound while skipping | Sound types 1 and 8 are switched off while the story is run on *(traced: 0x4b18a5; which sounds those types are, not traced)* | Speech and sound effects do not start; music and the rooms' ambient sound go on | To trace the types |
 | The GPS's size | Picked by the screen's width (1024, 800) and drawn unscaled *(traced: 0x46f7ca)* | Picked by the window's height as a 4:3 screen (768, 600) and scaled to the window, as the rest of the interface | — |
-| Asmodeus's height while walking (TE6) | The `Holy` scene sets his walker's `mFloorClamp` to 5, which holds him above the floor by his walk's own heights *(traced in outline: 0x4b625d, 0x418000; the height tables not)* | Our walker's height for him | To trace the walker's clamp modes |
-| The camera entering TE6 | Left where it was: the `Holy` scene's set-up does not cut to the room's first camera *(traced: 0x4b623f)* | Starts on the room's first camera; TE6's scripts cut at once | — |
-| Where TE3's pendulum carries the blood | Each step the floor's `groundblood` is given `gabmic`'s matrix *(traced: 0x457eed writes the wrong matrix back)* | Left alone; `Restart$` hides it | — |
-| The order TE5's stones glint in | Shuffled each round with the C library's `rand()` *(traced)*; how it was seeded is not | Shuffled each round from a sequence of our own | — |
+| Random numbers | One sequence for the whole game, the C library's `rand` (0x5c2ac1), seeded from the clock as the game starts (0x499b40) and not saved: idle scripts' choices and waits (0x42ed19), fidgets, walkers giving way, soundtracks, `GetRandomInt` (0x4ad0c8), TE5's stones | TE5's stones draw from it as the original does (seeded from the clock in a window, from the C library's own seed of 1 headless); the rest each draw from a sequence of their own, saved with the game | To trace each use's draw |
+| Asmodeus's height while walking (TE6) | The `Holy` scene sets his walker's `mFloorClamp` to 5 (0x4b625d). For him alone (noun 0x4f) his walk's start and cycle are sampled frame by frame as they are set, the hip's height at each kept (0x4172cf). Walking in mode 5, his walker's height is the floor's less the shoe offset plus that frame's hip height, eased between frames, where any other walker's is the floor's under its feet (0x417e56); the change is added to his model's height each frame (0x419556) *(traced; how that sits with the walk clip's own placement each frame, not)* | Our walker stands his lowest foot on the floor, as any walker's | To trace the walk's placement each frame |
 
 ### Small differences in what is traced
 
-- **A morph's easing** (`StartMorphAnimation`): the original moves each
-  vertex in a straight line from where it was to the animation's frame;
-  ours mixes each mesh's placement and its vertices, which over the
-  quarter-second the game asks for looks the same. *(traced:
-  `re-animation.md`)*
 - **Sounds placed in the room** are heard as Wine's DirectSound hears the
   original's 3D sounds (`re-sound.md`): its formulas for the fall-off and
   the share between the speakers. Windows' own DirectSound, or a sound

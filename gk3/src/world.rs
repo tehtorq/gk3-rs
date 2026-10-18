@@ -364,6 +364,9 @@ pub struct World<'a> {
     last_plate: Option<String>,
     /// What happened, in order, for logs and tests.
     pub log: Vec<String>,
+    /// How many times the score has gone up, for the window to show it
+    /// (the original's score manager tells its status line, 0x5072d5).
+    pub scored: u32,
     yaks: HashMap<String, Option<Animation>>,
     pub audio: Audio,
     /// Sounds due to start, by time.
@@ -520,6 +523,7 @@ impl<'a> World<'a> {
             fingerprint_label: None,
             last_plate: None,
             log: Vec::new(),
+            scored: 0,
             yaks: HashMap::new(),
             audio,
             scheduled: Vec::new(),
@@ -2370,6 +2374,11 @@ impl<'a> World<'a> {
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
+        if e.is("ChangeScore") {
+            // A script's score, already counted in the story.
+            self.scored += 1;
+            return None;
+        }
         let scene = self.scene.as_mut()?;
         let name = e.name.to_ascii_uppercase();
         match name.as_str() {
@@ -4283,7 +4292,7 @@ impl<'a> World<'a> {
             self.state.flags.insert(gk3_game::state::key(flag));
         }
         if let Some(score) = print.score {
-            self.state.score_events.insert(gk3_game::state::key(score));
+            self.award_score(score);
         }
         self.log
             .push(format!("  fingerprint {} kept", print.texture));
@@ -4358,14 +4367,14 @@ impl<'a> World<'a> {
                     self.state.variables.insert(key(v), n);
                 }
                 Event::Score(s) => {
-                    self.state.score_events.insert(key(&s));
+                    self.award_score(&s);
                 }
                 Event::AddFile(id) => {
                     if self.state.sidney_files.insert(id)
                         && let Some(f) = crate::sidney::file(id)
                         && !f.score.is_empty()
                     {
-                        self.state.score_events.insert(key(f.score));
+                        self.award_score(f.score);
                     }
                     self.log.push(format!("  SIDNEY file {id} added"));
                 }
@@ -4837,6 +4846,13 @@ impl<'a> World<'a> {
         if self.held != held {
             self.held = held;
             self.audio.hold(held);
+        }
+    }
+
+    /// Scores an event, if it may (`GameState::award_score`).
+    fn award_score(&mut self, event: &str) {
+        if self.state.award_score(event) {
+            self.scored += 1;
         }
     }
 
@@ -5503,7 +5519,7 @@ impl crate::mechanism::Room for World<'_> {
     }
 
     fn score(&mut self, event: &str) {
-        self.state.score_events.insert(gk3_game::state::key(event));
+        self.award_score(event);
     }
 
     fn script(&mut self, text: &str) {

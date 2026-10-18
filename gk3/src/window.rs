@@ -73,6 +73,40 @@ enum Front {
     Title,
 }
 
+/// The status line at the top left, as the original's `RCBarPopper` shows
+/// it (0x4f0dd0): where the player is, the day and time, and the score.
+/// It comes up while the pointer is at the top of the screen and when the
+/// score goes up, and is held a while, then fades.
+#[derive(Default)]
+struct StatusLine {
+    state: StatusState,
+    text: String,
+    /// When the hold or the fade began.
+    since: f64,
+    /// The world's count of scores, as last seen.
+    scored: u32,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum StatusState {
+    #[default]
+    Hidden,
+    /// Up for as long as the pointer is at the top.
+    Held,
+    /// Up for `STATUS_HOLD` more, then fading.
+    Holding,
+    Fading,
+}
+
+/// How long the status line stays up once let go (0xdac ms, 0x4f0a56), and
+/// how long it takes to fade (1000 ms, 0x4f127a).
+const STATUS_HOLD: f64 = 3.5;
+const STATUS_FADE: f64 = 1.0;
+/// The pointer this near the top brings it up (0x4f119d), and it sits this
+/// far in from the top left (0x4f0979), in the interface's pixels.
+const STATUS_TOP: f32 = 16.0;
+const STATUS_AT: f32 = 5.0;
+
 struct Gfx {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
@@ -112,6 +146,7 @@ struct Gfx {
     /// window asked for: for the host to carry out.
     cursor_visible: bool,
     fullscreen_toggle: bool,
+    status: StatusLine,
     /// Frames shown, and frames not for want of a surface to draw to.
     presented: u64,
     skipped: u64,
@@ -278,6 +313,7 @@ impl Gfx {
             time: 0.0,
             cursor_visible: true,
             fullscreen_toggle: false,
+            status: StatusLine::default(),
             presented: 0,
             skipped: 0,
             overlay: Overlay::default(),
@@ -320,6 +356,107 @@ impl Gfx {
 
     /// The player may move the camera only in the room itself, with nothing
     /// playing and no menu or inventory up.
+    /// Puts the status line up afresh, with what is so now (0x4f0dd0); not
+    /// over the driving map or a movie.
+    fn status_up(&mut self) {
+        let movie = self.world.showing.as_ref().is_some_and(|s| !s.ended);
+        if self.world.map.is_some() || movie {
+            return;
+        }
+        let state = &self.world.state;
+        let place = self.ui.string(&format!("loc_{}", state.location.to_ascii_lowercase()));
+        let when = self.ui.string(&format!("Day{}", state.timeblock.to_ascii_lowercase()));
+        let score = printf_ints(
+            &self.ui.string("ScoreText"),
+            &[self.world.score(), gk3_game::scores::MAX_SCORE],
+        );
+        self.status.text = format!("{place}, {when}, {score}");
+        self.status.state = StatusState::Held;
+    }
+
+    /// The score went up: the status line comes up and is let go at once
+    /// (0x4f1299).
+    fn status_scored(&mut self) {
+        self.status_up();
+        if self.status.state == StatusState::Held {
+            self.status.state = StatusState::Holding;
+            self.status.since = self.time;
+        }
+    }
+
+    /// The pointer moved, to `y`: at the top, the status line comes up and
+    /// stays; away from it, the line is let go (0x4f1196). Only while the
+    /// game is what takes the pointer, or the fingerprint kit or the LSR
+    /// map, which keep the popper too.
+    fn status_pointer(&mut self, y: f32) {
+        let takes = !self.modal()
+            && self.front.is_none()
+            && self.card.is_none()
+            && self.bar.is_none()
+            && self.menu.is_none()
+            && !self.world.state.inventory_shown
+            && self.world.binocs.is_none()
+            && self.world.sidney.as_ref().is_none_or(|s| s.lsr_map_up());
+        if !takes {
+            return;
+        }
+        let top = STATUS_TOP * crate::screens::ui_scale(self.size());
+        match (y <= top, self.status.state) {
+            (true, StatusState::Hidden | StatusState::Fading) => self.status_up(),
+            (true, StatusState::Holding) => self.status.state = StatusState::Held,
+            (false, StatusState::Held) => {
+                self.status.state = StatusState::Holding;
+                self.status.since = self.time;
+            }
+            _ => {}
+        }
+    }
+
+    /// Moves the status line on: a held line fades, a faded one goes
+    /// (0x4f1259, 0x4678c4); and draws it, over everything.
+    fn status_line(&mut self, overlay: &mut Overlay) {
+        let now = self.time;
+        if self.world.scored < self.status.scored {
+            // Another story, started or loaded.
+            self.status.scored = self.world.scored;
+        } else if self.world.scored > self.status.scored {
+            self.status.scored = self.world.scored;
+            self.status_scored();
+        }
+        let s = &mut self.status;
+        if s.state == StatusState::Holding && now - s.since >= STATUS_HOLD {
+            s.state = StatusState::Fading;
+            s.since = now;
+        }
+        if s.state == StatusState::Fading && now - s.since >= STATUS_FADE {
+            s.state = StatusState::Hidden;
+        }
+        // A movie or the map, full screen, is over it.
+        let movie = self.world.showing.as_ref().is_some_and(|s| !s.ended);
+        if movie || self.world.map.is_some() {
+            return;
+        }
+        let s = &self.status;
+        let opacity = match s.state {
+            StatusState::Hidden => return,
+            StatusState::Held | StatusState::Holding => 1.0,
+            StatusState::Fading => 1.0 - ((now - s.since) / STATUS_FADE) as f32,
+        };
+        // The font is drawn at 70% over 30% of what is behind
+        // (`F_STATUS_FADE.FON`).
+        let scale = crate::screens::ui_scale(self.size());
+        self.ui.write_line(
+            self.world.lib,
+            &mut self.renderer,
+            overlay,
+            "F_STATUS_FADE",
+            &self.status.text,
+            (STATUS_AT * scale, STATUS_AT * scale),
+            scale,
+            opacity * 0.7,
+        );
+    }
+
     fn camera_free(&self) -> bool {
         self.camera_yours()
             && !self.modal()
@@ -1613,6 +1750,7 @@ impl Gfx {
         {
             self.ui.notice(&mut overlay, text, size);
         }
+        self.status_line(&mut overlay);
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
@@ -1667,6 +1805,38 @@ impl Gfx {
         self.presented += 1;
         self.overlay = overlay;
     }
+}
+
+/// A C format string's `%d`s (with any width and zero fill, as `%03d`)
+/// filled in with `values`, in order.
+fn printf_ints(format: &str, values: &[u32]) -> String {
+    let mut out = String::new();
+    let mut values = values.iter();
+    let mut rest = format;
+    while let Some(at) = rest.find('%') {
+        out.push_str(&rest[..at]);
+        let spec = &rest[at + 1..];
+        if let Some(after) = spec.strip_prefix('%') {
+            out.push('%');
+            rest = after;
+            continue;
+        }
+        let digits = spec.bytes().take_while(u8::is_ascii_digit).count();
+        if spec[digits..].starts_with('d') {
+            let width = &spec[..digits];
+            let value = values.next().copied().unwrap_or(0);
+            out.push_str(&match (width.starts_with('0'), width.parse::<usize>().unwrap_or(0)) {
+                (true, w) => format!("{value:0w$}"),
+                (false, w) => format!("{value:w$}"),
+            });
+            rest = &spec[digits + 1..];
+        } else {
+            out.push('%');
+            rest = spec;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Shows a frame of one of the game's cursors as the system's, making the
@@ -1747,6 +1917,7 @@ impl Gfx {
             }
             Input::Moved(x, y) => {
                 let to = (x, y);
+                self.status_pointer(y);
                 if let Some((slider, track)) = self.sliding {
                     let fit = crate::screens::ui_scale(self.size());
                     self.set_slider(slider, crate::screens::slider_value(track, to.0, fit));
@@ -2164,5 +2335,16 @@ impl Frontend {
     /// What has happened, for the host's log.
     pub fn take_log(&mut self) -> Vec<String> {
         std::mem::take(&mut self.0.world.log)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_score_text_is_filled_in_as_c_would() {
+        assert_eq!(printf_ints("Score: %03d of %03d", &[12, 965]), "Score: 012 of 965");
+        assert_eq!(printf_ints("%d%% done", &[50]), "50% done");
     }
 }

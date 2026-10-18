@@ -1,10 +1,43 @@
 //! What each score event is worth. The original keeps these in its
 //! executable rather than its data: 385 event names (`GK3.exe` 0x6f0c14) and
-//! their points (0x685f40), read out here. An event counts once.
+//! their points (0x685f40), read out here. An event counts once, an event
+//! not in the table not at all, and of six pairs only the first scored
+//! counts (0x5072d5).
 
-/// The most a game can score: some events are alternatives, so the table's
-/// total (978) is never reached.
+/// The most a game can score, as the game's `GAME.CFG` gives it (`[Logic]
+/// Max Score`, read at 0x5071f7): the table's own total is 978, 967 with
+/// one of each pair.
 pub const MAX_SCORE: u32 = 965;
+
+/// The events of which only one may score: once either is scored the other
+/// is worth nothing, whichever comes first (0x50721b).
+pub const ALTERNATIVES: &[(&str, &str)] = &[
+    ("e_210a_r29_exit_balcony", "e_210a_r29_enter_from_balcony"),
+    ("e_210a_r31_exit_balcony", "e_210a_r31_enter_from_balcony"),
+    ("e_210a_r21_fingerprint_kit_suitcase", "e_202p_lby_fingerprint_kit_buchelli_glass"),
+    ("e_212p_cse_climb_vines", "e_212p_cse_open_cellar_doors"),
+    ("e_310a_hal_enter_r23_see_jean_roxanne", "e_310a_lby_talk_jean_wilkes"),
+    ("e_303p_din_manuscript_no_prints", "e_303p_din_manuscript_prints"),
+];
+
+/// The event that rules this one out once scored, if it has one.
+pub fn alternative(event: &str) -> Option<&'static str> {
+    let event = event.trim();
+    ALTERNATIVES.iter().find_map(|&(a, b)| {
+        if a.eq_ignore_ascii_case(event) {
+            Some(b)
+        } else if b.eq_ignore_ascii_case(event) {
+            Some(a)
+        } else {
+            None
+        }
+    })
+}
+
+/// Whether an event is in the table at all.
+pub fn known(event: &str) -> bool {
+    EVENTS.iter().any(|(name, _)| name.eq_ignore_ascii_case(event.trim()))
+}
 
 /// Each event's name, as `ChangeScore` gives it, and its points.
 pub const EVENTS: &[(&str, u32)] = &[
@@ -405,7 +438,7 @@ pub fn points(event: &str) -> u32 {
 
 /// The score for a set of events achieved.
 pub fn total<'a>(events: impl IntoIterator<Item = &'a String>) -> u32 {
-    events.into_iter().map(|e| points(e)).sum::<u32>().min(MAX_SCORE)
+    events.into_iter().map(|e| points(e)).sum()
 }
 
 #[cfg(test)]
@@ -419,5 +452,19 @@ mod tests {
         assert_eq!(points("no such event"), 0);
         let got = ["E_110A_R25_TAPE".to_string(), "e_110a_din_enter".to_string()];
         assert_eq!(total(&got), 6);
+    }
+
+    #[test]
+    fn of_each_pair_only_one_can_score() {
+        for (a, b) in ALTERNATIVES {
+            assert!(known(a) && known(b), "{a} {b}");
+            assert_eq!(alternative(a), Some(*b));
+            assert_eq!(alternative(&b.to_ascii_uppercase()), Some(*a));
+        }
+        assert_eq!(alternative("e_110a_r25_tape"), None);
+        // The table, with the lesser of each pair left out.
+        let all: u32 = EVENTS.iter().map(|(_, p)| p).sum();
+        let lesser: u32 = ALTERNATIVES.iter().map(|(a, b)| points(a).min(points(b))).sum();
+        assert_eq!((all, all - lesser), (978, 967));
     }
 }

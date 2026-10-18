@@ -64,7 +64,9 @@ and click a verb icon; right-click or Esc closes the menu; while someone is
 speaking, a click or Space moves on to the next line. I, Tab or the button at
 the bottom left opens the inventory; click an item for INSPECT (close-up),
 its verbs, and PICKUP, which puts it in hand so it is offered as a verb on
-whatever you click next. Esc, as in the original, skips: what is playing is
+whatever you click next. Moving the pointer to the top of the screen
+shows, as in the original, where you are, the day and time, and the score;
+the same line comes up for a moment whenever the score goes up. Esc, as in the original, skips: what is playing is
 run on to its end (a conversation to the end of the topic), or with nothing
 playing, walks jump to where they were going. Ctrl+Q asks to quit.
 

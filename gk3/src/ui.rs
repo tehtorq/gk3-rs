@@ -1272,6 +1272,26 @@ impl Ui {
         self.measure(font, text)
     }
 
+    /// Writes a line with its top left at `at` in the window's pixels,
+    /// `scale` times its size, at an opacity from 0 to 1.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_line(
+        &mut self,
+        lib: &Library,
+        renderer: &mut Renderer,
+        overlay: &mut Overlay,
+        font: &str,
+        text: &str,
+        at: (f32, f32),
+        scale: f32,
+        opacity: f32,
+    ) {
+        if self.need_font(lib, renderer, font) {
+            let alpha = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+            self.text(overlay, font, text, at, scale, [255, 255, 255, alpha]);
+        }
+    }
+
     /// Writes text in a 640x480 space, in a font that brings its own
     /// colours, wrapped to `width` if given and aligned in it. Returns the
     /// height used, in screen pixels.

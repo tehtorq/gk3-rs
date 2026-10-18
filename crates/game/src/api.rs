@@ -356,7 +356,14 @@ impl<'a> GameApi<'a> {
                 Value::Int(0)
             }
             "CHANGESCORE" => {
-                st.score_events.insert(key(&s(0)));
+                // The engine shows the score when it goes up (0x5072d5).
+                if st.award_score(&s(0)) {
+                    self.effects.push(Effect {
+                        name: "ChangeScore".into(),
+                        args: vec![Value::Str(s(0))],
+                        thread: None,
+                    });
+                }
                 Value::Int(0)
             }
             // Time and place.

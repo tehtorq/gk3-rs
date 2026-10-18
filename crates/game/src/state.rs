@@ -78,6 +78,20 @@ pub fn character(name: &str) -> String {
 }
 
 impl GameState {
+    /// Scores an event, as the original's score manager does (0x5072d5):
+    /// only an event in the table, only once, and not once its alternative
+    /// has scored. Whether it scored.
+    pub fn award_score(&mut self, event: &str) -> bool {
+        let event = key(event);
+        if !crate::scores::known(&event)
+            || self.score_events.contains(&event)
+            || crate::scores::alternative(&event).is_some_and(|a| self.score_events.contains(&key(a)))
+        {
+            return false;
+        }
+        self.score_events.insert(event)
+    }
+
     pub fn new(timeblock: &str, location: &str) -> Self {
         Self {
             timeblock: key(timeblock),
@@ -242,6 +256,18 @@ impl GameState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_score_counts_once_and_rules_out_its_alternative() {
+        let mut s = GameState::default();
+        assert!(s.award_score("e_303p_din_manuscript_no_prints"));
+        assert!(!s.award_score("E_303P_DIN_MANUSCRIPT_NO_PRINTS"));
+        // The prints route came second: it scores nothing.
+        assert!(!s.award_score("e_303p_din_manuscript_prints"));
+        assert!(!s.award_score("e_no_such_event"));
+        assert!(s.award_score("e_110a_r25_tape"));
+        assert_eq!(crate::scores::total(&s.score_events), 4);
+    }
 
     #[test]
     fn names_are_case_insensitive_and_characters_alias() {

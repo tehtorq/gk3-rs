@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["crates/audio", "crates/barn", "crates/bink", "crates/formats", "crates/game", "crates/media", "crates/render", "crates/sheep", "gk3"]
+members = ["crates/audio", "crates/barn", "crates/bink", "crates/formats", "crates/game", "crates/media", "crates/render", "crates/sheep", "crates/web", "gk3"]
+# The browser build is made for wasm32 on its own (see crates/web).
+default-members = ["crates/audio", "crates/barn", "crates/bink", "crates/formats", "crates/game", "crates/media", "crates/render", "crates/sheep", "gk3"]
 
 [workspace.package]
 version = "0.1.0"
@@ -32,3 +34,10 @@ serde_json = "1"
 lto = "fat"
 codegen-units = 1
 strip = true
+
+# The browser build: optimised, but without the release build's whole-
+# program optimisation, which takes more memory than most machines spare.
+[profile.web]
+inherits = "release"
+lto = false
+codegen-units = 16

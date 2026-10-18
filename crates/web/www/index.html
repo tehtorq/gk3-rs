@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gabriel Knight 3</title>
+<style>
+  :root { color-scheme: dark; }
+  [hidden] { display: none !important; }
+  body { margin: 0; background: #000; color: #ccc; font: 15px/1.4 system-ui, sans-serif; }
+  #start { position: fixed; inset: 0; display: grid; place-items: center; text-align: center; }
+  #start p { max-width: 32em; margin: 0 1em 1.2em; }
+  label { display: inline-block; padding: .6em 1.2em; border: 1px solid #888; border-radius: 4px; cursor: pointer; }
+  label:hover { background: #222; }
+  input { display: none; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #status { position: fixed; left: 1em; bottom: 1em; color: #aaa; }
+</style>
+</head>
+<body>
+<div id="start" hidden>
+  <div>
+    <p>Gabriel Knight 3 runs here from your own copy of the game. Choose its
+    <b>Data</b> folder; nothing is uploaded. (Run <code>scripts/gk3-web</code>
+    to have the folder served with the page and skip this.)</p>
+    <label>Choose the Data folder<input id="data" type="file" webkitdirectory multiple></label>
+  </div>
+</div>
+<canvas id="screen" hidden></canvas>
+<div id="status"></div>
+<script type="module" src="main.js"></script>
+</body>
+</html>

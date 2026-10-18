@@ -5,3 +5,5 @@
 *.BRN
 *.bik
 *.BIK
+# The browser build's generated files (see crates/web).
+/crates/web/www/pkg

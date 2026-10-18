@@ -4,17 +4,19 @@
 //! written to the system through PulseAudio's simple API, which PipeWire also
 //! provides. The library is loaded when the game starts rather than linked,
 //! so a machine without it gets a silent game instead of one that will not
-//! start.
+//! start. In a browser the page asks for the mix as Web Audio plays it
+//! (`Audio::mix`).
 
-use std::ffi::{CString, c_char, c_int, c_void};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(not(target_arch = "wasm32"))]
 use std::thread;
 
 use gk3_media::Pcm;
 
 pub const RATE: u32 = 44_100;
 /// Frames mixed per write: about 23 ms.
+#[cfg(not(target_arch = "wasm32"))]
 const CHUNK: usize = 1024;
 
 /// Which volume control a sound answers to.
@@ -143,16 +145,41 @@ impl Audio {
         }
     }
 
+    /// In a browser: a mix the page takes as it plays it (`mix`).
+    #[cfg(target_arch = "wasm32")]
+    pub fn open(_: &str) -> Self {
+        Self::mixed(Arc::new(AtomicBool::new(true)), "Web Audio")
+    }
+
+    /// A mixer at the game's levels, with no output yet.
+    fn mixed(running: Arc<AtomicBool>, status: &str) -> Self {
+        Self {
+            mixer: Some(Arc::new(Mutex::new(Mixer {
+                gains: [1.0, 0.8, 0.6, 1.0, 0.8],
+                ..Mixer::default()
+            }))),
+            next: Arc::new(AtomicU64::new(1)),
+            running,
+            status: Arc::new(status.into()),
+        }
+    }
+
+    /// Mixes the next `out.len() / 2` frames of interleaved 44.1 kHz stereo,
+    /// for an output that asks for them (a browser's).
+    pub fn mix(&self, out: &mut [i16]) {
+        match &self.mixer {
+            Some(mixer) => mixer.lock().unwrap().mix(out),
+            None => out.fill(0),
+        }
+    }
+
     /// Opens the system's sound output, or returns a silent system saying why.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open(application: &str) -> Self {
         match Pulse::open(application) {
             Ok(pulse) => {
-                let mixer = Arc::new(Mutex::new(Mixer {
-                    gains: [1.0, 0.8, 0.6, 1.0, 0.8],
-                    ..Mixer::default()
-                }));
-                let running = Arc::new(AtomicBool::new(true));
-                let (m, r) = (mixer.clone(), running.clone());
+                let audio = Self::mixed(Arc::new(AtomicBool::new(true)), "PulseAudio");
+                let (m, r) = (audio.mixer.clone().unwrap(), audio.running.clone());
                 let spawned = thread::Builder::new().name("audio".into()).spawn(move || {
                     let mut buffer = vec![0i16; CHUNK * 2];
                     while r.load(Ordering::Relaxed) {
@@ -163,12 +190,7 @@ impl Audio {
                     }
                 });
                 match spawned {
-                    Ok(_) => Self {
-                        mixer: Some(mixer),
-                        next: Arc::new(AtomicU64::new(1)),
-                        running,
-                        status: Arc::new("PulseAudio".into()),
-                    },
+                    Ok(_) => audio,
                     Err(e) => Self::silent(&format!("no audio thread: {e}")),
                 }
             }
@@ -292,132 +314,142 @@ impl Drop for Audio {
     }
 }
 
-#[repr(C)]
-struct SampleSpec {
-    format: c_int,
-    rate: u32,
-    channels: u8,
-}
+#[cfg(not(target_arch = "wasm32"))]
+use pulse::Pulse;
 
-#[repr(C)]
-struct BufferAttr {
-    maxlength: u32,
-    tlength: u32,
-    prebuf: u32,
-    minreq: u32,
-    fragsize: u32,
-}
+/// PulseAudio, loaded at run time: not in a browser.
+#[cfg(not(target_arch = "wasm32"))]
+mod pulse {
+    use super::*;
+    use std::ffi::{CString, c_char, c_int, c_void};
 
-type NewFn = unsafe extern "C" fn(
-    *const c_char,
-    *const c_char,
-    c_int,
-    *const c_char,
-    *const c_char,
-    *const SampleSpec,
-    *const c_void,
-    *const BufferAttr,
-    *mut c_int,
-) -> *mut c_void;
-type WriteFn = unsafe extern "C" fn(*mut c_void, *const c_void, usize, *mut c_int) -> c_int;
-type FreeFn = unsafe extern "C" fn(*mut c_void);
+    #[repr(C)]
+    struct SampleSpec {
+        format: c_int,
+        rate: u32,
+        channels: u8,
+    }
 
-/// A playback stream through `libpulse-simple`, loaded at run time.
-struct Pulse {
-    _library: libloading::Library,
-    stream: *mut c_void,
-    write: WriteFn,
-    free: FreeFn,
-}
+    #[repr(C)]
+    struct BufferAttr {
+        maxlength: u32,
+        tlength: u32,
+        prebuf: u32,
+        minreq: u32,
+        fragsize: u32,
+    }
 
-// The stream is only ever used from the audio thread it is moved to.
-unsafe impl Send for Pulse {}
+    type NewFn = unsafe extern "C" fn(
+        *const c_char,
+        *const c_char,
+        c_int,
+        *const c_char,
+        *const c_char,
+        *const SampleSpec,
+        *const c_void,
+        *const BufferAttr,
+        *mut c_int,
+    ) -> *mut c_void;
+    type WriteFn = unsafe extern "C" fn(*mut c_void, *const c_void, usize, *mut c_int) -> c_int;
+    type FreeFn = unsafe extern "C" fn(*mut c_void);
 
-const PA_SAMPLE_S16LE: c_int = 3;
-const PA_STREAM_PLAYBACK: c_int = 1;
+    /// A playback stream through `libpulse-simple`, loaded at run time.
+    pub(super) struct Pulse {
+        _library: libloading::Library,
+        stream: *mut c_void,
+        write: WriteFn,
+        free: FreeFn,
+    }
 
-impl Pulse {
-    fn open(application: &str) -> Result<Self, String> {
-        // SAFETY: loading a system library runs its initialisers; this one
-        // is PulseAudio's own client library.
-        let library = unsafe { libloading::Library::new("libpulse-simple.so.0") }
-            .map_err(|e| format!("no PulseAudio or PipeWire sound library ({e})"))?;
-        // SAFETY: the signatures match pulse/simple.h.
-        let (new, write, free) = unsafe {
-            let new: NewFn = *library
-                .get::<NewFn>(b"pa_simple_new\0")
-                .map_err(|e| e.to_string())?;
-            let write: WriteFn = *library
-                .get::<WriteFn>(b"pa_simple_write\0")
-                .map_err(|e| e.to_string())?;
-            let free: FreeFn = *library
-                .get::<FreeFn>(b"pa_simple_free\0")
-                .map_err(|e| e.to_string())?;
-            (new, write, free)
-        };
-        let name = CString::new(application).unwrap_or_default();
-        let stream_name = CString::new("game").unwrap_or_default();
-        let spec = SampleSpec {
-            format: PA_SAMPLE_S16LE,
-            rate: RATE,
-            channels: 2,
-        };
-        // About a tenth of a second queued: short enough that a line starts
-        // with its caption.
-        let attr = BufferAttr {
-            maxlength: u32::MAX,
-            tlength: (RATE / 10) * 4,
-            prebuf: u32::MAX,
-            minreq: u32::MAX,
-            fragsize: u32::MAX,
-        };
-        let mut error = 0;
-        // SAFETY: every pointer is valid for the call; null server and device
-        // mean the defaults.
-        let stream = unsafe {
-            new(
-                std::ptr::null(),
-                name.as_ptr(),
-                PA_STREAM_PLAYBACK,
-                std::ptr::null(),
-                stream_name.as_ptr(),
-                &spec,
-                std::ptr::null(),
-                &attr,
-                &mut error,
-            )
-        };
-        if stream.is_null() {
-            return Err(format!("the sound server refused a stream (error {error})"));
+    // The stream is only ever used from the audio thread it is moved to.
+    unsafe impl Send for Pulse {}
+
+    const PA_SAMPLE_S16LE: c_int = 3;
+    const PA_STREAM_PLAYBACK: c_int = 1;
+
+    impl Pulse {
+        pub(super) fn open(application: &str) -> Result<Self, String> {
+            // SAFETY: loading a system library runs its initialisers; this one
+            // is PulseAudio's own client library.
+            let library = unsafe { libloading::Library::new("libpulse-simple.so.0") }
+                .map_err(|e| format!("no PulseAudio or PipeWire sound library ({e})"))?;
+            // SAFETY: the signatures match pulse/simple.h.
+            let (new, write, free) = unsafe {
+                let new: NewFn = *library
+                    .get::<NewFn>(b"pa_simple_new\0")
+                    .map_err(|e| e.to_string())?;
+                let write: WriteFn = *library
+                    .get::<WriteFn>(b"pa_simple_write\0")
+                    .map_err(|e| e.to_string())?;
+                let free: FreeFn = *library
+                    .get::<FreeFn>(b"pa_simple_free\0")
+                    .map_err(|e| e.to_string())?;
+                (new, write, free)
+            };
+            let name = CString::new(application).unwrap_or_default();
+            let stream_name = CString::new("game").unwrap_or_default();
+            let spec = SampleSpec {
+                format: PA_SAMPLE_S16LE,
+                rate: RATE,
+                channels: 2,
+            };
+            // About a tenth of a second queued: short enough that a line starts
+            // with its caption.
+            let attr = BufferAttr {
+                maxlength: u32::MAX,
+                tlength: (RATE / 10) * 4,
+                prebuf: u32::MAX,
+                minreq: u32::MAX,
+                fragsize: u32::MAX,
+            };
+            let mut error = 0;
+            // SAFETY: every pointer is valid for the call; null server and device
+            // mean the defaults.
+            let stream = unsafe {
+                new(
+                    std::ptr::null(),
+                    name.as_ptr(),
+                    PA_STREAM_PLAYBACK,
+                    std::ptr::null(),
+                    stream_name.as_ptr(),
+                    &spec,
+                    std::ptr::null(),
+                    &attr,
+                    &mut error,
+                )
+            };
+            if stream.is_null() {
+                return Err(format!("the sound server refused a stream (error {error})"));
+            }
+            Ok(Self {
+                _library: library,
+                stream,
+                write,
+                free,
+            })
         }
-        Ok(Self {
-            _library: library,
-            stream,
-            write,
-            free,
-        })
+
+        pub(super) fn write(&self, samples: &[i16]) -> Result<(), ()> {
+            let mut error = 0;
+            // SAFETY: the buffer is valid for its length in bytes; the call
+            // blocks until the server has room, which paces the mixer.
+            let r = unsafe {
+                (self.write)(
+                    self.stream,
+                    samples.as_ptr().cast(),
+                    std::mem::size_of_val(samples),
+                    &mut error,
+                )
+            };
+            if r < 0 { Err(()) } else { Ok(()) }
+        }
     }
 
-    fn write(&self, samples: &[i16]) -> Result<(), ()> {
-        let mut error = 0;
-        // SAFETY: the buffer is valid for its length in bytes; the call
-        // blocks until the server has room, which paces the mixer.
-        let r = unsafe {
-            (self.write)(
-                self.stream,
-                samples.as_ptr().cast(),
-                std::mem::size_of_val(samples),
-                &mut error,
-            )
-        };
-        if r < 0 { Err(()) } else { Ok(()) }
-    }
-}
-
-impl Drop for Pulse {
-    fn drop(&mut self) {
-        // SAFETY: the stream came from pa_simple_new and is freed once.
-        unsafe { (self.free)(self.stream) };
+    impl Drop for Pulse {
+        fn drop(&mut self) {
+            // SAFETY: the stream came from pa_simple_new and is freed once.
+            unsafe { (self.free)(self.stream) };
+        }
     }
 }
 

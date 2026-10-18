@@ -13,6 +13,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::camera::{self, Controls};
+use crate::cursor::CursorArt;
 use crate::play::Options;
 use crate::saves::Settings;
 use crate::screens::{Button, Help, Layout, OptionBar, Painter, Popup, SaveLoad, Slider, Status, Toggle};
@@ -35,8 +36,12 @@ pub fn run(lib: Library, options: Options) -> Result<ExitCode, String> {
     let mut app = Game {
         lib,
         options,
+        window: None,
         gfx: None,
         error: None,
+        started: Instant::now(),
+        cursors: Default::default(),
+        cursor_shown: None,
     };
     event_loop
         .run_app(&mut app)
@@ -50,8 +55,14 @@ pub fn run(lib: Library, options: Options) -> Result<ExitCode, String> {
 struct Game {
     lib: &'static Library,
     options: Options,
+    window: Option<Arc<Window>>,
     gfx: Option<Gfx>,
     error: Option<String>,
+    started: Instant,
+    /// The system cursors made from the game's, by name and scale, and the
+    /// one up.
+    cursors: std::collections::HashMap<(String, u32), Vec<winit::window::CustomCursor>>,
+    cursor_shown: Option<((String, u32), usize)>,
 }
 
 /// Before the game: the Sierra logo, the intro and the title screen.
@@ -62,14 +73,7 @@ enum Front {
     Title,
 }
 
-/// A cursor's art and the system cursors made from its frames.
-struct Cursors {
-    art: crate::cursor::CursorArt,
-    frames: Vec<winit::window::CustomCursor>,
-}
-
 struct Gfx {
-    window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     renderer: Renderer,
@@ -101,7 +105,13 @@ struct Gfx {
     /// The fingerprint kit's parts as last drawn, and the pointer then.
     kit_layout: KitLayout,
     kit_pointer: (f32, f32),
-    started: Instant,
+    /// The time now, in seconds from the start: the host's clock, set
+    /// before each input and frame.
+    time: f64,
+    /// Whether the pointer is shown, and a switch between fullscreen and a
+    /// window asked for: for the host to carry out.
+    cursor_visible: bool,
+    fullscreen_toggle: bool,
     overlay: Overlay,
     /// Where the presentation before the game has got to, if it is on.
     front: Option<Front>,
@@ -121,11 +131,10 @@ struct Gfx {
     save_load: Option<SaveLoad>,
     popup: Option<Popup>,
     /// The cursor wanted (by name, and whether it animates), since when,
-    /// and the cursors made so far, by name and scale.
+    /// and the cursors' art loaded so far, by name and scale.
     cursor_want: (String, bool),
     cursor_since: f64,
-    cursor_shown: Option<(String, u32, usize)>,
-    cursors: std::collections::HashMap<(String, u32), Option<Cursors>>,
+    cursor_art: std::collections::HashMap<(String, u32), Option<CursorArt>>,
     /// The thing last under the pointer, and whether its highlight is the
     /// blue one: moving straight from one thing to another flips it, so
     /// neighbours can be told apart, as G-Engine.
@@ -156,7 +165,7 @@ struct Gfx {
 }
 
 impl Game {
-    fn open(&mut self, event_loop: &ActiveEventLoop) -> Result<Gfx, String> {
+    fn open(&mut self, event_loop: &ActiveEventLoop) -> Result<(Arc<Window>, Gfx), String> {
         let window = Arc::new(
             event_loop
                 .create_window(
@@ -198,34 +207,49 @@ impl Game {
         let samples = gk3_render::window_samples(&adapter, format);
 
         let mut renderer = Renderer::with_samples(device, queue, format, samples);
+        let info = adapter.get_info();
+        if info.device_type == wgpu::DeviceType::Cpu {
+            renderer.max_anisotropy = 1;
+        }
+        renderer.adapter_name = info.name;
+        let gfx = Gfx::new(self.lib, &self.options, surface, config, renderer)?;
+        Ok((window, gfx))
+    }
+}
+
+impl Gfx {
+    /// The game, drawn by `renderer` to `surface`, as it starts: on the
+    /// Sierra logo for a new game, as the original; else where `options`
+    /// say.
+    fn new(
+        lib: &'static Library,
+        options: &Options,
+        surface: wgpu::Surface<'static>,
+        config: wgpu::SurfaceConfiguration,
+        mut renderer: Renderer,
+    ) -> Result<Self, String> {
         let depth = renderer.frame_buffers(config.width, config.height);
-        let ui = Ui::new(self.lib, &mut renderer);
+        let ui = Ui::new(lib, &mut renderer);
         let audio = gk3_audio::Audio::open("Gabriel Knight 3");
         if audio.is_silent() {
             eprintln!("no sound: {}", audio.status);
         }
         let settings = Settings::load();
         settings.apply(&audio);
-        let info = adapter.get_info();
-        if info.device_type == wgpu::DeviceType::Cpu {
-            renderer.max_anisotropy = 1;
-        }
         renderer.set_filtering(settings.filtering());
-        renderer.adapter_name = info.name;
-        let mut world = World::new(self.lib, &self.options.time, audio);
+        let mut world = World::new(lib, &options.time, audio);
         world.door_sounds = settings.door_sounds;
         // A new game opens as the original does: the Sierra logo, the
         // intro on the first run, and the title screen.
-        let new_game = self.options.new_game && self.options.load.is_none();
+        let new_game = options.new_game && options.load.is_none();
         let front = if new_game {
             world.play_movie("SIERRA", AfterMovie::Nothing);
             Some(Front::Logo)
         } else {
-            crate::play::start(&mut world, &renderer, &self.options)?;
+            crate::play::start(&mut world, &renderer, options)?;
             None
         };
         Ok(Gfx {
-            window,
             surface,
             config,
             renderer,
@@ -248,29 +272,30 @@ impl Game {
             gps_rects: None,
             kit_layout: KitLayout::default(),
             kit_pointer: (0.0, 0.0),
-            started: Instant::now(),
+            time: 0.0,
+            cursor_visible: true,
+            fullscreen_toggle: false,
             overlay: Overlay::default(),
             front,
             title_buttons: Vec::new(),
             title_held: None,
             quit: false,
-            start: (self.options.time.clone(), self.options.location.clone()),
-            layout: Layout::load(self.lib),
+            start: (options.time.clone(), options.location.clone()),
+            layout: Layout::load(lib),
             bar: None,
             save_load: None,
             popup: None,
             camera_shots: Vec::new(),
             cursor_want: ("C_POINT".into(), true),
             cursor_since: 0.0,
-            cursor_shown: None,
-            cursors: Default::default(),
+            cursor_art: Default::default(),
             last_hover: None,
             blue: false,
             room_cursor: None,
             tip: None,
             tip_gone: 0.0,
             help: None,
-            help_pages: Help::load(self.lib),
+            help_pages: Help::load(lib),
             death: false,
             finished: false,
             paused: false,
@@ -336,7 +361,7 @@ impl Gfx {
                 self.front = None;
                 let (time, location) = self.start.clone();
                 self.world.end_timeblock(&time, &location);
-                self.card_until = Some(self.started.elapsed().as_secs_f64() + 5.0);
+                self.card_until = Some(self.time + 5.0);
             }
             TitleButton::Restore if self.any_saves => self.open_save_load(false),
             TitleButton::Restore => {}
@@ -383,45 +408,20 @@ impl Gfx {
         }
     }
 
-    /// Shows the cursor wanted, making the system cursors for it the first
-    /// time, at the interface's whole-number scale.
-    fn show_cursor(&mut self, event_loop: &ActiveEventLoop) {
+    /// The cursor wanted now, at the interface's whole-number scale: its
+    /// name and scale, its art (loaded the first time), and the frame due.
+    fn cursor(&mut self) -> Option<(&(String, u32), &CursorArt, usize)> {
         let scale = (self.config.height / 480).max(1);
         let (name, animate) = self.cursor_want.clone();
-        let key = (name.clone(), scale);
-        let lib = self.world.lib;
-        let entry = self.cursors.entry(key).or_insert_with(|| {
-            let art = crate::cursor::CursorArt::load(lib, &name, scale)?;
-            let frames = art
-                .frames
-                .iter()
-                .filter_map(|f| {
-                    let source = winit::window::CustomCursor::from_rgba(
-                        f.rgba.clone(),
-                        f.width as u16,
-                        f.height as u16,
-                        art.hotspot.0 as u16,
-                        art.hotspot.1 as u16,
-                    )
-                    .ok()?;
-                    Some(event_loop.create_custom_cursor(source))
-                })
-                .collect::<Vec<_>>();
-            (!frames.is_empty()).then_some(Cursors { art, frames })
-        });
-        let Some(cursors) = entry else {
-            return;
-        };
-        let now = self.started.elapsed().as_secs_f64();
-        let frame = cursors
-            .art
-            .frame_at(now - self.cursor_since, animate)
-            .min(cursors.frames.len() - 1);
-        let shown = Some((name, scale, frame));
-        if self.cursor_shown != shown {
-            self.window.set_cursor(cursors.frames[frame].clone());
-            self.cursor_shown = shown;
+        let since = self.time - self.cursor_since;
+        let key = (name, scale);
+        if !self.cursor_art.contains_key(&key) {
+            let art = CursorArt::load(self.world.lib, &key.0, scale);
+            self.cursor_art.insert(key.clone(), art);
         }
+        let (key, art) = self.cursor_art.get_key_value(&key)?;
+        let art = art.as_ref()?;
+        Some((key, art, art.frame_at(since, animate)))
     }
 
     /// The pointer in SIDNEY's 640x480 pixels.
@@ -896,7 +896,7 @@ impl Gfx {
     }
 
     fn tell(&mut self, text: String) {
-        let until = self.started.elapsed().as_secs_f64() + 3.0;
+        let until = self.time + 3.0;
         self.notice = Some((text, until));
     }
 
@@ -1171,8 +1171,10 @@ impl Gfx {
         }
     }
 
-    fn redraw(&mut self) {
-        let now = self.started.elapsed().as_secs_f64();
+    /// Moves the story on and draws a frame; `before_present` is the host's,
+    /// just before the frame goes up.
+    fn redraw(&mut self, before_present: &dyn Fn()) {
+        let now = self.time;
         let (w, h) = self.size();
         self.world.aspect = w as f32 / h.max(1) as f32;
         let modal = self.modal();
@@ -1222,14 +1224,12 @@ impl Gfx {
         self.kit_pointer = self.pointer;
         // The fingerprint kit draws its tools as the pointer, and movies
         // hide it, as G-Engine locks the mouse under them.
-        self.window.set_cursor_visible(
-            self.world.showing.is_none()
-                && self
-                    .world
-                    .fingerprint
-                    .as_ref()
-                    .is_none_or(|k| k.tool.cursor().is_none()),
-        );
+        self.cursor_visible = self.world.showing.is_none()
+            && self
+                .world
+                .fingerprint
+                .as_ref()
+                .is_none_or(|k| k.tool.cursor().is_none());
         // The binoculars turn while an arrow is held, a radian a second.
         if self.world.binocs.is_some() {
             let c = &self.controls;
@@ -1655,212 +1655,242 @@ impl Gfx {
                 },
             );
         }
-        self.window.pre_present_notify();
+        before_present();
         self.renderer.queue().present(frame);
         self.overlay = overlay;
     }
 }
 
-impl ApplicationHandler for Game {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.gfx.is_some() {
-            return;
-        }
-        match self.open(event_loop) {
-            Ok(gfx) => self.gfx = Some(gfx),
-            Err(e) => {
-                self.error = Some(e);
-                event_loop.exit();
-            }
-        }
+/// Shows a frame of one of the game's cursors as the system's, making the
+/// system cursors for it the first time.
+fn show_cursor(
+    window: &Window,
+    event_loop: &ActiveEventLoop,
+    cursors: &mut std::collections::HashMap<(String, u32), Vec<winit::window::CustomCursor>>,
+    shown: &mut Option<((String, u32), usize)>,
+    key: &(String, u32),
+    art: &CursorArt,
+    frame: usize,
+) {
+    let frames = cursors.entry(key.clone()).or_insert_with(|| {
+        art.frames
+            .iter()
+            .filter_map(|f| {
+                let source = winit::window::CustomCursor::from_rgba(
+                    f.rgba.clone(),
+                    f.width as u16,
+                    f.height as u16,
+                    art.hotspot.0 as u16,
+                    art.hotspot.1 as u16,
+                )
+                .ok()?;
+                Some(event_loop.create_custom_cursor(source))
+            })
+            .collect()
+    });
+    let Some(last) = frames.len().checked_sub(1) else {
+        return;
+    };
+    let frame = frame.min(last);
+    let now = Some((key.clone(), frame));
+    if *shown != now {
+        window.set_cursor(frames[frame].clone());
+        *shown = now;
     }
+}
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
-        let Some(gfx) = &mut self.gfx else { return };
-        match event {
+/// What the player does, from whatever the game is shown in: a window on
+/// the desktop or a page in a browser.
+pub enum Input {
+    Close,
+    Resized(u32, u32),
+    /// The pointer, in pixels from the top left.
+    Moved(f32, f32),
+    Mouse { button: MouseButton, down: bool },
+    /// The wheel, in pixels, up positive.
+    Wheel(f32),
+    Key {
+        code: KeyCode,
+        /// What the key types, if anything.
+        text: Option<String>,
+        down: bool,
+        repeat: bool,
+    },
+}
+
+impl Gfx {
+    /// Does what the player did.
+    fn input(&mut self, input: Input) {
+        match input {
             // As G-Engine: closing the window asks first; asked twice, it goes.
-            WindowEvent::CloseRequested => {
-                if gfx.popup == Some(Popup::Quit) {
-                    event_loop.exit();
+            Input::Close => {
+                if self.popup == Some(Popup::Quit) {
+                    self.quit = true;
                 } else {
-                    gfx.bar = None;
-                    gfx.popup = Some(Popup::Quit);
+                    self.bar = None;
+                    self.popup = Some(Popup::Quit);
                 }
             }
-            WindowEvent::Resized(size) if size.width > 0 && size.height > 0 => {
-                gfx.config.width = size.width;
-                gfx.config.height = size.height;
-                gfx.surface.configure(gfx.renderer.device(), &gfx.config);
-                gfx.depth = gfx.renderer.frame_buffers(size.width, size.height);
+            Input::Resized(width, height) if width > 0 && height > 0 => {
+                self.config.width = width;
+                self.config.height = height;
+                self.surface.configure(self.renderer.device(), &self.config);
+                self.depth = self.renderer.frame_buffers(width, height);
             }
-            WindowEvent::CursorMoved { position, .. } => {
-                let to = (position.x as f32, position.y as f32);
-                if let Some((slider, track)) = gfx.sliding {
-                    let fit = crate::screens::ui_scale(gfx.size());
-                    gfx.set_slider(slider, crate::screens::slider_value(track, to.0, fit));
+            Input::Moved(x, y) => {
+                let to = (x, y);
+                if let Some((slider, track)) = self.sliding {
+                    let fit = crate::screens::ui_scale(self.size());
+                    self.set_slider(slider, crate::screens::slider_value(track, to.0, fit));
                 }
                 // Holding the left button and moving drags the camera.
-                if let Some(start) = gfx.press
-                    && gfx.camera_free()
+                if let Some(start) = self.press
+                    && self.camera_free()
                 {
                     let moved = (to.0 - start.0).hypot(to.1 - start.1);
-                    if gfx.dragging {
-                        gfx.controls.drag.0 += to.0 - gfx.pointer.0;
-                        gfx.controls.drag.1 += to.1 - gfx.pointer.1;
+                    if self.dragging {
+                        self.controls.drag.0 += to.0 - self.pointer.0;
+                        self.controls.drag.1 += to.1 - self.pointer.1;
                     } else if moved > camera::DRAG_START {
-                        gfx.dragging = true;
+                        self.dragging = true;
                     }
                 }
-                gfx.pointer = to;
-                if gfx.press.is_some() {
-                    let at = gfx.sidney_at();
-                    if let Some(s) = gfx.world.sidney.as_mut() {
+                self.pointer = to;
+                if self.press.is_some() {
+                    let at = self.sidney_at();
+                    if let Some(s) = self.world.sidney.as_mut() {
                         s.map_held(at);
                     }
                 }
             }
             // A click acts on release, unless the press became a drag.
-            WindowEvent::MouseInput { state, button, .. } => match (button, state) {
+            Input::Mouse { button, down } => match (button, down) {
                 // The end goes at any press.
-                (_, ElementState::Pressed) if gfx.finished => gfx.quit = true,
-                (MouseButton::Left, ElementState::Pressed) => {
-                    gfx.press = Some(gfx.pointer);
-                    if gfx.world.sidney.is_some()
-                        && !gfx.world.state.inventory_shown
-                        && !gfx.modal()
-                        && gfx.menu.is_none()
+                (_, true) if self.finished => self.quit = true,
+                (MouseButton::Left, true) => {
+                    self.press = Some(self.pointer);
+                    if self.world.sidney.is_some()
+                        && !self.world.state.inventory_shown
+                        && !self.modal()
+                        && self.menu.is_none()
                     {
-                        let at = gfx.sidney_at();
-                        gfx.world.sidney_press(&gfx.renderer, at);
+                        let at = self.sidney_at();
+                        self.world.sidney_press(&self.renderer, at);
                     }
-                    gfx.dragging = false;
-                    gfx.held_button = gfx.button_at(gfx.pointer);
-                    if let Some(Button::Slider(slider)) = gfx.held_button
+                    self.dragging = false;
+                    self.held_button = self.button_at(self.pointer);
+                    if let Some(Button::Slider(slider)) = self.held_button
                         && let Some((_, track)) =
-                            gfx.buttons.iter().rev().find(|(b, _)| *b == Button::Slider(slider))
+                            self.buttons.iter().rev().find(|(b, _)| *b == Button::Slider(slider))
                     {
                         let track = *track;
-                        let fit = crate::screens::ui_scale(gfx.size());
-                        gfx.sliding = Some((slider, track));
-                        gfx.set_slider(slider, crate::screens::slider_value(track, gfx.pointer.0, fit));
+                        let fit = crate::screens::ui_scale(self.size());
+                        self.sliding = Some((slider, track));
+                        self.set_slider(slider, crate::screens::slider_value(track, self.pointer.0, fit));
                     }
-                    if gfx.front == Some(Front::Title) {
-                        gfx.title_held = gfx
+                    if self.front == Some(Front::Title) {
+                        self.title_held = self
                             .title_buttons
                             .iter()
-                            .find(|(_, r)| inside(*r, gfx.pointer))
+                            .find(|(_, r)| inside(*r, self.pointer))
                             .map(|(b, _)| *b);
                     }
                 }
-                (MouseButton::Left, ElementState::Released) => {
-                    if let Some(s) = gfx.world.sidney.as_mut() {
+                (MouseButton::Left, false) => {
+                    if let Some(s) = self.world.sidney.as_mut() {
                         s.map_release();
                     }
-                    if gfx.sliding.take().is_some() {
-                        gfx.settings.store();
-                        gfx.held_button = None;
-                    } else if gfx.press.take().is_some() && !gfx.dragging {
-                        gfx.click();
+                    if self.sliding.take().is_some() {
+                        self.settings.store();
+                        self.held_button = None;
+                    } else if self.press.take().is_some() && !self.dragging {
+                        self.click();
                     }
-                    gfx.press = None;
-                    gfx.dragging = false;
+                    self.press = None;
+                    self.dragging = false;
                 }
-                (MouseButton::Right, ElementState::Pressed)
-                    if gfx.modal()
-                        || gfx.world.showing.is_some()
-                        || gfx.front.is_some()
-                        || gfx.card.is_some() => {}
-                (MouseButton::Right, ElementState::Pressed) if gfx.menu.is_some() => gfx.close_menu(),
+                (MouseButton::Right, true)
+                    if self.modal()
+                        || self.world.showing.is_some()
+                        || self.front.is_some()
+                        || self.card.is_some() => {}
+                (MouseButton::Right, true) if self.menu.is_some() => self.close_menu(),
                 // On SIDNEY's map, it lets go of the shape picked.
-                (MouseButton::Right, ElementState::Pressed)
-                    if gfx.bar.is_none()
-                        && gfx.world.sidney.as_ref().is_some_and(|s| s.map_showing()) =>
+                (MouseButton::Right, true)
+                    if self.bar.is_none()
+                        && self.world.sidney.as_ref().is_some_and(|s| s.map_showing()) =>
                 {
-                    if let Some(s) = gfx.world.sidney.as_mut() {
+                    if let Some(s) = self.world.sidney.as_mut() {
                         s.map_deselect();
                     }
                 }
                 // As G-Engine, a right click brings the option bar up where
                 // the pointer is, or puts it away.
-                (MouseButton::Right, ElementState::Pressed) => {
-                    gfx.bar = match gfx.bar {
+                (MouseButton::Right, true) => {
+                    self.bar = match self.bar {
                         Some(_) => None,
-                        None => Some(OptionBar::new(gfx.pointer)),
+                        None => Some(OptionBar::new(self.pointer)),
                     };
                 }
                 _ => {}
             },
             // Typing a save's name.
-            WindowEvent::KeyboardInput { event, .. }
-                if event.state == ElementState::Pressed
-                    && gfx.popup.is_none()
-                    && gfx.save_load.as_ref().is_some_and(|s| s.typing.is_some()) =>
+            Input::Key { code, text, down: true, .. }
+                if self.popup.is_none()
+                    && self.save_load.as_ref().is_some_and(|s| s.typing.is_some()) =>
             {
-                if let PhysicalKey::Code(code) = event.physical_key {
-                    gfx.type_name(code, event.text.as_deref());
-                }
+                self.type_name(code, text.as_deref());
             }
             // Typing into SIDNEY's search box.
-            WindowEvent::KeyboardInput { event, .. }
-                if event.state == ElementState::Pressed
-                    && !gfx.world.state.inventory_shown
-                    && gfx.world.sidney.as_ref().is_some_and(|s| s.wants_text()) =>
+            Input::Key { code, text, down: true, .. }
+                if !self.world.state.inventory_shown
+                    && self.world.sidney.as_ref().is_some_and(|s| s.wants_text()) =>
             {
-                match event.physical_key {
-                    PhysicalKey::Code(KeyCode::Backspace) => {
-                        if let Some(s) = gfx.world.sidney.as_mut() {
+                match code {
+                    KeyCode::Backspace => {
+                        if let Some(s) = self.world.sidney.as_mut() {
                             s.backspace();
                         }
                     }
-                    PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter) => gfx
+                    KeyCode::Enter | KeyCode::NumpadEnter => self
                         .world
-                        .sidney_click(&gfx.renderer, crate::sidney::Hit::SearchGo),
-                    PhysicalKey::Code(KeyCode::Escape) => gfx
+                        .sidney_click(&self.renderer, crate::sidney::Hit::SearchGo),
+                    KeyCode::Escape => self
                         .world
-                        .sidney_click(&gfx.renderer, crate::sidney::Hit::MainMenu),
-                    PhysicalKey::Code(KeyCode::PageDown | KeyCode::ArrowDown) => {
-                        if let Some(s) = gfx.world.sidney.as_mut() {
+                        .sidney_click(&self.renderer, crate::sidney::Hit::MainMenu),
+                    KeyCode::PageDown | KeyCode::ArrowDown => {
+                        if let Some(s) = self.world.sidney.as_mut() {
                             s.scroll(60.0);
                         }
                     }
-                    PhysicalKey::Code(KeyCode::PageUp | KeyCode::ArrowUp) => {
-                        if let Some(s) = gfx.world.sidney.as_mut() {
+                    KeyCode::PageUp | KeyCode::ArrowUp => {
+                        if let Some(s) = self.world.sidney.as_mut() {
                             s.scroll(-60.0);
                         }
                     }
                     _ => {
                         if let (Some(s), Some(text)) =
-                            (gfx.world.sidney.as_mut(), event.text.as_ref())
+                            (self.world.sidney.as_mut(), text.as_ref())
                         {
                             s.type_text(text);
                         }
                     }
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } if gfx.save_load.is_some() => {
-                let dy = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
-                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 20.0,
-                };
-                if let Some(screen) = &mut gfx.save_load {
+            Input::Wheel(dy) if self.save_load.is_some() => {
+                if let Some(screen) = &mut self.save_load {
                     screen.scroll_by(if dy > 0.0 { -1 } else { 1 });
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } => {
-                if let Some(s) = gfx.world.sidney.as_mut() {
-                    let dy = match delta {
-                        winit::event::MouseScrollDelta::LineDelta(_, y) => y * 40.0,
-                        winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32,
-                    };
+            Input::Wheel(dy) => {
+                if let Some(s) = self.world.sidney.as_mut() {
                     s.scroll(-dy);
                 }
             }
-            WindowEvent::KeyboardInput { event, .. } => {
-                let down = event.state == ElementState::Pressed;
-                let PhysicalKey::Code(code) = event.physical_key else {
-                    return;
-                };
-                let c = &mut gfx.controls;
+            Input::Key {
+                code, down, repeat, ..
+            } => {
+                let c = &mut self.controls;
                 match code {
                     KeyCode::KeyW | KeyCode::ArrowUp => c.forward = down,
                     KeyCode::KeyS | KeyCode::ArrowDown => c.back = down,
@@ -1871,36 +1901,33 @@ impl ApplicationHandler for Game {
                     KeyCode::AltLeft | KeyCode::AltRight => c.fast = down,
                     _ => {}
                 }
-                if !down || event.repeat {
+                if !down || repeat {
                     return;
                 }
                 // Fullscreen and back, anywhere: F11, or Alt and Enter.
-                if code == KeyCode::F11 || (code == KeyCode::Enter && gfx.controls.fast) {
-                    let full = gfx.window.fullscreen().is_some();
-                    gfx.window.set_fullscreen(
-                        (!full).then_some(winit::window::Fullscreen::Borderless(None)),
-                    );
+                if code == KeyCode::F11 || (code == KeyCode::Enter && self.controls.fast) {
+                    self.fullscreen_toggle = true;
                     return;
                 }
-                if gfx.modal() {
-                    gfx.screen_key(code);
+                if self.modal() {
+                    self.screen_key(code);
                     return;
                 }
                 // Any key puts the option bar away, and does its own work
                 // too; Escape only that.
-                if gfx.bar.take().is_some() && code == KeyCode::Escape {
+                if self.bar.take().is_some() && code == KeyCode::Escape {
                     return;
                 }
                 // A movie is skipped, as G-Engine's Escape (and Space and
                 // Enter here); nothing else listens under it.
-                if gfx.world.showing.is_some() {
+                if self.world.showing.is_some() {
                     if matches!(code, KeyCode::Escape | KeyCode::Space | KeyCode::Enter) {
-                        gfx.world.stop_movie(&gfx.renderer);
+                        self.world.stop_movie(&self.renderer);
                     }
                     return;
                 }
                 // The title screen's buttons have keys.
-                if gfx.front == Some(Front::Title) {
+                if self.front == Some(Front::Title) {
                     let button = match code {
                         KeyCode::KeyI => Some(TitleButton::Intro),
                         KeyCode::KeyP => Some(TitleButton::Play),
@@ -1909,68 +1936,67 @@ impl ApplicationHandler for Game {
                         _ => None,
                     };
                     if let Some(button) = button {
-                        gfx.title_press(button);
+                        self.title_press(button);
                     }
                     return;
                 }
                 // The title card's keys, while it has buttons: C or Escape
                 // (and Space or Enter) go on, S saves, as G-Engine.
-                if gfx.card.is_some() {
-                    if gfx.card_until.is_none() {
+                if self.card.is_some() {
+                    if self.card_until.is_none() {
                         match code {
                             KeyCode::KeyC | KeyCode::Escape | KeyCode::Space | KeyCode::Enter => {
-                                gfx.continue_timeblock()
+                                self.continue_timeblock()
                             }
-                            KeyCode::KeyS => gfx.open_save_load(true),
+                            KeyCode::KeyS => self.open_save_load(true),
                             _ => {}
                         }
                     }
                     return;
                 }
-                match event.physical_key {
-                    PhysicalKey::Code(KeyCode::Escape) => {
-                        if gfx.menu.is_some() {
-                            gfx.close_menu();
-                        } else if gfx.world.sidney.is_some() && !gfx.world.state.inventory_shown {
-                            let hit = match gfx.world.sidney.as_ref().map(|s| &s.screen) {
+                match code {
+                    KeyCode::Escape => {
+                        if self.menu.is_some() {
+                            self.close_menu();
+                        } else if self.world.sidney.is_some() && !self.world.state.inventory_shown {
+                            let hit = match self.world.sidney.as_ref().map(|s| &s.screen) {
                                 Some(crate::sidney::Screen::Desktop) => crate::sidney::Hit::Exit,
                                 _ => crate::sidney::Hit::MainMenu,
                             };
-                            gfx.world.sidney_click(&gfx.renderer, hit);
-                        } else if gfx.world.fingerprint.is_some() {
-                            gfx.world
+                            self.world.sidney_click(&self.renderer, hit);
+                        } else if self.world.fingerprint.is_some() {
+                            self.world
                                 .fingerprint_events(vec![crate::fingerprint::Event::Close]);
-                        } else if gfx.world.map.is_some() {
-                            gfx.world.map_cancel();
-                        } else if gfx.world.state.inventory_shown {
-                            gfx.world.state.inventory_shown = false;
+                        } else if self.world.map.is_some() {
+                            self.world.map_cancel();
+                        } else if self.world.state.inventory_shown {
+                            self.world.state.inventory_shown = false;
                         } else {
                             // As the original's Esc: skips what is playing,
                             // or with nothing playing, the walks under way.
-                            gfx.world.skip_action(&gfx.renderer);
+                            self.world.skip_action(&self.renderer);
                         }
                     }
                     // Ctrl+Q asks to quit, as the original.
-                    PhysicalKey::Code(KeyCode::KeyQ) if gfx.controls.pan => {
-                        gfx.popup = Some(Popup::Quit);
+                    KeyCode::KeyQ if self.controls.pan => {
+                        self.popup = Some(Popup::Quit);
                     }
                     // P stops the story until P again, as G-Engine.
-                    PhysicalKey::Code(KeyCode::KeyP | KeyCode::Pause) => {
-                        gfx.paused = true
+                    KeyCode::KeyP | KeyCode::Pause => {
+                        self.paused = true
                     }
-                    PhysicalKey::Code(KeyCode::F1 | KeyCode::KeyH) => {
-                        gfx.help = Some(0)
+                    KeyCode::F1 | KeyCode::KeyH => {
+                        self.help = Some(0)
                     }
                     // Space moves things on; with nothing playing it levels
                     // the camera, as in G-Engine.
-                    PhysicalKey::Code(KeyCode::Space) if gfx.camera_free() => {
-                        gfx.world.camera.pitch = 0.0;
+                    KeyCode::Space if self.camera_free() => {
+                        self.world.camera.pitch = 0.0;
                     }
-                    PhysicalKey::Code(KeyCode::Space | KeyCode::Period) => gfx.world.skip(),
-                    PhysicalKey::Code(KeyCode::F5) => gfx.quick_save(),
-                    PhysicalKey::Code(KeyCode::F9) => gfx.quick_load(),
-                    PhysicalKey::Code(
-                        k @ (KeyCode::Digit1
+                    KeyCode::Space | KeyCode::Period => self.world.skip(),
+                    KeyCode::F5 => self.quick_save(),
+                    KeyCode::F9 => self.quick_load(),
+                    k @ (KeyCode::Digit1
                         | KeyCode::Digit2
                         | KeyCode::Digit3
                         | KeyCode::Digit4
@@ -1978,30 +2004,152 @@ impl ApplicationHandler for Game {
                         | KeyCode::Digit6
                         | KeyCode::Digit7
                         | KeyCode::Digit8
-                        | KeyCode::Digit9),
-                    ) if gfx.camera_free() => {
-                        gfx.room_camera(k as usize - KeyCode::Digit1 as usize);
+                        | KeyCode::Digit9) if self.camera_free() => {
+                        self.room_camera(k as usize - KeyCode::Digit1 as usize);
                     }
-                    PhysicalKey::Code(KeyCode::KeyI | KeyCode::Tab) if gfx.menu.is_none() => {
-                        gfx.world.state.inventory_shown = !gfx.world.state.inventory_shown;
-                        gfx.inventory.closeup = None;
+                    KeyCode::KeyI | KeyCode::Tab if self.menu.is_none() => {
+                        self.world.state.inventory_shown = !self.world.state.inventory_shown;
+                        self.inventory.closeup = None;
                     }
                     _ => {}
                 }
             }
-            WindowEvent::RedrawRequested => gfx.redraw(),
             _ => {}
+        }
+    }
+}
+
+impl ApplicationHandler for Game {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.gfx.is_some() {
+            return;
+        }
+        match self.open(event_loop) {
+            Ok((window, gfx)) => {
+                self.window = Some(window);
+                self.gfx = Some(gfx);
+            }
+            Err(e) => {
+                self.error = Some(e);
+                event_loop.exit();
+            }
+        }
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        let (Some(gfx), Some(window)) = (&mut self.gfx, &self.window) else {
+            return;
+        };
+        gfx.time = self.started.elapsed().as_secs_f64();
+        let input = match event {
+            WindowEvent::CloseRequested => Input::Close,
+            WindowEvent::Resized(size) => Input::Resized(size.width, size.height),
+            WindowEvent::CursorMoved { position, .. } => {
+                Input::Moved(position.x as f32, position.y as f32)
+            }
+            WindowEvent::MouseInput { state, button, .. } => Input::Mouse {
+                button,
+                down: state == ElementState::Pressed,
+            },
+            WindowEvent::MouseWheel { delta, .. } => Input::Wheel(match delta {
+                winit::event::MouseScrollDelta::LineDelta(_, y) => y * 40.0,
+                winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32,
+            }),
+            WindowEvent::KeyboardInput { event, .. } => {
+                let PhysicalKey::Code(code) = event.physical_key else {
+                    return;
+                };
+                Input::Key {
+                    code,
+                    text: event.text.map(|t| t.to_string()),
+                    down: event.state == ElementState::Pressed,
+                    repeat: event.repeat,
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                gfx.redraw(&|| window.pre_present_notify());
+                return;
+            }
+            _ => return,
+        };
+        gfx.input(input);
+        if gfx.quit {
+            event_loop.exit();
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(gfx) = &mut self.gfx {
+        if let (Some(gfx), Some(window)) = (&mut self.gfx, &self.window) {
             if gfx.quit {
                 event_loop.exit();
                 return;
             }
-            gfx.show_cursor(event_loop);
-            gfx.window.request_redraw();
+            gfx.time = self.started.elapsed().as_secs_f64();
+            if std::mem::take(&mut gfx.fullscreen_toggle) {
+                let full = window.fullscreen().is_some();
+                window.set_fullscreen((!full).then_some(winit::window::Fullscreen::Borderless(None)));
+            }
+            window.set_cursor_visible(gfx.cursor_visible);
+            if let Some((key, art, frame)) = gfx.cursor() {
+                show_cursor(window, event_loop, &mut self.cursors, &mut self.cursor_shown, key, art, frame);
+            }
+            window.request_redraw();
         }
+    }
+}
+
+/// The game for a host that owns the surface and the clock (the browser
+/// build): the same screens, menus and story as in a window, fed the
+/// player's input and asked for frames.
+pub struct Frontend(Gfx);
+
+impl Frontend {
+    /// The game as `gk3 play` would start it with `args` (none: a new
+    /// game, from the Sierra logo), drawn by `renderer` to `surface`.
+    pub fn new(
+        lib: &'static Library,
+        args: &[String],
+        surface: wgpu::Surface<'static>,
+        config: wgpu::SurfaceConfiguration,
+        renderer: Renderer,
+    ) -> Result<Self, String> {
+        let (options, _) = crate::play::parse(args)?;
+        Gfx::new(lib, &options, surface, config, renderer).map(Self)
+    }
+
+    /// Does what the player did, at `time` (seconds from the start).
+    pub fn input(&mut self, time: f64, input: Input) {
+        self.0.time = time;
+        self.0.input(input);
+    }
+
+    /// Moves the story on to `time` and draws a frame.
+    pub fn frame(&mut self, time: f64) {
+        self.0.time = time;
+        self.0.redraw(&|| {});
+    }
+
+    /// The game's cursor to show over the picture, if any: its name and
+    /// scale, its art, and the frame due now.
+    pub fn cursor(&mut self) -> Option<(&(String, u32), &CursorArt, usize)> {
+        if !self.0.cursor_visible {
+            return None;
+        }
+        self.0.cursor()
+    }
+
+    /// The sound system, for a host that drives its output itself.
+    pub fn audio(&self) -> &gk3_audio::Audio {
+        &self.0.world.audio
+    }
+
+    /// Whether the player has quit.
+    pub fn quit(&self) -> bool {
+        self.0.quit
+    }
+
+    /// What has happened, for the host's log.
+    pub fn take_log(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.0.world.log)
     }
 }

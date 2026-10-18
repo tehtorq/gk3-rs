@@ -1,0 +1,35 @@
+[package]
+name = "gk3-web"
+description = "Gabriel Knight 3 in a web browser: the engine in a Web Worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+gk3 = { path = "../../gk3" }
+gk3-audio.workspace = true
+gk3-barn.workspace = true
+gk3-formats.workspace = true
+gk3-render.workspace = true
+wgpu = { workspace = true, features = ["webgpu", "webgl"] }
+wasm-bindgen = "=0.2.129"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "Blob",
+    "console",
+    "DedicatedWorkerGlobalScope",
+    "File",
+    "FileReaderSync",
+    "MessageEvent",
+    "MessagePort",
+    "OffscreenCanvas",
+    "Performance",
+    "WorkerGlobalScope",
+    "XmlHttpRequest",
+    "XmlHttpRequestResponseType",
+] }

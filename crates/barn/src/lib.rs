@@ -144,11 +144,33 @@ impl Entry {
     }
 }
 
+/// Where an archive's bytes are: a file on disk, or (in a browser) a file
+/// the page keeps.
+pub trait Storage: Send + Sync {
+    /// How many bytes there are.
+    fn size(&self) -> io::Result<u64>;
+    /// Reads from `offset` into `buf`, as many bytes as come at once.
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize>;
+}
+
+impl Storage for File {
+    fn size(&self) -> io::Result<u64> {
+        Ok(self.metadata()?.len())
+    }
+
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        read_file_at(self, buf, offset)
+    }
+}
+
+/// What finds the files lying loose beside the archives, by name.
+pub type LooseFiles = Box<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>;
+
 /// One `.brn` file.
 pub struct Barn {
     path: PathBuf,
     name: String,
-    file: File,
+    file: Box<dyn Storage>,
     file_len: u64,
     data_base: u64,
     entries: Vec<Entry>,
@@ -193,21 +215,27 @@ fn latin1(bytes: &[u8]) -> String {
 }
 
 #[cfg(unix)]
-fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+fn read_file_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     std::os::unix::fs::FileExt::read_at(file, buf, offset)
 }
 
 #[cfg(windows)]
-fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+fn read_file_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     std::os::windows::fs::FileExt::seek_read(file, buf, offset)
+}
+
+/// Elsewhere (a browser) files on disk are not to be had.
+#[cfg(not(any(unix, windows)))]
+fn read_file_at(_: &File, _: &mut [u8], _: u64) -> io::Result<usize> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
 /// Fills as much of `buf` as the file has from `offset`, returning the count.
 /// Short only at end of file.
-fn read_fully_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+fn read_fully_at(file: &dyn Storage, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     let mut done = 0;
     while done < buf.len() {
-        match read_at(file, &mut buf[done..], offset + done as u64) {
+        match file.read_at(&mut buf[done..], offset + done as u64) {
             Ok(0) => break,
             Ok(n) => done += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -221,6 +249,16 @@ impl Barn {
     /// Opens an archive and reads its directories. Asset bytes are read on demand.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let file = File::open(&path).map_err(|source| Error::Io {
+            path: path.clone(),
+            source,
+        })?;
+        Self::from_storage(path, Box::new(file))
+    }
+
+    /// Reads an archive's directories from wherever its bytes are; `path`
+    /// names it (its file name is the archive's name).
+    pub fn from_storage(path: PathBuf, file: Box<dyn Storage>) -> Result<Self> {
         let io_err = |source| Error::Io {
             path: path.clone(),
             source,
@@ -230,14 +268,13 @@ impl Barn {
             message,
         };
 
-        let file = File::open(&path).map_err(io_err)?;
-        let file_len = file.metadata().map_err(io_err)?.len();
+        let file_len = file.size().map_err(io_err)?;
 
         // The directories sit between the header and the data section in every
         // retail archive, but nothing guarantees it, so read the header first
         // and then exactly the regions the table of contents points at.
         let mut header = [0u8; 24];
-        if read_fully_at(&file, &mut header, 0).map_err(io_err)? < header.len() {
+        if read_fully_at(&*file, &mut header, 0).map_err(io_err)? < header.len() {
             return Err(format_err("too short to be a Barn".into()));
         }
         let mut h = Cursor::at(&header, 0);
@@ -255,7 +292,7 @@ impl Barn {
                 )));
             }
             let mut buf = vec![0u8; len];
-            read_fully_at(&file, &mut buf, offset).map_err(io_err)?;
+            read_fully_at(&*file, &mut buf, offset).map_err(io_err)?;
             Ok(buf)
         };
 
@@ -378,7 +415,7 @@ impl Barn {
             // has left. The data is intact, so take what is there.
             let available = (self.file_len - offset.min(self.file_len)) as usize;
             let mut buf = vec![0u8; len.min(available)];
-            read_fully_at(&self.file, &mut buf, offset).map_err(|source| Error::Io {
+            read_fully_at(&*self.file, &mut buf, offset).map_err(|source| Error::Io {
                 path: self.path.clone(),
                 source,
             })?;
@@ -440,6 +477,8 @@ pub struct Library {
     unresolved: Vec<(String, String)>,
     /// The directory the archives came from, where the movies lie loose.
     dir: Option<PathBuf>,
+    /// Or, without a directory, what finds the loose files by name.
+    loose: Option<LooseFiles>,
 }
 
 impl Library {
@@ -470,6 +509,9 @@ impl Library {
     /// A file lying loose beside the archives (the movies), by name, in
     /// any case.
     pub fn loose_file(&self, name: &str) -> Option<Vec<u8>> {
+        if let Some(loose) = &self.loose {
+            return loose(name);
+        }
         let dir = self.dir.as_ref()?;
         let path = std::fs::read_dir(dir)
             .ok()?
@@ -480,6 +522,13 @@ impl Library {
                     .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(name))
             })?;
         std::fs::read(path).ok()
+    }
+
+    /// Finds the loose files (the movies) with `loose`, by name in any
+    /// case, rather than in a directory.
+    pub fn with_loose(mut self, loose: LooseFiles) -> Self {
+        self.loose = Some(loose);
+        self
     }
 
     /// Builds a library from already-open archives.
@@ -533,6 +582,7 @@ impl Library {
             index,
             unresolved,
             dir: None,
+            loose: None,
         }
     }
 

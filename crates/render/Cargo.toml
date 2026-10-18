@@ -13,3 +13,7 @@ glam.workspace = true
 bytemuck.workspace = true
 pollster.workspace = true
 serde.workspace = true
+
+# In a browser: WebGPU where there is one, else WebGL2.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { workspace = true, features = ["webgpu", "webgl"] }

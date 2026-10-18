@@ -111,6 +111,26 @@ gk3 play TE6 --time 309P --do WAIT:2 --where   # where everyone stands
 gk3 movie Parch1Geo.avi --png last.png       # an AVI from the Data folder
 ```
 
+## In a browser (experimental)
+
+The same engine builds to WebAssembly and runs in a web page, drawing with
+WebGPU or WebGL2 (`crates/web`):
+
+```sh
+cargo build --profile web --target wasm32-unknown-unknown -p gk3-web
+wasm-bindgen --target web --out-dir crates/web/www/pkg \
+  target/wasm32-unknown-unknown/web/gk3_web.wasm
+scripts/gk3-web --data "$GK3_DATA"   # then open http://127.0.0.1:8173/
+```
+
+`gk3-web` serves the page and your Data folder beside it, on this machine
+only, and the game starts from it straight away; served any other way, the
+page asks for the Data folder and reads it in place (nothing is uploaded or
+copied). `?args=R25 --time 110A` starts where `gk3 play` would; with none
+it is a new game. Sound plays once you first click or press a key (the
+browser's rule), and the game's own cursors are shown. There is no saving
+in the browser yet.
+
 ## Building
 
 ```sh

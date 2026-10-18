@@ -1164,11 +1164,14 @@ impl Renderer {
                         &self.model_pipeline
                     });
                     pass.set_bind_group(2, &model.light_group, &[]);
-                    pass.set_vertex_buffer(0, model.vertices.slice(..));
                     pass.set_index_buffer(model.indices.slice(..), wgpu::IndexFormat::Uint16);
                     for (group, first, count, base) in &model.draws {
                         pass.set_bind_group(1, group, &[]);
-                        pass.draw_indexed(*first..*first + *count, *base, 0..1);
+                        // Each submesh's vertices from its own start, rather
+                        // than a base vertex, which WebGL2 does not have.
+                        let start = *base as u64 * std::mem::size_of::<ModelVertex>() as u64;
+                        pass.set_vertex_buffer(0, model.vertices.slice(start..));
+                        pass.draw_indexed(*first..*first + *count, 0, 0..1);
                     }
                 }
             }

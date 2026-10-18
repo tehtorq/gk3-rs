@@ -40,6 +40,13 @@ pub struct Bounds {
     pub enabled: bool,
 }
 
+/// See [`Bounds::changes`].
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct BoundsChanges {
+    blocks: Vec<(String, Vec<Wall>)>,
+    enabled: bool,
+}
+
 impl Default for Bounds {
     fn default() -> Self {
         Self {
@@ -69,6 +76,20 @@ impl Bounds {
         self.unblock(model);
         self.blocks
             .push((model.to_ascii_uppercase(), with_normals(triangles)));
+    }
+
+    /// What the story has changed: the props blocking the camera, and
+    /// whether the bounds hold at all. For a saved game.
+    pub fn changes(&self) -> BoundsChanges {
+        BoundsChanges {
+            blocks: self.blocks.clone(),
+            enabled: self.enabled,
+        }
+    }
+
+    pub fn apply(&mut self, changes: BoundsChanges) {
+        self.blocks = changes.blocks;
+        self.enabled = changes.enabled;
     }
 
     pub fn unblock(&mut self, model: &str) {

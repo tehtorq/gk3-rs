@@ -100,6 +100,7 @@ fn leap(code: u32) -> String {
     format!("GabTe5Jump{kind}")
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Bridge {
     clock: f64,
     /// Where he is, or is jumping to (curBlockPos).

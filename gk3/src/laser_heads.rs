@@ -31,7 +31,7 @@ const LASER_START: f32 = 3.0;
 pub const LASER_REACH: f32 = 1000.0;
 
 /// A head turning (`currHead`, `currHeading`, `tgtHeading`, `turnRate`).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct Turning {
     head: usize,
     current: f32,
@@ -51,7 +51,7 @@ pub enum Event {
     Turned { solved: bool },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LaserHeads {
     /// Each head's five headings, radians: at the next head, the one after,
     /// the middle, and the two after that.

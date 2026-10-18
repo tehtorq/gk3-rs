@@ -169,6 +169,13 @@ impl Room {
 
     /// Paints a BSP object with another texture, as an animation's
     /// `[STEXTURES]` do; true if that changed anything (then rebuild).
+    /// The pieces of the room repainted, and with what: for a saved game.
+    pub fn retextures(&self) -> Vec<(String, String)> {
+        let mut all: Vec<_> = self.retextured.iter().map(|(o, t)| (o.clone(), t.clone())).collect();
+        all.sort();
+        all
+    }
+
     pub fn retexture(&mut self, lib: &Library, object: &str, texture: &str) -> bool {
         let (object, texture) = (object.to_ascii_uppercase(), texture.to_ascii_uppercase());
         if !self

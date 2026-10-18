@@ -35,7 +35,7 @@ const ALL_LINES: u32 = 0x1f8;
 /// How long the solved square is kept up.
 const SOLVED_SECONDS: f64 = 5.0;
 
-#[derive(Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Angels {
     /// One bit for each line drawn (`angelLineFlags`).
     lines: u32,

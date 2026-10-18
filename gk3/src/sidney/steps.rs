@@ -18,7 +18,7 @@ use crate::ui::{Align, Space, Ui};
 
 /// A message box: text, perhaps a picture above it, and buttons that each
 /// lead somewhere; or a line to type into.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Popup {
     pub text: String,
     pub image: Option<String>,
@@ -72,23 +72,25 @@ impl Popup {
 }
 
 /// What a typed answer is for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Answer {
     /// The word missing from "Et in Arcadia Ego".
     ArcadiaWord,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Step {
     Show(Popup),
     Wait(f64),
     /// A movie from the Data directory, in a slot, at a place; then a
     /// still picture left in its place, keyed by colour.
     Video {
-        name: &'static str,
+        #[serde(deserialize_with = "crate::saved::static_str")]
+        name: crate::saved::Name,
         slot: usize,
         at: (f32, f32),
-        then: Option<(&'static str, [u8; 3])>,
+        #[serde(deserialize_with = "crate::saved::option_static_keyed")]
+        then: Option<(crate::saved::Name, [u8; 3])>,
     },
     /// Takes a slot's movie or picture away.
     Clear(usize),
@@ -100,25 +102,25 @@ pub enum Step {
 }
 
 /// Changes to a tool's state that steps make once they get there.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ToolStep {
     /// Analyze's state goes back to before analysis.
     AnalyzePre,
     /// Translate appends text.
     TranslateText(String),
     /// Asks again which language a parchment's message is in.
-    Languages(&'static str, Vec<Step>),
+    Languages(#[serde(deserialize_with = "crate::saved::static_str")] crate::saved::Name, Vec<Step>),
     /// Match Analysis' scan has played: comparing begins.
     Scanned,
     /// The map: a grid to fill the screen or a shape; a grid of a size, in
     /// a shape or not; a shape put on it.
     MapGridFill(bool),
     MapGrid(u32, bool),
-    MapShape(&'static str),
+    MapShape(#[serde(deserialize_with = "crate::saved::static_str")] crate::saved::Name),
 }
 
 /// What the queue is waiting on.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Waiting {
     Until(f64),
     Video(usize),
@@ -128,8 +130,14 @@ pub enum Waiting {
 }
 
 /// A movie playing in a slot, or the picture it left.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Video {
     pub at: (f32, f32),
+    /// The movie, and when it began if it is still playing: what a saved
+    /// game keeps, the decoder being opened again on restoring.
+    name: String,
+    since: Option<f64>,
+    #[serde(skip)]
     playing: Option<(Avi, Player, f64)>,
     shown: usize,
     pub frame: Option<Image>,
@@ -202,6 +210,8 @@ impl Sidney {
                     let avi = lib.loose_file(name).and_then(|b| Avi::parse(b).ok());
                     let video = Video {
                         at,
+                        name: name.to_string(),
+                        since: None,
                         playing: None,
                         shown: 0,
                         frame: None,
@@ -216,6 +226,7 @@ impl Sidney {
                         let player = avi.frames();
                         if let Some(v) = &mut self.videos[slot] {
                             v.playing = Some((avi, player, self.clock));
+                            v.since = Some(self.clock);
                         }
                         self.waiting = Some(Waiting::Video(slot));
                     }
@@ -254,6 +265,21 @@ impl Sidney {
         Vec::new()
     }
 
+    /// After a restore: movies that were playing are opened again, to
+    /// catch up with the clock from where they began.
+    pub(super) fn reopen_videos(&mut self, lib: &gk3_barn::Library) {
+        for v in self.videos.iter_mut().flatten() {
+            let Some(since) = v.since else { continue };
+            let Some(avi) = lib.loose_file(&v.name).and_then(|b| Avi::parse(b).ok()) else {
+                v.since = None;
+                continue;
+            };
+            let player = avi.frames();
+            v.playing = Some((avi, player, since));
+            v.shown = 0;
+        }
+    }
+
     /// Movies move on with the clock.
     pub(super) fn play_videos(&mut self) {
         let now = self.clock;
@@ -266,6 +292,7 @@ impl Sidney {
             while v.shown < due {
                 if !player.advance(avi) {
                     v.playing = None;
+                    v.since = None;
                     break;
                 }
                 v.shown += 1;

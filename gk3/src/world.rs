@@ -30,6 +30,8 @@ use crate::room::{Catalog, Room, RoomCamera};
 use crate::shoot;
 use crate::soundtrack::Soundtrack;
 
+mod saved;
+
 /// A line on screen.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Caption {
@@ -279,6 +281,9 @@ pub struct World<'a> {
     /// From a loaded game: where the player stood and the camera looked,
     /// put back once the room's entry has played.
     restore: Option<Restore>,
+    /// The story as it stood on entering the room now up: what its file
+    /// was read under, for building the same room again from a saved game.
+    entry: Option<GameState>,
     /// Something to turn to face when an approach walk ends, and within
     /// what of it (radians).
     face_after: Option<(String, f32)>,
@@ -474,6 +479,7 @@ impl<'a> World<'a> {
             saved_fidgets: Vec::new(),
             approach: None,
             restore: None,
+            entry: None,
             face_after: None,
             last_trigger: None,
             skip_lock: None,
@@ -540,8 +546,10 @@ impl<'a> World<'a> {
         }
     }
 
-    /// The game as save-file text. Only when the player is free: a running
-    /// script cannot be saved.
+    /// The game as save-file text: the story, and a snapshot of the world
+    /// as it stands (see `saved`). Only while the player is in control, as
+    /// the original saves (0x4ab1d2): nothing but background functions is
+    /// running then, and those are kept by name.
     pub fn save(&self) -> Result<String, String> {
         // On a title card the story is between timeblocks: it saves as the
         // next one about to start, as the card's own Save button does.
@@ -555,52 +563,27 @@ impl<'a> World<'a> {
             state.last_location = std::mem::replace(&mut state.location, change.location.clone());
             return Ok(state.to_save(&[]));
         }
-        if !self.idle() {
+        if !self.in_control() {
             return Err("cannot save while something is happening".into());
         }
-        let num = |v: f32| format!("{v}");
-        let mut extra = Vec::new();
-        if let Some(scene) = &self.scene
-            && let Some((p, heading)) = scene.cast.actor_position(&scene.ego)
-        {
-            extra.push(vec![
-                "ego_at".into(),
-                num(p.x),
-                num(p.y),
-                num(p.z),
-                num(heading),
-            ]);
-        }
-        let c = &self.camera;
-        extra.push(vec![
-            "camera".into(),
-            num(c.position.x),
-            num(c.position.y),
-            num(c.position.z),
-            num(c.yaw),
-            num(c.pitch),
-            num(c.fov_y),
-        ]);
-        if self.forced_cuts {
-            extra.push(vec!["forced_cuts".into()]);
-        }
-        if let Some(scene) = &self.scene
-            && scene.room.name != scene.room.built_as
-        {
-            extra.push(vec!["scene".into(), scene.room.name.clone()]);
-        }
-        for (left, noun, verb) in &self.game_timers {
-            extra.push(vec!["game_timer".into(), num(*left as f32), noun.clone(), verb.clone()]);
-        }
-        Ok(self.state.to_save(&extra))
+        let snapshot = serde_json::to_string(&self.snapshot()?).map_err(|e| e.to_string())?;
+        Ok(self.state.to_save(&[vec!["snapshot".into(), snapshot]]))
     }
 
-    /// Loads a saved game: the story as it was, then the room built from it
-    /// and entered, as G-Engine's first save versions did. The entry counts
-    /// as a visit, so first-visit scenes do not play again. Where the player
-    /// stood and looked is put back once the entry has played.
+    /// Loads a saved game. One with a snapshot of the world is put back as
+    /// it was (see `saved`), the original's restore. One without (saved on
+    /// a title card, about to start the next timeblock, or before saves
+    /// kept snapshots) has its room built from the story and entered.
+    /// Where the player stood and looked is put back once the entry has
+    /// played.
     pub fn load(&mut self, renderer: &Renderer, text: &str) -> Result<(), String> {
         let (state, extra) = GameState::from_save(text)?;
+        let snapshot = extra
+            .iter()
+            .find(|r| r[0] == "snapshot" && r.len() == 2)
+            .map(|r| serde_json::from_str::<saved::Snapshot>(&r[1]))
+            .transpose()
+            .map_err(|e| format!("cannot read the saved world: {e}"))?;
         let floats = |r: &Vec<String>| -> Vec<f32> {
             r[1..].iter().filter_map(|v| v.parse().ok()).collect()
         };
@@ -652,11 +635,21 @@ impl<'a> World<'a> {
         self.skip_lock = None;
         self.fast_forward = false;
         self.next_location = None;
+        self.map = None;
+        self.map_leave = None;
+        if let Some(saved) = snapshot {
+            self.binocs = None;
+            self.conversation = None;
+            self.speaker = None;
+            self.speaker_changes.clear();
+            self.saved_fidgets.clear();
+            self.timeblock_change = None;
+            self.restore = None;
+            return self.restore_snapshot(renderer, state, saved);
+        }
         let last_location = state.last_location.clone();
         self.state = state;
         let location = self.state.location.clone();
-        self.map = None;
-        self.map_leave = None;
         if location == "MAP" {
             self.state.location = last_location.clone();
             self.open_map(crate::map::Follow::None);
@@ -725,6 +718,30 @@ impl<'a> World<'a> {
     /// Goes to a location: builds it as the story has it now, counts the
     /// visit, and runs its `SCENE ENTER` action.
     pub fn enter(&mut self, renderer: &Renderer, location: &str) -> Result<(), String> {
+        self.build_room(renderer, location)?;
+        self.state.count_visit();
+
+        let enter = {
+            let scene = self.scene.as_ref().unwrap();
+            let scripts = &self.scripts;
+            let snapshot = self.state.clone();
+            let mut probe = snapshot.clone();
+            let mut api = GameApi::new(&mut probe, scripts);
+            scene
+                .actions
+                .find("SCENE", "ENTER", &mut api, &snapshot)
+                .cloned()
+        };
+        if let Some(rule) = enter {
+            self.run(renderer, rule, false);
+        }
+        Ok(())
+    }
+
+    /// Builds a location's room as the story stands, up to its own code's
+    /// set-up (`init`): its scene, cast, actions and sounds. The story as
+    /// it stood is kept, so a saved game can build the same room again.
+    fn build_room(&mut self, renderer: &Renderer, location: &str) -> Result<(), String> {
         let location = location.to_ascii_uppercase();
         // The GPS is put away on leaving its room (0x46f391).
         if self.gps.take().is_some_and(|mut g| g.leave()) {
@@ -736,6 +753,7 @@ impl<'a> World<'a> {
         if self.state.location != gk3_game::state::key(&location) {
             self.state.move_to(&location);
         }
+        self.entry = Some(self.state.clone());
         self.catalog.time = Some(self.state.timeblock.clone());
         self.catalog.state = Some(self.state.clone());
         let scene_name = self
@@ -991,22 +1009,6 @@ impl<'a> World<'a> {
         }
         self.timed_shows.clear();
         self.scene_function(renderer, "init");
-        self.state.count_visit();
-
-        let enter = {
-            let scene = self.scene.as_ref().unwrap();
-            let scripts = &self.scripts;
-            let snapshot = self.state.clone();
-            let mut probe = snapshot.clone();
-            let mut api = GameApi::new(&mut probe, scripts);
-            scene
-                .actions
-                .find("SCENE", "ENTER", &mut api, &snapshot)
-                .cloned()
-        };
-        if let Some(rule) = enter {
-            self.run(renderer, rule, false);
-        }
         Ok(())
     }
 
@@ -2923,6 +2925,13 @@ impl<'a> World<'a> {
                 } else {
                     crate::map::Follow::None
                 };
+                // Following Estelle counts twice, at once (0x47f3c7): the
+                // evening of day two ends on it.
+                if self.map_follow == crate::map::Follow::Estelle {
+                    let ego = self.state.ego.clone();
+                    let n = self.state.noun_verb(&ego, "ESTELLE", "FOLLOW");
+                    self.state.set_noun_verb(&ego, "ESTELLE", "FOLLOW", n + 2);
+                }
                 self.next_location = Some("MAP".into());
                 None
             }
@@ -3788,6 +3797,11 @@ impl<'a> World<'a> {
                     crate::map::Event::ActorAt(actor, location) => {
                         self.state.actor_locations.insert(actor, location);
                     }
+                    crate::map::Event::Count(noun, verb) => {
+                        let ego = self.state.ego.clone();
+                        let n = self.state.noun_verb(&ego, noun, verb);
+                        self.state.set_noun_verb(&ego, noun, verb, n + 1);
+                    }
                     crate::map::Event::Leave(location) => {
                         let after = self.captions.iter().map(|c| c.until).fold(now, f64::max);
                         self.map_leave = Some((after, location));
@@ -4107,9 +4121,8 @@ impl<'a> World<'a> {
         }
     }
 
-    /// Goes somewhere, as G-Engine's `LocationManager` does: the new location
-    /// is set first, then the timeblock rules are asked whether that ends
-    /// the timeblock. If it does, the story waits on the title card (see
+    /// Goes somewhere, as the original does (0x5206ad): the timeblock rules
+    /// are asked whether going there ends the timeblock. If it does, the story waits on the title card (see
     /// [`World::continue_timeblock`]); otherwise the location is entered.
     pub fn change_location(&mut self, renderer: &Renderer, location: &str) {
         self.drop_last_frame();
@@ -4117,11 +4130,7 @@ impl<'a> World<'a> {
         let follow = std::mem::replace(&mut self.map_follow, crate::map::Follow::None);
         let mut probe = self.state.clone();
         probe.last_location = std::mem::replace(&mut probe.location, location.clone());
-        let ending = {
-            let mut copy = probe.clone();
-            let mut api = GameApi::new(&mut copy, &self.scripts);
-            gk3_game::timeblocks::check(&probe, &mut api)
-        };
+        let ending = gk3_game::timeblocks::check(&probe, &self.scripts);
         match ending {
             Some((to, opens)) => {
                 let location = opens.map_or(location, str::to_string);
@@ -4376,11 +4385,7 @@ impl<'a> World<'a> {
                     self.change_location(renderer, location);
                 }
                 Event::ExitIfOver => {
-                    let ending = {
-                        let mut copy = self.state.clone();
-                        let mut api = GameApi::new(&mut copy, &self.scripts);
-                        gk3_game::timeblocks::check(&self.state, &mut api)
-                    };
+                    let ending = gk3_game::timeblocks::check(&self.state, &self.scripts);
                     if ending.is_some() {
                         self.sidney_exit(renderer);
                     }
@@ -4415,11 +4420,7 @@ impl<'a> World<'a> {
     fn sidney_exit(&mut self, renderer: &Renderer) {
         self.close_sidney();
         let here = self.state.location.clone();
-        let ending = {
-            let mut copy = self.state.clone();
-            let mut api = GameApi::new(&mut copy, &self.scripts);
-            gk3_game::timeblocks::check(&self.state, &mut api)
-        };
+        let ending = gk3_game::timeblocks::check(&self.state, &self.scripts);
         match ending {
             Some((to, opens)) => {
                 let location = opens.map_or(here.clone(), str::to_string);
@@ -4947,11 +4948,9 @@ impl<'a> World<'a> {
             // Topics and chats count themselves; ordinary verbs count only
             // when their script says so.
             if actions::is_topic(&rule.verb) {
-                *self
-                    .state
-                    .topics
-                    .entry((rule.noun.clone(), rule.verb.clone()))
-                    .or_default() += 1;
+                let ego = self.state.ego.clone();
+                let said = self.state.noun_verb(&ego, &rule.noun, &rule.verb);
+                self.state.set_noun_verb(&ego, &rule.noun, &rule.verb, said + 1);
                 self.state.played_topics.insert((
                     rule.noun.clone(),
                     rule.verb.clone(),
@@ -4979,6 +4978,28 @@ impl<'a> World<'a> {
     /// What lies under a point on screen.
     /// What is under a point of the window, and the piece of the room (or
     /// figure) it is.
+    /// Whether something with this noun can be clicked on now, by the rules
+    /// [`World::pick_object`] picks by: a figure shown, a piece of the room
+    /// not hidden or gone, the one being talked to (on the topic bar), or,
+    /// with the inventory up, an item the player carries.
+    pub fn clickable(&self, noun: &str) -> bool {
+        let noun = noun.to_ascii_uppercase();
+        if self.topic_bar.as_deref() == Some(noun.as_str())
+            || (self.state.inventory_shown && self.state.has_item(&self.state.ego, &noun))
+        {
+            return true;
+        }
+        let Some(scene) = &self.scene else {
+            return false;
+        };
+        scene.cast.shows_noun(&noun)
+            || scene.nouns.iter().any(|(object, n)| {
+                *n == noun
+                    && !scene.untouchable.contains(object)
+                    && (!scene.room.hidden.contains(object) || scene.hit_tests.contains(object))
+            })
+    }
+
     pub fn pick_object(&self, x: f32, y: f32, width: u32, height: u32) -> (Pick, Option<String>) {
         let Some(scene) = &self.scene else {
             return (Pick::Nothing, None);

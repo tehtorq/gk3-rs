@@ -84,7 +84,7 @@ pub enum Click {
     Jump,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Chessboard {
     /// Each tile's state, by column and row.
     board: [[i32; 8]; 8],

@@ -66,7 +66,7 @@ const NOT_NOW: &str = "StartDialogue(\"1SERM44V51\", 1);";
 const CURSOR: &str = "C_ZOOM";
 
 /// The scene's state (+0xdc; 6 is never used).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum State {
     Doorway,
     OnPlatform,
@@ -81,7 +81,7 @@ pub enum State {
 }
 
 /// The blade in a danger zone: coming up to a slot or going down from it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Zone {
     None,
     Up,
@@ -89,7 +89,7 @@ enum Zone {
 }
 
 /// What the scene is told when something it started ends (0x458c48).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Message {
     /// 0: the death played out.
     Killed,
@@ -109,6 +109,7 @@ enum Message {
     Dropped,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Pendulum {
     state: State,
     /// The scene's clock, ms, and its steps' (`lastUpdate`, `nextUpdate`,

@@ -12,6 +12,13 @@ use std::sync::Arc;
 
 use gk3_formats::image::IndexedImage;
 
+/// See [`WalkMap::changes`].
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct WalkChanges {
+    blocked: BTreeSet<u8>,
+    rects: HashMap<String, [f32; 4]>,
+}
+
 #[derive(Debug, Clone)]
 pub struct WalkMap {
     width: i32,
@@ -62,6 +69,20 @@ impl WalkMap {
             Some(r) => self.rects.insert(name, r),
             None => self.rects.remove(&name),
         };
+    }
+
+    /// What the story has closed off: regions and named areas. For a
+    /// saved game.
+    pub fn changes(&self) -> WalkChanges {
+        WalkChanges {
+            blocked: self.blocked.clone(),
+            rects: self.rects.clone(),
+        }
+    }
+
+    pub fn apply(&mut self, changes: WalkChanges) {
+        self.blocked = changes.blocked;
+        self.rects = changes.rects;
     }
 
     pub fn set_blocked(&mut self, region: u8, blocked: bool) {

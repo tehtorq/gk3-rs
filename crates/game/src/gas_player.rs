@@ -25,6 +25,7 @@ pub enum Request {
     Stop,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct GasPlayer {
     script: Vec<Instruction>,
     pc: usize,
@@ -47,7 +48,7 @@ pub struct GasPlayer {
 }
 
 /// Someone coming near (or going away), and where the script goes then.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Near {
     pub noun: String,
     pub distance: f32,

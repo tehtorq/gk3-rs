@@ -217,7 +217,7 @@ pub fn file(id: u32) -> Option<&'static File> {
 }
 
 /// SIDNEY's interface text (`ESIDNEY.TXT`), by screen and key.
-#[derive(Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Strings(HashMap<String, HashMap<String, String>>);
 
 impl Strings {
@@ -256,7 +256,7 @@ impl Strings {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Email {
     pub from: String,
     pub to: String,
@@ -312,52 +312,53 @@ pub fn load_emails(lib: &Library) -> BTreeMap<String, Email> {
 }
 
 /// What SIDNEY asks the game to do.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Event {
     Say(String, i32),
-    Sound(&'static str),
-    SetFlag(&'static str),
-    ClearFlag(&'static str),
-    Variable(&'static str, i32),
+    Sound(#[serde(deserialize_with = "crate::saved::static_str")] crate::saved::Name),
+    SetFlag(#[serde(deserialize_with = "crate::saved::static_str")] crate::saved::Name),
+    ClearFlag(#[serde(deserialize_with = "crate::saved::static_str")] crate::saved::Name),
+    Variable(#[serde(deserialize_with = "crate::saved::static_str")] crate::saved::Name, i32),
     Score(String),
     AddFile(u32),
     /// A flag named at run time (from the page triggers' file).
     SetFlagOwned(String),
     ShowInventory,
-    GiveItem(&'static str),
+    GiveItem(#[serde(deserialize_with = "crate::saved::static_str")] crate::saved::Name),
     /// A file has been analysed.
     Analyzed(u32),
-    /// A movie's sound.
+    /// A movie's sound: carried out at once, never saved.
+    #[serde(skip)]
     Pcm(Arc<gk3_media::Pcm>),
     /// Close SIDNEY and go back to the room.
     Exit,
     /// Le Serpent Rouge has moved on: `LSRState` is to be brought up to
     /// date with the flags.
     LsrState,
-    TakeItem(&'static str),
+    TakeItem(#[serde(deserialize_with = "crate::saved::static_str")] crate::saved::Name),
     /// SIDNEY closes and the story goes elsewhere.
-    ChangeLocation(&'static str),
+    ChangeLocation(#[serde(deserialize_with = "crate::saved::static_str")] crate::saved::Name),
     /// SIDNEY closes if that ends the timeblock.
     ExitIfOver,
     /// A sound played over and over, or (`None`) stopped.
-    LoopSound(Option<&'static str>),
+    LoopSound(#[serde(deserialize_with = "crate::saved::option_static_str")] Option<crate::saved::Name>),
 }
 
 /// A list to choose from: the grid's sizes, the shapes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Choice {
     title: String,
     rows: Vec<(Row, Vec<steps::Step>)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum Row {
     Text(String),
     Picture(String),
 }
 
 /// The tools on the desktop, left to right.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Tool {
     Search,
     Email,
@@ -380,7 +381,7 @@ const TOOLS: &[(Tool, &str)] = &[
     (Tool::Suspects, "SUSPT"),
 ];
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Screen {
     Desktop,
     EmailList,
@@ -395,7 +396,7 @@ pub enum Screen {
 }
 
 /// Add Data's progress.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 enum Adding {
     Idle,
     /// "Waiting for input", then the inventory comes up.
@@ -415,7 +416,7 @@ enum Adding {
 }
 
 /// A clickable thing, as last drawn.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Hit {
     Exit,
     Tool(Tool),
@@ -440,7 +441,7 @@ pub enum Hit {
     MatchLink,
     MatchClose,
     /// Make ID's person (`GAB` or `GRA`), and PRINT.
-    Person(&'static str),
+    Person(#[serde(deserialize_with = "crate::saved::static_str")] crate::saved::Name),
     Print,
     TranslateOpen,
     /// A language button: from (true) or to, and which.
@@ -458,7 +459,7 @@ pub enum Hit {
 /// A page visit's one-time line, from `SIDNEYDIALOG.TXT`: said if the
 /// flag it sets is not yet set, the Le Serpent Rouge puzzle is within its
 /// steps, and its required flags (`!` for not) hold.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct Trigger {
     line: String,
     flag: String,
@@ -469,14 +470,16 @@ struct Trigger {
 
 /// Search's state: what is typed, the page shown and how far down, and
 /// the pages visited.
-#[derive(Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 struct Search {
     input: String,
     page: Option<String>,
     scroll: f32,
     history: Vec<String>,
     at: usize,
-    /// The page laid out: its name, pieces and height.
+    /// The page laid out: its name, pieces and height. Laid out again
+    /// after a restore.
+    #[serde(skip)]
     laid_out: Option<(String, Vec<crate::html::Piece>, f32)>,
 }
 
@@ -537,7 +540,9 @@ pub fn lsr_step(state: &GameState) -> i32 {
         "SAGITTARIUS",
         "CAPRICORN",
     ];
-    SIGNS.iter().filter(|s| state.flags.contains(**s)).count() as i32
+    // As the original counts them (0x64a616): in order, up to the first
+    // sign not yet found.
+    SIGNS.iter().take_while(|s| state.flags.contains(**s)).count() as i32
 }
 
 /// Search terms, lower case, to the page each finds (`SIDSEARCH.TXT`).
@@ -590,6 +595,7 @@ fn load_triggers(lib: &Library) -> HashMap<String, Trigger> {
 }
 
 /// SIDNEY while it is up.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Sidney {
     pub screen: Screen,
     pub files_open: bool,
@@ -662,6 +668,17 @@ pub fn receive_email(state: &mut GameState) -> bool {
 }
 
 impl Sidney {
+    /// The LSR map is being worked on: a screen of its own over SIDNEY in
+    /// the original (its LSR layer), on which the game cannot be saved.
+    pub fn lsr_map_up(&self) -> bool {
+        self.screen == Screen::Analyze && self.analyze.state == analyze::State::Map
+    }
+
+    /// Back from a saved game: movies that were playing open again.
+    pub fn restored(&mut self, lib: &Library) {
+        self.reopen_videos(lib);
+    }
+
     pub fn new(lib: &Library) -> Self {
         Self {
             screen: Screen::Desktop,

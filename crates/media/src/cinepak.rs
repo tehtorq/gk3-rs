@@ -27,6 +27,7 @@ impl Default for Strip {
 }
 
 /// Decodes a Cinepak movie's frames in order onto an RGB picture.
+#[derive(Clone)]
 pub struct Cinepak {
     width: usize,
     height: usize,

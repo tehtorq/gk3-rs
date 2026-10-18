@@ -4,7 +4,7 @@ use crate::reader::Reader;
 use crate::{Error, Result};
 
 /// An 8-bit RGBA image, top row first.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Image {
     pub width: u32,
     pub height: u32,

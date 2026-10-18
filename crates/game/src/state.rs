@@ -21,8 +21,9 @@ pub struct GameState {
     pub flags: BTreeSet<String>,
     pub variables: BTreeMap<String, i32>,
     /// By character, noun and verb: what has been done to what, by whom.
+    /// Topics are verbs here too: the original keeps both in one table,
+    /// by noun, verb and whether the player is Gabriel or Grace (0x491a2e).
     pub noun_verbs: BTreeMap<(String, String, String), i32>,
-    pub topics: BTreeMap<(String, String), i32>,
     /// Topics already discussed, by noun, verb and the case they came under:
     /// a topic is raised once per case.
     pub played_topics: BTreeSet<(String, String, String)>,
@@ -87,7 +88,6 @@ impl GameState {
             flags: BTreeSet::new(),
             variables: BTreeMap::new(),
             noun_verbs: BTreeMap::new(),
-            topics: BTreeMap::new(),
             played_topics: BTreeSet::new(),
             chats: BTreeMap::new(),
             score_events: BTreeSet::new(),
@@ -209,7 +209,7 @@ impl GameState {
     /// rendering, maps in key order).
     pub fn hash(&self) -> u64 {
         let text = format!(
-            "{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}",
+            "{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}",
             self.timeblock,
             self.last_timeblock,
             self.location,
@@ -218,7 +218,6 @@ impl GameState {
             self.flags,
             self.variables,
             self.noun_verbs,
-            self.topics,
             self.played_topics,
             self.chats,
             self.score_events,

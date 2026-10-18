@@ -5,7 +5,7 @@
 //! parentheses or a mix. A run of consecutive `ONEOF` lines is one random
 //! choice. As G-Engine's `GAS` reads them.
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Instruction {
     /// Play an animation and wait for it, with a percentage chance of
     /// playing at all.

@@ -131,6 +131,8 @@ pub enum Event {
     /// Speak lines, by license plate and count.
     Say(String, i32),
     ActorAt(String, String),
+    /// Count a noun and verb once more, for the player.
+    Count(&'static str, &'static str),
     /// Leave the map for a location, once anything being said is done.
     Leave(String),
 }
@@ -475,6 +477,9 @@ impl MapScreen {
                 self.other(BUTHANE, &route, false);
                 self.on_arrival = vec![
                     say("2196L3WL71"),
+                    // Followed all the way, as the original counts it
+                    // (0x480d65); day one's afternoon ends on it.
+                    Event::Count("BUTHANE", "FOLLOW"),
                     Event::ActorAt("BUTHANE".into(), "CSD".into()),
                 ];
             }
@@ -482,6 +487,7 @@ impl MapScreen {
                 self.other(WILKES, &["PLO", "PL3", "RL1", "IN4", "VGR", "PL4"], false);
                 self.on_arrival = vec![
                     say("2196L3WLM1"),
+                    Event::Count("WILKES", "FOLLOW"),
                     Event::ActorAt("WILKES".into(), "LER".into()),
                 ];
             }
@@ -649,12 +655,7 @@ pub fn press(state: &GameState, location: &str) -> Result<(String, Option<i32>),
 pub fn hints(state: &GameState) -> Vec<&'static str> {
     let ego = state.ego.as_str();
     let nvc = |noun: &str, verb: &str| state.noun_verb(ego, noun, verb);
-    let topic = |noun: &str, verb: &str| {
-        *state
-            .topics
-            .get(&(gk3_game::state::key(noun), gk3_game::state::key(verb)))
-            .unwrap_or(&0)
-    };
+    let topic = nvc;
     let var = |name: &str| *state.variables.get(&gk3_game::state::key(name)).unwrap_or(&0);
     let flag = |name: &str| state.flags.contains(&gk3_game::state::key(name));
     let has = |item: &str| state.has_item(ego, item);

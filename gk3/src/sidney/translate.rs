@@ -9,7 +9,7 @@ use gk3_game::state::GameState;
 use super::steps::{Answer, Popup, Step, ToolStep};
 use super::{Event, Sidney, file};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Language {
     English,
     Latin,
@@ -85,6 +85,7 @@ fn translation(id: u32) -> Option<&'static Translation> {
     TRANSLATIONS.iter().find(|t| t.file == id)
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Translate {
     pub file: Option<u32>,
     pub from: Language,

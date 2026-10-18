@@ -20,7 +20,7 @@ pub const PANEL_AT: (f32, f32) = (2.0, 2.0);
 
 /// How a room's map lies over the world, and the spot it reads out from:
 /// a section of `GPS.TXT`, named for the room.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Calibration {
     /// The panel's picture, before the size's ending (`gpsLER`).
     pub name: String,
@@ -37,7 +37,7 @@ pub struct Calibration {
 }
 
 /// One of the panel's three sizes: a section of `GPS.TXT`, in pixels.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Layout {
     /// The ending of each picture of this size (`_L`).
     pub ext: String,
@@ -63,7 +63,7 @@ pub struct Layout {
 }
 
 /// The device's settings for a room, as `GPS.TXT` has them.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     pub calibration: Calibration,
     /// Small, medium and large.
@@ -210,19 +210,20 @@ pub enum Effect {
     Script(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 enum Turn {
     On,
     Away,
 }
 
 /// The device in a room.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Gps {
     pub config: Config,
     /// The room's script with `HideCoord`, called when the power is turned
     /// off by its button.
-    script: &'static str,
+    #[serde(deserialize_with = "crate::saved::static_str")]
+    script: crate::saved::Name,
     /// The panel is up.
     pub shown: bool,
     /// Its display is on.

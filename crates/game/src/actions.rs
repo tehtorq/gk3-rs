@@ -238,10 +238,7 @@ impl ActionSet {
         if !ego_ok {
             return Some(false);
         }
-        let said = *state
-            .topics
-            .get(&(rule.noun.clone(), rule.verb.clone()))
-            .unwrap_or(&0);
+        let said = state.noun_verb(&state.ego, &rule.noun, &rule.verb);
         let total = self
             .rules
             .iter()

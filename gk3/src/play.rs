@@ -464,6 +464,13 @@ fn headless_run(lib: &Library, o: &Options) -> Result<ExitCode, String> {
         if world.state.has_item(&ego, verb) {
             world.state.active_item.insert(ego, verb.clone());
         }
+        // Only what a player could click on: nothing hidden or gone.
+        if !world.clickable(noun) && noun != "SCENE" {
+            world
+                .log
+                .push(format!("cannot {noun}:{verb}; nothing to click on"));
+            continue;
+        }
         let mut verbs = world.verbs(noun);
         verbs.extend(world.topics(noun));
         // With --seconds, the last action is caught in progress.
@@ -730,8 +737,10 @@ fn headless_run(lib: &Library, o: &Options) -> Result<ExitCode, String> {
     }
 
     if let Some(name) = &o.save {
+        // As the player's quick save: only when the original allows one.
         let path = world
-            .save()
+            .may_save()
+            .and_then(|()| world.save())
             .and_then(|text| crate::saves::write(name, &text))?;
         println!("saved to {}", path.display());
         if let (Some(scene), Some(seen)) = (&world.scene, world.view_scene()) {

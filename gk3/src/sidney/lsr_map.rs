@@ -82,7 +82,7 @@ const HEXAGRAM_DEGREES: f32 = 33.0;
 const NEAR: f32 = 20.0;
 const HOVER: f32 = 4.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Kind {
     Circle,
     Square,
@@ -90,7 +90,7 @@ pub enum Kind {
 }
 
 /// A shape on the little map: `size` is a radius, or a square's side.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Shape {
     pub kind: Kind,
     pub center: Vec2,
@@ -98,7 +98,7 @@ pub struct Shape {
     pub angle: f32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Grid {
     pub center: Vec2,
     pub size: f32,
@@ -108,7 +108,7 @@ pub struct Grid {
 }
 
 /// What a press on the little map commits to until let go.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Drag {
     #[default]
     None,
@@ -227,7 +227,7 @@ impl Grid {
 }
 
 /// The map's state.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Map {
     /// On the big map.
     pub points: Vec<Vec2>,

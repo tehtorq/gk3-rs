@@ -194,7 +194,7 @@ pub fn for_character(
 }
 
 /// What a face currently shows; `None` is the part's resting picture.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Expression {
     pub mouth: Option<String>,
     pub eyelids: Option<String>,

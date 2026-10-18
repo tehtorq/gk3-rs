@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use gk3_formats::ini::{Document, Split};
 
 /// A vertex in a model: mesh, submesh ("group"), vertex.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Marker {
     pub mesh: usize,
     pub group: usize,
@@ -17,14 +17,14 @@ pub struct Marker {
 /// the hip point to this vertex of the hip mesh, across the floor, turned
 /// by `adjust` (radians). Chosen once from the model as its walk starts
 /// (`placement::hip_reference`).
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct HipReference {
     pub group: usize,
     pub vertex: usize,
     pub adjust: f32,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Character {
     pub hip: Marker,
     pub left_shoe: Marker,

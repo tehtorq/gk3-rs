@@ -9,12 +9,12 @@ use gk3_formats::act::{Keyed, VertexAnimation};
 use gk3_formats::model::Model;
 use glam::{Mat4, Vec3, Vec4};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Pose {
     pub meshes: Vec<MeshPose>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MeshPose {
     /// Mesh-to-model transform as i, j, k, position columns.
     pub transform: [[f32; 3]; 4],

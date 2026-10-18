@@ -21,6 +21,9 @@ use glam::{Mat3, Mat4, Vec2, Vec3};
 use crate::faces::{Compositor, Expression, FaceConfig};
 use gk3_formats::anm::FaceChange;
 
+mod saved;
+pub use saved::CastSnapshot;
+
 /// The vertex animations an `.ANM` starts, by the frame each begins on.
 type Clips = Vec<(u32, Arc<VertexAnimation>)>;
 
@@ -29,8 +32,10 @@ type Clips = Vec<(u32, Arc<VertexAnimation>)>;
 type ByFigure = HashMap<usize, (Clips, Option<[f32; 8]>)>;
 
 /// An animation in progress: the clips it starts and when.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Playing {
     anim: String,
+    #[serde(with = "saved::clips::numbered")]
     clips: Vec<(u32, Arc<VertexAnimation>)>,
     frames: u32,
     looping: bool,
@@ -39,8 +44,10 @@ struct Playing {
     fidgeting: bool,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Walk {
     path: Vec<[f32; 2]>,
+    #[serde(with = "saved::clips::option")]
     clip: Option<Arc<VertexAnimation>>,
     started: f64,
     last: f64,
@@ -48,9 +55,11 @@ struct Walk {
     heading: Option<f32>,
     /// The start animation; its first frame is the stance a walk ends in
     /// before turning.
+    #[serde(with = "saved::clips::option")]
     stance: Option<Arc<VertexAnimation>>,
     /// The walk's opening stride: the start animation, or a turning start
     /// for a goal behind.
+    #[serde(with = "saved::clips::option")]
     opener: Option<Arc<VertexAnimation>>,
     /// The opener turns the walker round, as G-Engine's
     /// `FollowPathStartTurnLeft` and `Right`.
@@ -116,6 +125,7 @@ struct Walk {
 
 /// A walk paused for another walker: the stride it stopped in, eased out
 /// of into standing, and when to look again.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Pause {
     until: f64,
     from: Pose,
@@ -160,6 +170,7 @@ pub const GIVE_WAY_FOR: f64 = 30.0;
 /// reached, to the goal and the standing pose, over `SETTLE_SECONDS`.
 /// G-Engine (and the original) jump straight there, which shows as a hop:
 /// a deliberate difference (`docs/deviations.md`).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Settle {
     from: Vec2,
     pose: Pose,
@@ -178,7 +189,7 @@ pub const AT_END: f32 = 2.0;
 /// walk (`docs/re-walking.md`): within `arrive` of its end, and facing
 /// within `face` of its heading. Without a `face`, the walker turns to the
 /// heading exactly.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Tolerance {
     pub arrive: f32,
     pub face: Option<f32>,
@@ -220,7 +231,7 @@ pub enum WalkGoal {
 
 /// What an actor does with themselves when nothing else is asked of them:
 /// stand about, talk, or listen. Each is a GAS script.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Fidget {
     Idle = 0,
     Talk = 1,
@@ -248,6 +259,8 @@ struct Figure {
     /// Submeshes to repaint with another texture, by flat index and the
     /// texture's name.
     repaint: Vec<(usize, String)>,
+    /// The texture each repainted submesh now wears, for a saved game.
+    painted: std::collections::BTreeMap<usize, String>,
     /// Parts not drawn: mesh and group.
     hidden_parts: std::collections::HashSet<(usize, usize)>,
     /// An actor's blob shadow on the floor, and whether the story wants it.
@@ -306,7 +319,7 @@ struct FaceState {
 }
 
 /// What someone's eyes are turned to.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LookTarget {
     /// Someone or something in the room, by noun or model.
     Noun(String),
@@ -317,11 +330,13 @@ pub enum LookTarget {
 /// from the character's `<code>TurnHead{L,R,Up,Down}` animations, each a
 /// steady turn from rest to its furthest, at the frame matching the angle
 /// wanted. Only characters with those animations (the Abbé) have one.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct HeadRig {
     mesh: usize,
     /// How far it may turn: left, up, right, down, in radians.
     limits: [f32; 4],
     /// Left, right, up, down, each with the angle its last frame reaches.
+    #[serde(with = "saved::clips::head")]
     clips: [(Arc<VertexAnimation>, f32); 4],
     /// Now, and where `TurnHead` asked for, held until when: yaw (right
     /// +), pitch (up +).
@@ -362,6 +377,7 @@ impl FaceState {
     }
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct ActorPlacement {
     character: Character,
     position: Vec3,
@@ -670,6 +686,7 @@ impl Cast {
             cleanup: VecDeque::new(),
             morph: None,
             repaint: Vec::new(),
+            painted: Default::default(),
             hidden_parts: Default::default(),
             shadow: None,
             shadow_on: true,
@@ -1185,6 +1202,7 @@ impl Cast {
         self.paints
             .entry(name.clone())
             .or_insert_with(|| load_texture(lib, texture));
+        self.figures[i].painted.insert(index, name.clone());
         self.figures[i].repaint.push((index, name));
         true
     }
@@ -2776,6 +2794,13 @@ impl Cast {
         best
     }
 
+    /// Whether a figure with this noun is shown, to be clicked on.
+    pub fn shows_noun(&self, noun: &str) -> bool {
+        self.figures
+            .iter()
+            .any(|f| f.visible && f.noun.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(noun)))
+    }
+
     /// How far along a ray one figure, if shown, is first met.
     pub fn ray_figure(&self, name: &str, origin: Vec3, direction: Vec3) -> Option<f32> {
         let f = self.figures.get(self.find(name)?).filter(|f| f.visible)?;
@@ -2806,6 +2831,7 @@ impl Cast {
     }
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Morph {
     from: Pose,
     to: Pose,
@@ -3689,7 +3715,7 @@ fn ambient_range(line: &Line) -> Option<f32> {
 
 /// The floor's light about a model (0x4b0546): the mean of the last four
 /// colours taken, each 0 to 1; half until any is.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct FloorLight {
     ring: [[f32; 3]; 4],
     next: usize,

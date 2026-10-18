@@ -142,7 +142,7 @@ const UNKNOWNS: &[Unknown] = &[
 ];
 
 /// Match Analysis under way.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Matching {
     /// The scan movie plays.
     Scanning,
@@ -155,15 +155,16 @@ pub enum Matching {
     None,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Match {
     pub file: u32,
     pub phase: Matching,
     /// The print picture shown beside the scan.
-    pub picture: &'static str,
+    #[serde(deserialize_with = "crate::saved::static_str")]
+    pub picture: crate::saved::Name,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Suspects {
     pub open: Option<usize>,
     pub file: Option<u32>,

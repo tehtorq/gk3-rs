@@ -50,7 +50,7 @@ const ROW: f32 = 15.0;
 const ROWS: usize = 9;
 
 /// Where the parser has got to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum State {
     /// The pause before it starts.
     Idle,
@@ -62,7 +62,7 @@ pub enum State {
 }
 
 /// What can be clicked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AnagramHit {
     /// A word in the list, by its place in the list of words.
     Word(usize),
@@ -88,7 +88,7 @@ pub enum Out {
 }
 
 /// Steps of the timed messages, each after its pause.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Act {
     StartScramble,
     NoMatch,
@@ -99,6 +99,7 @@ enum Act {
     Translation,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Anagram {
     pub state: State,
     /// The text being parsed, as shown.
@@ -133,7 +134,8 @@ pub struct Anagram {
     pub scroll: usize,
     rng: u64,
     /// The strings it shows, by key.
-    strings: Vec<(&'static str, String)>,
+    #[serde(deserialize_with = "crate::saved::static_pairs")]
+    strings: Vec<(crate::saved::Name, String)>,
 }
 
 const KEYS: [&str; 16] = [

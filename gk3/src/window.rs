@@ -440,11 +440,54 @@ impl Gfx {
         self.world.sound("SIDBUTN-1", 1.0, gk3_audio::Bus::Effects);
     }
 
+    /// Whether the game may be saved from where the player is, as the
+    /// original asks before its save screen or quick save (0x4cbe72): on
+    /// a title card or the death screen; else with no verb menu up and
+    /// none of the screens that forbid it (inventory, close-up, help,
+    /// pause, a message, the finished screen), and the world allowing it.
+    fn may_save(&self) -> Result<(), String> {
+        if self.card.is_some() || self.death {
+            return Ok(());
+        }
+        if self.menu.is_some() {
+            return Err("the verbs are up".into());
+        }
+        if self.inventory.open
+            || self.inventory.closeup.is_some()
+            || self.help.is_some()
+            || self.paused
+            || self.popup.is_some()
+            || self.finished
+            || self.quit
+        {
+            return Err("not on this screen".into());
+        }
+        self.world.may_save()
+    }
+
+    /// Whether a saved game may be put back from where the player is
+    /// (0x4cbebf): the title screen, a title card and the death screen
+    /// allow it; else not the finished screen, and the world must allow it.
+    fn may_restore(&self) -> Result<(), String> {
+        if self.front.is_some() || self.card.is_some() || self.death {
+            return Ok(());
+        }
+        if self.finished {
+            return Err("not on this screen".into());
+        }
+        self.world.may_restore()
+    }
+
     /// Opens the save screen (if the story can be saved now) or the restore
-    /// screen.
+    /// screen (if a game can be put back now).
     fn open_save_load(&mut self, saving: bool) {
         self.bar = None;
-        if saving && let Err(e) = self.world.save() {
+        let allowed = if saving {
+            self.may_save()
+        } else {
+            self.may_restore()
+        };
+        if let Err(e) = allowed {
             self.tell(format!("Not now: {e}"));
             return;
         }
@@ -853,8 +896,8 @@ impl Gfx {
 
     fn quick_save(&mut self) {
         let result = self
-            .world
-            .save()
+            .may_save()
+            .and_then(|()| self.world.save())
             .and_then(|text| crate::saves::write(crate::saves::QUICK, &text));
         match result {
             Ok(_) => {
@@ -867,7 +910,9 @@ impl Gfx {
     }
 
     fn quick_load(&mut self) {
-        let result = crate::saves::read(crate::saves::QUICK)
+        let result = self
+            .may_restore()
+            .and_then(|()| crate::saves::read(crate::saves::QUICK))
             .and_then(|text| self.world.load(&self.renderer, &text));
         match result {
             Ok(()) => {

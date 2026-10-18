@@ -21,6 +21,7 @@ mod movie;
 mod pendulum;
 mod play;
 mod room;
+mod saved;
 mod saves;
 mod scenes;
 mod screens;

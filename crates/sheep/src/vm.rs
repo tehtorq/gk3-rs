@@ -177,6 +177,18 @@ impl Vm {
     }
 
     /// Threads that have not finished.
+    /// The script and function (with its `$`) of every thread still
+    /// running or waiting, as the original lists its background
+    /// functions when saving (0x5096a2).
+    pub fn running(&self) -> Vec<(String, String)> {
+        self.threads
+            .iter()
+            .flatten()
+            .filter(|t| matches!(t.state, ThreadState::Running | ThreadState::Waiting))
+            .map(|t| (t.script_name.clone(), t.function.clone()))
+            .collect()
+    }
+
     pub fn waiting(&self) -> Vec<ThreadId> {
         self.threads
             .iter()

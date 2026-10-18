@@ -30,7 +30,7 @@ pub struct Cue {
     pub what: CueKind,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum CueKind {
     /// Speak one line, by license plate (without the language's `E`).
     Dialogue(String),
@@ -72,7 +72,7 @@ pub struct FaceEvent {
     pub change: FaceChange,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum FaceChange {
     /// A mouth shape shared by everyone (`MOUTH03`); the character's own
     /// bitmap is `<code>_MOUTH03`.
@@ -277,10 +277,14 @@ impl Animation {
         }
 
         // Captions contain commas, so everything past the fields belongs to
-        // the text. SPEAKER and CAPTION come as a pair of lines.
+        // the text. A SPEAKER line gives the line its speaker from its frame
+        // on, whether it comes before or after the CAPTION in the file: the
+        // original plays both as events on the line (0x4a00ae, 0x4a02e0)
+        // and draws a caption with the speaker the line has by then.
         let mut captions = Vec::new();
         let mut faces = Vec::new();
-        let mut speaker: Option<String> = None;
+        let mut speakers: Vec<(u32, String)> = Vec::new();
+        let mut spoken = Vec::new();
         let mut dialogue_cue = None;
         for line in doc.sections("GK3").flat_map(|s| &s.lines) {
             let mut parts = line.text.splitn(2, ',');
@@ -292,13 +296,25 @@ impl Animation {
             };
             let (kind, rest) = rest.split_once(',').map_or((rest, ""), |(k, r)| (k, r));
             match kind.trim().to_ascii_uppercase().as_str() {
-                "SPEAKER" => speaker = Some(rest.trim().to_ascii_uppercase()),
-                "CAPTION" => captions.push(Caption {
-                    frame,
-                    end: None,
-                    speaker: speaker.clone(),
-                    text: rest.trim().to_string(),
-                }),
+                "SPEAKER" => {
+                    // A voice over (`MESMI_VO`) is spoken by its noun
+                    // (0x4a0028).
+                    let who = rest.trim().to_ascii_uppercase();
+                    let who = match who.strip_suffix("_VO") {
+                        Some(noun) if who.len() > 3 => noun.to_string(),
+                        _ => who,
+                    };
+                    speakers.push((frame, who));
+                }
+                "CAPTION" => {
+                    spoken.push(captions.len());
+                    captions.push(Caption {
+                        frame,
+                        end: None,
+                        speaker: None,
+                        text: rest.trim().to_string(),
+                    });
+                }
                 "LIPSYNCH" | "FACETEX" | "UNFACETEX" => {
                     let fields: Vec<&str> = rest.split(',').map(str::trim).collect();
                     let part = |i: usize| {
@@ -399,6 +415,14 @@ impl Animation {
                 }
                 _ => {}
             }
+        }
+        for i in spoken {
+            let frame = captions[i].frame;
+            captions[i].speaker = speakers
+                .iter()
+                .filter(|(f, _)| *f <= frame)
+                .max_by_key(|(f, _)| *f)
+                .map(|(_, who)| who.clone());
         }
         let frame_rate = doc
             .sections("OPTIONS")
@@ -557,6 +581,16 @@ mod tests {
         assert_eq!(yak.frame_rate, 15);
         let movie = Animation::parse(b"[HEADER]\r\n30\r\n[OPTIONS]\r\n1\r\n0,FRAMERATE,30\r\n");
         assert_eq!(movie.frame_rate, 30);
+    }
+
+    #[test]
+    fn a_speaker_given_after_its_caption_still_says_it() {
+        let yak = Animation::parse(
+            b"[HEADER]\r\n10\r\n[GK3]\r\n4\r\n0,CAPTION,Here's your fee.\r\n0,SPEAKER,MACDOUGALL\r\n\
+              5,SPEAKER,MESMI_VO\r\n5,CAPTION,Hallo?\r\n",
+        );
+        assert_eq!(yak.captions[0].speaker.as_deref(), Some("MACDOUGALL"));
+        assert_eq!(yak.captions[1].speaker.as_deref(), Some("MESMI"));
     }
 
     #[test]

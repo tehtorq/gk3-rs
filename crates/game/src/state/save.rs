@@ -37,9 +37,6 @@ impl GameState {
         for ((who, noun, verb), n) in &self.noun_verbs {
             line(&["noun_verb", who, noun, verb, &n.to_string()]);
         }
-        for ((noun, verb), n) in &self.topics {
-            line(&["topic", noun, verb, &n.to_string()]);
-        }
         for (noun, verb, case) in &self.played_topics {
             line(&["played_topic", noun, verb, case]);
         }
@@ -102,6 +99,7 @@ impl GameState {
         }
         let mut state = GameState::new("110A", "");
         let mut extra = Vec::new();
+        let mut topics = Vec::new();
         for (n, text) in lines.enumerate() {
             if text.trim().is_empty() {
                 continue;
@@ -127,9 +125,8 @@ impl GameState {
                 "noun_verb" => {
                     state.noun_verbs.insert((s(1)?, s(2)?, s(3)?), int(4)?);
                 }
-                "topic" => {
-                    state.topics.insert((s(1)?, s(2)?), int(3)?);
-                }
+                // Older saves kept topics apart, for whoever was playing.
+                "topic" => topics.push((s(1)?, s(2)?, int(3)?)),
                 "played_topic" => {
                     state.played_topics.insert((s(1)?, s(2)?, s(3)?));
                 }
@@ -172,6 +169,10 @@ impl GameState {
                 _ => extra.push(f.iter().map(|s| s.to_string()).collect()),
             }
         }
+        for (noun, verb, n) in topics {
+            let ego = state.ego.clone();
+            state.set_noun_verb(&ego, &noun, &verb, n);
+        }
         Ok((state, extra))
     }
 }
@@ -190,7 +191,9 @@ mod tests {
         state
             .noun_verbs
             .insert(("GRACE".into(), "BELL".into(), "RING".into()), 2);
-        state.topics.insert(("JEAN".into(), "T_RENNES".into()), 1);
+        state
+            .noun_verbs
+            .insert(("GRACE".into(), "JEAN".into(), "T_RENNES".into()), 1);
         state
             .played_topics
             .insert(("JEAN".into(), "T_RENNES".into(), "ALL".into()));

@@ -342,10 +342,10 @@ impl<'a> GameApi<'a> {
                 Value::Int(0)
             }
             "GETTOPICCOUNT" | "GETTOPICCOUNTINT" => {
-                Value::Int(*st.topics.get(&(key(&s(0)), key(&s(1)))).unwrap_or(&0))
+                Value::Int(st.noun_verb(&ego, &s(0), &s(1)))
             }
             "SETTOPICCOUNT" => {
-                st.topics.insert((key(&s(0)), key(&s(1))), i(2));
+                st.set_noun_verb(&ego, &s(0), &s(1), i(2));
                 Value::Int(0)
             }
             "GETCHATCOUNT" | "GETCHATCOUNTINT" => {

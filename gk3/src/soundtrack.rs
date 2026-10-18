@@ -7,7 +7,7 @@
 
 use gk3_formats::ini::{Document, Split};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Clip {
     pub name: String,
     /// 0 to 1.
@@ -22,7 +22,7 @@ pub struct Clip {
 /// while it plays (0x51b333), and how near it is heard in full (`MinDist`,
 /// 60 if not given) and how far before it is gone (`MaxDist`, a unit more
 /// than `MinDist` if not given; three times it if less).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ClipPlace {
     pub at: [f32; 3],
     pub follow: Option<String>,
@@ -30,14 +30,14 @@ pub struct ClipPlace {
     pub far: f32,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 enum Kind {
     Wait { min: f64, max: f64 },
     Sound(Clip),
     OneOf(Vec<Clip>),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Step {
     kind: Kind,
     /// Remaining runs; `None` for always.
@@ -45,6 +45,7 @@ struct Step {
     chance: u32,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Soundtrack {
     /// Upper-cased, without `.STK`, for stopping it by name.
     pub name: String,
@@ -57,6 +58,8 @@ pub struct Soundtrack {
     busy_until: f64,
     /// A looping clip has started; the rest of the list never runs.
     stopped: bool,
+    /// The step whose looping clip is playing.
+    looping: Option<usize>,
     rng: u64,
 }
 
@@ -139,7 +142,20 @@ impl Soundtrack {
             at: 0,
             busy_until: 0.0,
             stopped: false,
+            looping: None,
             rng: seed | 1,
+        }
+    }
+
+    /// Back from a saved game. Its sounds were not saved, as the
+    /// original's are not: a step still with time to run waits it out in
+    /// silence, and one playing a loop, with no time to wait, is run again
+    /// (0x51c110).
+    pub fn restored(&mut self) {
+        if let Some(step) = self.looping.take() {
+            self.at = step;
+            self.stopped = false;
+            self.busy_until = 0.0;
         }
     }
 
@@ -193,6 +209,7 @@ impl Soundtrack {
                     self.busy_until = now + length(&clip).unwrap_or(0.0);
                     if clip.looping {
                         self.stopped = true;
+                        self.looping = Some(index);
                     }
                     started.push(clip);
                 }

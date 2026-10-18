@@ -22,7 +22,7 @@ pub const HERMETIC: u32 = 25;
 pub const SUM_NOTE: u32 = 26;
 pub const ARCADIA: u32 = 29;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum State {
     #[default]
     Empty,
@@ -56,7 +56,7 @@ pub enum Item {
     EraseGrid,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Analyze {
     pub file: Option<u32>,
     pub state: State,

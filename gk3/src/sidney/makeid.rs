@@ -18,9 +18,11 @@ pub const JOBS: &[&[&str]] = &[
     &["NOPD", "SECURITY"],
 ];
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct MakeId {
     /// `GAB` or `GRA`.
-    pub person: &'static str,
+    #[serde(deserialize_with = "crate::saved::static_str")]
+    pub person: crate::saved::Name,
     /// Menu and entry of the job.
     pub job: (usize, usize),
 }

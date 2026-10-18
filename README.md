@@ -78,12 +78,13 @@ On a graphics card the picture is drawn with 4x multisampling, which smooths
 the edges of walls and people; on a software renderer it is not, to keep it
 fast.
 
-F5 saves to the quick slot and F9 loads it. Saves are small text files in
+F5 saves to the quick slot and F9 loads it. Saves are text files in
 `~/.local/share/gk3-rs/saves` (or `$XDG_DATA_HOME/gk3-rs/saves`); `gk3 play
---load quick` starts from one. A save holds the whole story state and where
-you stood; loading rebuilds the room and enters it again, as the original's
-first save format did, so the visit counts once more but first-visit scenes
-do not replay. Saving waits until nothing is playing. Sound comes from PulseAudio or PipeWire if they are there; without
+--load quick` starts from one. As in the original, the game saves only when
+you are in control (not mid-scene, in a conversation or on a screen that
+forbids it), and a save is a snapshot of the whole world: loading puts the
+room, its people, the timers and the music back as they were, without
+entering the room again (`docs/re-saves.md`). Sound comes from PulseAudio or PipeWire if they are there; without
 them the game is silent rather than refusing to start.
 
 For testing, the same command runs without a window:

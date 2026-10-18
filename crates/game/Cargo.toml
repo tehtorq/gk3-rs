@@ -10,3 +10,4 @@ rust-version.workspace = true
 gk3-formats.workspace = true
 gk3-sheep.workspace = true
 glam.workspace = true
+serde.workspace = true

@@ -22,7 +22,7 @@ pub struct Print {
 
 /// How an object sits in the panel: hard against its left side (G-Engine's
 /// default) or centred; then nudged by an offset, y up.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Anchor {
     Left,
     Center,
@@ -294,7 +294,7 @@ pub fn objects() -> Vec<Object> {
 }
 
 /// What the player holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Tool {
     Hand,
     Brush,
@@ -338,13 +338,33 @@ pub enum Event {
 }
 
 /// The kit while it is up.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Kit {
+    /// Saved by its noun, and found again in the kit's table.
+    #[serde(with = "object_by_noun")]
     pub object: Object,
     pub tool: Tool,
     /// How visible each print is, nought to one, and whether it is kept.
     pub shown: Vec<f32>,
     pub kept: Vec<bool>,
     dusted: f32,
+}
+
+mod object_by_noun {
+    use super::{Object, objects};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(object: &Object, s: S) -> Result<S::Ok, S::Error> {
+        object.noun.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Object, D::Error> {
+        let noun = String::deserialize(d)?;
+        objects()
+            .into_iter()
+            .find(|o| o.noun == noun)
+            .ok_or_else(|| serde::de::Error::custom(format!("no fingerprint object {noun}")))
+    }
 }
 
 impl Kit {

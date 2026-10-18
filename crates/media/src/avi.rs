@@ -34,6 +34,7 @@ const BI_RGB: u32 = 0;
 const BI_RLE8: u32 = 1;
 const CVID: u32 = u32::from_le_bytes(*b"cvid");
 
+#[derive(Clone)]
 pub struct Avi {
     pub width: u32,
     pub height: u32,
@@ -232,6 +233,7 @@ impl Avi {
 /// Decodes a movie's frames one after another; each RLE frame is drawn
 /// over the last. It holds no reference to the movie, so the two can be
 /// kept side by side.
+#[derive(Clone)]
 pub struct Player {
     next: usize,
     width: u32,
